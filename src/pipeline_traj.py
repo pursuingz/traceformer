@@ -55,6 +55,6 @@ class TrajPipeline(DiffusionPipeline):
                 model_output = model_pred_uncond + guidance_scale * (model_pred_cond - model_pred_uncond)
             # 2. predict previous mean of image x_t-1 and add variance depending on eta
             # eta corresponds to η in paper and should be between [0, 1]
-            # do x_t -> x_t-1
+            # do x_t -> x_t-1 
             sample = self.scheduler.step(model_output, t[0], sample).prev_sample
         return sample

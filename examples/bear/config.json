@@ -1,0 +1,5 @@
+{ 
+    "material": "sand",
+    "floor_loc_begin": [360, 100],
+    "floor_loc_end": [420, 600]
+}

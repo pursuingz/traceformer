@@ -1,0 +1,9 @@
+{ 
+    "material": "elastic", 
+    "log_E": 5,
+    "nu": 0.3,
+    "force_coeff": 0.08,
+    "drag_mode": "max",
+    "drag_axis": 1,
+    "drag_dir": [0, 1, 0]
+}

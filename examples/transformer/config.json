@@ -1,0 +1,5 @@
+{ 
+    "material": "rigid",
+    "floor_loc_begin": [380, 100],
+    "floor_loc_end": [400, 600]
+}

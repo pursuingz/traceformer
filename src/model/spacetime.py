@@ -8,8 +8,7 @@ sys.path.append('./')
 
 from einops import rearrange, repeat
 from model.dit import *
-from diffusers.models.embeddings import LabelEmbedding
-from model.sttransformer_nn import SpatialTemporalTransformerBlockv3
+from diffusers.models.embeddings import LabelEmbedding 
 
 class PointEmbed(nn.Module):
     def __init__(self, hidden_dim=96, dim=512):
