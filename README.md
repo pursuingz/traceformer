@@ -33,7 +33,7 @@ python3 inference.py --data_name "penguin"
 ## 🏋️‍♂️ Training and Evaluation
 ### Inference Trajectory Generation
 ```bash
-python3 eval.py --config configs/eval_v3.yaml
+python3 eval.py --config configs/eval_base.yaml
 ```
 
 ### Train Trajectory Generation
