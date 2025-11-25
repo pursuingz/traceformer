@@ -10,6 +10,7 @@ import taichi as ti
 sys.path.append("../libs")
 sys.path.append("../libs/LGM")
 sys.path.append("../libs/vggt")
+sys.path.append("../libs/das")
 
 import numpy as np
 import trimesh
@@ -653,6 +654,23 @@ def run_sam(args, output_dir):
     y, x, res = image_preprocess(input_sam, f"{output_dir}/input_processed.png", target_res=sv3d_res,
         lower_contrast=False, rescale=True) 
     np.save(f"{output_dir}/crop_info.npy", np.array([y, x, res]))
+
+from das.models.pipelines import DiffusionAsShaderPipeline
+from das.infer import load_media
+def run_das(args, output_dir, prompt, seed):
+    output_dir = os.path.join(args.output_dir, args.data_name)
+    das = DiffusionAsShaderPipeline(gpu_id=args.gpu, output_dir=os.path.join(args.output_dir, args.data_name))
+    video_tensor, fps, is_video = load_media(f'{args.base_dir}/{args.data_name}/input.png')
+    tracking_tensor, _, _ = load_media(os.path.join(args.output_dir, args.data_name, 'tracks_gen', 'tracking', 'tracks_tracking.mp4'))
+    das.apply_tracking(
+        video_tensor=video_tensor,
+        fps=24,
+        tracking_tensor=tracking_tensor,
+        img_cond_tensor=None,
+        prompt=prompt,
+        checkpoint_path=args.das_ckpt_path,
+        seed=seed
+    )
     
 if __name__ == "__main__":
 
@@ -664,7 +682,6 @@ if __name__ == "__main__":
     parser.add_argument("--das_ckpt_path", default="../checkpoints/cogshader5B")
     parser.add_argument("--base_ckpt_path", default="../checkpoints/physctrl_base.safetensors")
     parser.add_argument("--large_ckpt_path", default="../checkpoints/physctrl_large.safetensors")
-    parser.add_argument("--das_prompt", default="A chair lifted upwards")
     parser.add_argument("--gpu", type=int, default=0)    
     parser.add_argument("--data_name", default="chair", type=str, help="Data Name")
     parser.add_argument("--base_cfg_path", default="configs/eval_base.yaml", type=str, help="Model config")
@@ -716,7 +733,8 @@ if __name__ == "__main__":
     run_track(args, output_dir) 
         
     ## Run Video Generation
-    # run_das(args, base_dir, tracking_tensor, image_path)
+    prompt = cfg_json['prompt']
+    run_das(args, output_dir, prompt, seed=cfg_json['seed'] if 'seed' in cfg_json else 42)
     
     
     

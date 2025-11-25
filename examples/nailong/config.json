@@ -1,5 +1,6 @@
 { 
     "material": "plasticine",
     "floor_loc_begin": [360, 200],
-    "floor_loc_end": [420, 600]
+    "floor_loc_end": [420, 600],
+    "prompt": "A yellow plasticine dinasour toy free falls to the table due to gravity. It has no deformation before it touches the table. After it touches the table, it deforms."
 }

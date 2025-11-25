@@ -4,26 +4,30 @@
 <a href='https://huggingface.co/spaces/chenwang/physctrl'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Live_Demo-blue'></a>
 </p>
 
-**Still working on remaining parts...**
-
 ## 📦 Installation
 ```bash
-python3.10 -m venv venv
-source $venv/bin/activate
-# change it to your CUDA version
+python3.10 -m venv physctrl
+source physctrl/bin/activate
+# CAUTION: change it to your CUDA version
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118 xformers
+pip install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu118.html
 pip install -r requirements.txt
 ```
 
 ## 🤖 Pretrained Models
-Checkpoints can be found at: https://huggingface.co/chenwang/physctrl/tree/main
+Download checkpoints:
+```bash
+bash download_ckpts.sh
+```
 
 ## 📂 Dataset
 TBD
 
 ## 🎥 Image to Video Generation
+We provide several examples in the `examples` folder. You can put your own example there using the same format.
 ```bash
-TBD
+cd src
+python3 inference.py --data_name "penguin"
 ```
 
 ## 🏋️‍♂️ Training and Evaluation

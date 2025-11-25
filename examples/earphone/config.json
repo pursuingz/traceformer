@@ -5,5 +5,6 @@
     "force_coeff": 0.04,
     "drag_mode": "point",
     "drag_point": [-0.28, 0.21, -0.19],
-    "drag_dir": [0, 1, 0]
+    "drag_dir": [0, 1, 0],
+    "prompt": "the earphone is dragged upwards on its handle and rotates as if there an invisible force"
 }

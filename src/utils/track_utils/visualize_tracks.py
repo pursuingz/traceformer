@@ -38,10 +38,9 @@ def process_video(tracks_path, output_dir, args):
 def visualize_tracks(tracks_dir, output_dir, args):
     
     args.tracks_dir = tracks_dir
-    args.output_dir = output_dir
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     tracks_files = [f for f in os.listdir(args.tracks_dir) if f.endswith('tracks.npy')]
     for tracks_file in tracks_files:
         tracks_path = os.path.join(args.tracks_dir, tracks_file)
-        process_video(tracks_path, args.output_dir, args)
+        process_video(tracks_path, output_dir, args)

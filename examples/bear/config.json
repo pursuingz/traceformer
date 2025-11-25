@@ -1,5 +1,6 @@
 { 
     "material": "sand",
     "floor_loc_begin": [360, 100],
-    "floor_loc_end": [420, 600]
+    "floor_loc_end": [420, 600],
+    "prompt": "The sand bear statue drops onto the ground and it collapses into a loose pile of fine sand."
 }

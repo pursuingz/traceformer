@@ -11,6 +11,7 @@ rembg==2.0.63
 huggingface_hub==0.31.1
 gradio==4.44.1
 gradio_image_prompter==0.1.0
+SentencePiece==0.2.0
 
 warp-lang
 matplotlib
@@ -22,15 +23,13 @@ scikit-image
 open3d
 PyMCubes
 plyfile
-transformers
+transformers==4.45.1
 cython
 rich
 munch 
-torch_cluster
 omegaconf
 flow_vis
 kiui
-transformers
 segment_anything
 rembg
 onnxruntime
