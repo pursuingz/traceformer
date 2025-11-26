@@ -11,6 +11,10 @@ rembg==2.0.63
 huggingface_hub==0.31.1
 gradio==4.44.1
 gradio_image_prompter==0.1.0
+uvicorn==0.34.2
+fastapi==0.112.0
+pydantic==2.8.2
+plotly==5.24.1
 SentencePiece==0.2.0
 
 warp-lang

@@ -803,13 +803,6 @@ class CogVideoXImageToVideoPipelineTracking(CogVideoXImageToVideoPipeline, Diffu
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
-                # if i % 10 == 0:
-                #     from diffusers.utils import export_to_video, load_image, load_video
-                #     video = self.decode_latents(latents)
-                #     video = self.video_processor.postprocess_video(video=video, output_type=output_type)
-                #     video = CogVideoXPipelineOutput(frames=video).frames[0]
-                #     export_to_video(video, f'output_{i}.mp4', fps=24)
-
         # 9. Post-processing
         if not output_type == "latent":
             video = self.decode_latents(latents)

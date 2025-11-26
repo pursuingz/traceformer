@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils.track_utils.visualizer import Visualizer
+from .visualizer import Visualizer
 
 def create_white_video(num_frames, target_h=480, target_w=720):
     white_video = torch.ones((1, num_frames, 3, target_h, target_w))

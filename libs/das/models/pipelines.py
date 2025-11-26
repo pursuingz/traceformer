@@ -440,7 +440,7 @@ class DiffusionAsShaderPipeline:
 
         return tracking_path, tracking_video
     
-    def apply_tracking(self, video_tensor, fps=8, tracking_tensor=None, img_cond_tensor=None, prompt=None, checkpoint_path=None, coarse_video=None, start_noise_t=0, seed=42):
+    def apply_tracking(self, video_tensor, fps=8, tracking_tensor=None, img_cond_tensor=None, prompt=None, checkpoint_path=None, coarse_video=None, start_noise_t=0, seed=0):
         """Generate final video with motion transfer
         
         Args:
