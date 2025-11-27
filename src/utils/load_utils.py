@@ -58,7 +58,7 @@ def load_LGM(opt, device, lgm_ckpt_path="./checkpoints/lgm_fp16.safetensors"):
     model.eval()
     return model
 
-def load_diffusion(device, model_cfg_path, diffusion_ckpt_path, fluid=False, seed=0):
+def load_diffusion(device, model_cfg_path, diffusion_ckpt_path, seed=0):
     schema = OmegaConf.structured(TestingConfig)
     cfg = OmegaConf.load(model_cfg_path)
     cfg = OmegaConf.merge(schema, cfg)
@@ -182,7 +182,7 @@ def gen_tracking_video(base_dir):
     
     track_template.item()['tracks'] = tracks_output
     # track_template.item()['drag_points'] = np.stack(drag_points, axis=0)
-    sub_name = 'tracks_sim' if sim else 'tracks_gen'
+    sub_name = 'tracks_gen'
     sub_dir = f'{base_dir}/{sub_name}'
     os.makedirs(sub_dir, exist_ok=True)
 

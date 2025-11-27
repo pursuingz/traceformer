@@ -71,12 +71,12 @@ def plot_point_cloud(points, arrows):
         cone = go.Cone(
             x=[origin[0]], y=[origin[1]], z=[origin[2]],
             u=[direction[0]], v=[direction[1]], w=[direction[2]],
-            sizemode='absolute', sizeref=0.2,
+            sizemode='raw', sizeref=5,
             anchor='tail', colorscale='Reds', showscale=False,
             name='Arrow'
         )
         cone_traces.append(cone)
 
     fig = go.Figure(data=[scatter] + cone_traces)
-    fig.update_layout(scene=dict(aspectmode='data'), margin=dict(l=0, r=0, t=0, b=0), height=600)
+    fig.update_layout(scene=dict(aspectmode='data'), margin=dict(l=0, r=0, t=0, b=0), height=400)
     return fig
