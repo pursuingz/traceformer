@@ -31,7 +31,7 @@ class TrajPipeline(DiffusionPipeline):
         gravity = gravity.to(device) if gravity is not None else None
         y = y.to(device) if y is not None else None
         # set step values
-        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
         do_classifier_free_guidance = (guidance_scale > 1.0)
         null_emb = torch.tensor([1] * batch_size).to(sample.dtype)
         if do_classifier_free_guidance:

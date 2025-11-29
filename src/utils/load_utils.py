@@ -195,7 +195,7 @@ def load_das(gpu_id, output_dir):
     return das
 
 def normalize_points(output_dir, fluid=False):
-    from .transform import transform2origin
+    from .transform import transform2origin, shift2center
     import trimesh
     from torch_cluster import fps
     
@@ -209,10 +209,6 @@ def normalize_points(output_dir, fluid=False):
     N = 2048
     grid_center = [5, 5, 5]
     drag_size = [0.4, 0.4, 0.4]
-
-    def shift2center(position_tensor, center=[2, 2, 2]):
-        tensor = np.array(center)
-        return position_tensor + tensor
 
     points = shift2center(points, center=grid_center)
     points = torch.tensor(points, dtype=torch.float32, device=device).contiguous()

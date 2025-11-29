@@ -5,7 +5,6 @@ import sys
 import gc
 import random
 import warp as wp
-import taichi as ti
 
 sys.path.append("../libs")
 sys.path.append("../libs/LGM")
@@ -50,7 +49,7 @@ from utils.track_utils.visualize_tracks import visualize_tracks
 from utils.interpolate import *
 from utils.loading import paste_image
 from utils.image_process import image_preprocess, pred_bbox, sam_init, sam_out_nosave, resize_image
-from utils.transform import transform2origin, shift2center
+from utils.transform import transform2origin, shift2center_th
 from utils.sim_utils import get_particle_volume 
 
 # Diffusion
@@ -194,9 +193,6 @@ def run_diffusion(args, output_dir):
     np.save(f'{output_dir}/scale.npy', scale)
 
     N = 2048
-    n_grid = 128
-    grid_lim = 10.0
-    grid_dx = grid_lim / n_grid
     max_num_forces = 1
     has_gravity = args.mat_label > 0
 
@@ -205,7 +201,7 @@ def run_diffusion(args, output_dir):
     idx = fps(points, ratio=ratio_N, random_start=True)
     np.save(f'{output_dir}/fps_idx.npy', idx.cpu().numpy())
     points_tensor = points[idx].contiguous()
-    points_center = shift2center(points_tensor) # MPM coordinate
+    points_center = shift2center_th(points_tensor) # MPM coordinate
     points = points_tensor.cpu().numpy()
 
     # User input
@@ -250,9 +246,6 @@ def run_diffusion(args, output_dir):
     batch['drag_point'] = torch.from_numpy(drag_point).float() / 2
     batch['drag_point'] = batch['drag_point'].unsqueeze(0) # (1, 4)
     batch['points_src'] = points_tensor.float().unsqueeze(0) / 2 
-
-    ti.init(arch=ti.cuda, device_memory_GB=8.0)  
-    batch['vol'] = get_particle_volume(points_center, n_grid, grid_dx, uniform=args.mat_label == 2) 
 
     if has_gravity:
         floor_normal = np.load(f'{output_dir}/floor_normal.npy')
@@ -647,7 +640,7 @@ def run_sam(args, output_dir):
     sam_predictor = sam_init(args.sam_ckpt_path)
     print("[SAM] Loaded SAM model")
     
-    input_raw = Image.open(f'{args.base_dir}/{args.data_name}/input.png')
+    input_raw = Image.open(f'{args.base_dir}/{args.data_name}/input.png') if not os.path.exists(f'{args.base_dir}/{args.data_name}/input_masked.png') else Image.open(f'{args.base_dir}/{args.data_name}/input_masked.png')
     input_sam = sam_out_nosave(sam_predictor, input_raw.convert("RGB"), pred_bbox(input_raw))
     mask = np.array(input_sam)[:, :, 3]
     Image.fromarray(mask).save(f"{output_dir}/input_mask.png")
