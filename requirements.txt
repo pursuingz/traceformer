@@ -1,4 +1,4 @@
-diffusers==0.31.0
+diffusers==0.33.0
 accelerate==1.1.1
 moviepy==1.0.3
 hydra-core==1.3.2

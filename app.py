@@ -146,6 +146,7 @@ def segment(canvas, image, logits):
     out_image_bbox = Image.fromarray(out_image_bbox)
     y, x, res, sv3d_image = image_preprocess(out_image_bbox, target_res=sv3d_res, lower_contrast=False, rescale=True)
     np.save(f'{output_dir}/crop_info.npy', np.array([y, x, res]))
+    print(f'crop_info: {y}, {x}, {res}')
 
     return mask[0], {'image': masked_img, 'points': points}, out_image_bbox, {'crop_y_start': y, 'crop_x_start': x, 'crop_res': res}, sv3d_image
 
@@ -265,12 +266,11 @@ def run_LGM(image, seed=0):
         points_plot = plot_point_cloud(points, [])
         np.save(f'{output_dir}/center.npy', center)
         np.save(f'{output_dir}/scale.npy', scale)
+        print('center: ', center, 'scale: ', scale)
     return points_plot, points
 
 norm_fac = 5
 mat_labels = {'elastic': 0, 'plasticine': 1, 'sand': 2, 'rigid': 3}
-# TODO: make this adjustable
-# force_coeff = np.array(0.045)
 
 def run_diffusion(points, E_val, nu_val, x, y, z, u, v, w, force_coeff_val, floor_height=-1, fluid=False, seed=0, device='cuda'):
     drag_point = np.array([x, y, z])
