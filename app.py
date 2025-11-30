@@ -4,7 +4,13 @@ import json
 import ast
 import atexit
 import shutil
+import sys
 
+try:
+    import diff_gaussian_rasterization
+except:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/ashawkey/diff-gaussian-rasterization.git", "-v"])
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -15,7 +21,6 @@ import numpy as np
 from copy import deepcopy
 import cv2
 
-import sys
 sys.path.append("libs")
 sys.path.append("libs/LGM")
 sys.path.append("libs/das")
@@ -70,7 +75,7 @@ print(f'loading diffusion model...')
 diffusion_model = load_diffusion(device=device, model_cfg_path='./src/configs/eval_base.yaml', diffusion_ckpt_path='./checkpoints/physctrl_base.safetensors')
 
 temp_dir = tempfile.mkdtemp()
-delete temp_dir after program exits
+#s delete temp_dir after program exits
 atexit.register(lambda: shutil.rmtree(temp_dir))
 # temp_dir = './debug'
 output_dir = temp_dir
@@ -505,6 +510,11 @@ def update_sliders(material):
 update_sliders('Elastic')
 
 with gr.Blocks() as demo:
+    gr.Markdown("""
+    ## PhysCtrl: Generative Physics for Controllable and Physics-Grounded Video Generation
+    ### You can upload your own input image and set the force and material to generate the trajectory and final video.
+    ### The text prompt of video generation should describe the action of the object, e.g., "the penguin is fully lifted upwards, as if there is a force applied onto its left wing".
+    """)
     mask = gr.State(value=None) # store mask
     original_image = gr.State(value=None) # store original input image
     mask_logits = gr.State(value=None) # store mask logits
