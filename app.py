@@ -6,11 +6,6 @@ import atexit
 import shutil
 import sys
 
-try:
-    import diff_gaussian_rasterization
-except:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/ashawkey/diff-gaussian-rasterization.git", "-v"])
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
