@@ -16,8 +16,8 @@ fastapi==0.112.0
 pydantic==2.8.2
 plotly==5.24.1
 SentencePiece==0.2.0
+warp-lang==1.5.0
 
-warp-lang
 matplotlib
 pyyaml
 h5py
@@ -40,5 +40,6 @@ onnxruntime
 tyro
 roma 
 safetensors
-git+https://github.com/ashawkey/diff-gaussian-rasterization.git
-git+https://github.com/asomoza/image_gen_aux.git
+easydict
+utils3d
+objaverse
