@@ -29,7 +29,7 @@ bash download_ckpts.sh
 
 ## 📂 Dataset
 
-Currently, it's difficult for us to release full dataset since it's too large. But since our dataset is based on the open-source [TRELLIS-500K](https://github.com/microsoft/TRELLIS/blob/main/DATASET.md), it would be easy to recreate our dataset. Here we provide the scripts for creating the dataset for elastic, plasticine and sand material.
+Due to the large storage of original data, it's difficult for us to release the full dataset. A subset of the data can be found at [here](https://huggingface.co/datasets/chenwang/physctrl/resolve/main/sample.zip). Since our dataset is based on the open-source [TRELLIS-500K](https://github.com/microsoft/TRELLIS/blob/main/DATASET.md), it would be easy to recreate our dataset. Here we provide the scripts for creating the dataset for elastic, plasticine and sand material.
 
 1. Download the Objaverse sketchfab dataset
 
