@@ -13,7 +13,7 @@ import json
 
 from utils.seeding import seed_everything
 from utils.loading import load_mesh
-from utils.visualization import save_pointcloud_video
+from utils.visualization import save_pointcloud_video_wdp as save_pointcloud_video
 from utils.sample import sample_points_on_mesh, sample_direction_hemisphere
 from utils.transform import normalize_points
 from torch_cluster import fps
