@@ -43,3 +43,4 @@ safetensors
 easydict
 utils3d
 objaverse
+git+https://github.com/asomoza/image_gen_aux.git
