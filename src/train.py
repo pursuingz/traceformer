@@ -1,4 +1,5 @@
 import argparse
+import csv
 import itertools
 import json
 import logging
@@ -7,11 +8,13 @@ import os
 import random
 import shutil
 import warnings
+import sys
 from pathlib import Path
 from omegaconf import OmegaConf
 from options import TrainingConfig
 
 import numpy as np
+import h5py
 import safetensors
 import torch
 import torch.nn.functional as F
@@ -28,6 +31,9 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from torchvision import transforms
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import diffusers
 from diffusers import (
@@ -49,6 +55,123 @@ from utils.physics import loss_momentum
 from utils.physics import DeformLoss
 
 logger = get_logger(__name__)
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_file_logging(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "train.log")
+    log_file = open(log_path, "a", buffering=1)
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file)
+    return log_file, log_path
+
+INPUT_FRAMES = 5
+OUTPUT_FRAMES = 5
+ROLLOUT_STEPS = 4
+
+
+def build_raw_reference(batch, dataset_cfg, target_frames):
+    raw_sequences = []
+    for j, model_name in enumerate(batch['model']):
+        h5_path = os.path.join(dataset_cfg.dataset_path, model_name)
+        with h5py.File(h5_path, 'r') as model_metas:
+            model_pcls = torch.from_numpy(np.array(model_metas['x']))
+
+        point_indices = batch['point_indices'][j].cpu().numpy()
+        end_idx = min(target_frames, model_pcls.shape[0])
+        raw_seq = model_pcls[:end_idx][:, point_indices].float()
+        raw_seq = (raw_seq - dataset_cfg.norm_fac) / 2
+        if raw_seq.shape[0] < target_frames:
+            pad_count = target_frames - raw_seq.shape[0]
+            raw_seq = torch.cat([raw_seq, raw_seq[-1:].repeat(pad_count, 1, 1)], dim=0)
+        raw_sequences.append(raw_seq)
+
+    return torch.stack(raw_sequences, dim=0)
+
+
+def build_knn_indices(points, k):
+    if points.ndim == 4:
+        points = points[:, 0]
+    n_points = points.shape[1]
+    if n_points <= 1:
+        return None
+    k_eff = min(max(int(k), 1), n_points - 1)
+    dists = torch.cdist(points, points)
+    knn_idx = torch.topk(dists, k=k_eff + 1, dim=-1, largest=False).indices[..., 1:]
+    return knn_idx
+
+
+def laplacian_deformation_loss(pred_points, ref_points, knn_idx):
+    if knn_idx is None:
+        return pred_points.new_tensor(0.0)
+    batch_size, n_frames = pred_points.shape[:2]
+    per_batch_losses = []
+    for b in range(batch_size):
+        pred_b = pred_points[b]           # [n_frames, N, 3]
+        ref_b = ref_points[b]             # [n_frames, N, 3]
+        idx_b = knn_idx[b]                # [N, k]
+        loss_t = 0.0
+        for t in range(n_frames):
+            pred_nb = pred_b[t, idx_b, :]     # [N, k, 3]
+            ref_nb = ref_b[t, idx_b, :]       # [N, k, 3]
+            pred_lap = pred_b[t] - pred_nb.mean(dim=1)   # [N, 3]
+            ref_lap = ref_b[t] - ref_nb.mean(dim=1)      # [N, 3]
+            loss_t += F.mse_loss(pred_lap, ref_lap)
+        per_batch_losses.append(loss_t / n_frames)
+    return torch.stack(per_batch_losses).mean()
+
+
+def edge_length_regularization(pred_points, ref_points, knn_idx):
+    if knn_idx is None:
+        return pred_points.new_tensor(0.0)
+    batch_size, n_frames = pred_points.shape[:2]
+    per_batch_losses = []
+    for b in range(batch_size):
+        pred_b = pred_points[b]           # [n_frames, N, 3]
+        ref_b = ref_points[b]             # [n_frames, N, 3]
+        idx_b = knn_idx[b]                # [N, k]
+        loss_t = 0.0
+        for t in range(n_frames):
+            ref_edge_len = torch.norm(ref_b[t, idx_b, :] - ref_b[t, :, None, :], dim=-1)   # [N, k]
+            pred_edge_len = torch.norm(pred_b[t, idx_b, :] - pred_b[t, :, None, :], dim=-1) # [N, k]
+            loss_t += F.mse_loss(pred_edge_len, ref_edge_len)
+        per_batch_losses.append(loss_t / n_frames)
+    return torch.stack(per_batch_losses).mean()
+
+
+def collision_loss(pred_points, floor_height=None, margin=0.01):
+    batch_size, n_frame, n_points, _ = pred_points.shape
+    pred_flat = pred_points.reshape(batch_size * n_frame, n_points, 3)
+    dists = torch.cdist(pred_flat, pred_flat)
+    eye = torch.eye(n_points, device=pred_points.device, dtype=torch.bool).unsqueeze(0)
+    penetration = F.relu(margin - dists)
+    penetration = penetration.masked_fill(eye, 0.0)
+    self_collision = (penetration ** 2).sum() / (~eye).sum().clamp_min(1)
+    '''
+    floor_collision = pred_points.new_tensor(0.0)
+    if floor_height is not None:
+        floor_h = floor_height.reshape(batch_size, 1, 1)
+        floor_pen = F.relu(floor_h - pred_points[..., 1])
+        floor_collision = (floor_pen ** 2).mean()
+
+    return self_collision + floor_collision
+    '''
+    return self_collision
+
 
 def seed_everything(seed):
 	random.seed(seed)
@@ -76,6 +199,10 @@ def main(args):
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
+
+    log_file = None
+    if accelerator.is_main_process and args.output_dir is not None:
+        log_file, log_path = setup_file_logging(args.output_dir)
 
     if args.report_to == "wandb":
         if not is_wandb_available():
@@ -133,8 +260,16 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     
-    model = MDM_ST(args.pc_size, args.train_dataset.n_training_frames, n_feats=3, model_config=args.model_config)
+    args.train_dataset.input_frames = INPUT_FRAMES
+    args.train_dataset.output_frames = OUTPUT_FRAMES
+    args.model_config.cond_frames = INPUT_FRAMES
+    model = MDM_ST(args.pc_size, OUTPUT_FRAMES, n_feats=3, model_config=args.model_config)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    output_str = f"Total trainable parameters: {total_params / 1e6:.2f}M\n"
 
+    # 写入到 txt 文件
+    with open("model_parameters.txt", "w") as f:
+        f.write(output_str)
     # if args.gradient_checkpointing:
     #     model.enable_gradient_checkpointing()
 
@@ -235,6 +370,22 @@ def main(args):
     logger.info(f"  Log to = {args.output_dir}")
     global_step = 0
     first_epoch = 0
+    loss_history = {}
+    loss_rows = []
+    loss_csv_path = os.path.join(args.output_dir, "loss_history.csv")
+    loss_csv_header = [
+        "step",
+        "loss",
+        "loss_xyz",
+        "loss_mask",
+        "loss_vel",
+        "loss_p",
+        "loss_F",
+        "loss_floor",
+        "loss_laplacian",
+        "loss_collision",
+        "loss_edge",
+    ]
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -271,7 +422,9 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False)
+    noise_scheduler = None
+    if args.use_diffusion:
+        noise_scheduler = DDPMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False)
 
     if args.seed is None:
         generator = None
@@ -287,16 +440,22 @@ def main(args):
             with accelerator.accumulate(model):
                 latents = batch['points_tgt'] # (bsz, n_frames, n_points, 3)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                if args.use_diffusion:
+                    noise = torch.randn_like(latents)
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
+                    model_input = noise_scheduler.add_noise(latents, noise, timesteps)
+                else:
+                    timesteps = torch.zeros((bsz,), device=latents.device, dtype=torch.long)
+                    # Use the last source frame repeated as input, instead of zeros,
+                    # so that PointEmbed produces differentiated per-point embeddings.
+                    # Add small noise to break uniformity across the 5 output frames,
+                    # otherwise all output-frame tokens would have identical embeddings.
+                    last_src_frame = batch['points_src'][:, -1:, :, :]  # (B, 1, N, 3)
+                    model_input = last_src_frame.repeat(1, OUTPUT_FRAMES, 1, 1)  # (B, F, N, 3)
+                    model_input = model_input + torch.randn_like(model_input) * 0.02
+                    #print("Running training without diffusion.")
 
                 if args.condition_drop_rate > 0:
                     # Randomly drop some of the latents
@@ -306,7 +465,7 @@ def main(args):
                     null_emb = None
 
                 # Predict the noise residual
-                pred_sample = model(noisy_latents, timesteps, batch['points_src'], batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb)
+                pred_sample = model(model_input, timesteps, batch['points_src'], batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=batch.get('start_vel', None))
                 losses = {}
 
                 loss = F.mse_loss(pred_sample.float(), latents.float())
@@ -314,7 +473,7 @@ def main(args):
 
                 if args.lambda_mask > 0:
                     loss_mask = F.mse_loss(pred_sample[batch['mask']], latents[batch['mask']])
-                    loss += loss_mask
+                    loss += args.lambda_mask * loss_mask
                     losses['mask'] = loss_mask.detach().item()
 
                 if args.lambda_vel > 0.:
@@ -322,7 +481,7 @@ def main(args):
                     pred_vel = (pred_sample[:, 1:] - pred_sample[:, :-1])
                     loss_vel = F.mse_loss(target_vel.float(), pred_vel.float())
                     losses['loss_vel'] = loss_vel.detach().item()
-                    loss = loss + loss_vel
+                    loss = loss + args.lambda_vel * loss_vel
 
                 if 'vol' in batch and args.lambda_momentum > 0.:
                     loss_p = loss_momentum(x=pred_sample, vol=batch['vol'], force=batch['weighted_force'],
@@ -332,25 +491,50 @@ def main(args):
                 
                 if 'vol' in batch and args.lambda_deform > 0.:
                     pred_sample_mpm = pred_sample
+                    vol_data = batch['vol']
+                    F_data = batch['F']
+                    C_data = batch['C']
                     if 'is_mpm' in batch:
-                        mask = batch['is_mpm']
-                        pred_sample_mpm = pred_sample[mask]
-                        batch['vol'] = batch['vol'][mask]
-                        batch['F'] = batch['F'][mask]
-                        batch['C'] = batch['C'][mask]
-                    loss_F = loss_deform(x=pred_sample_mpm.clamp(min=-2.2, max=2.2), vol=batch['vol'], F=batch['F'],
-                        C=batch['C'], frame_interval=2, norm_fac=args.train_dataset.norm_fac) if batch['vol'].shape[0] > 0 else torch.tensor(0.0, device=pred_sample.device)
+                        is_mpm_mask = batch['is_mpm']
+                        pred_sample_mpm = pred_sample[is_mpm_mask]
+                        vol_data = vol_data[is_mpm_mask]
+                        F_data = F_data[is_mpm_mask]
+                        C_data = C_data[is_mpm_mask]
+                    loss_F = loss_deform(x=pred_sample_mpm.clamp(min=-2.2, max=2.2), vol=vol_data, F=F_data,
+                        C=C_data, frame_interval=2, norm_fac=args.train_dataset.norm_fac) if vol_data.shape[0] > 0 else torch.tensor(0.0, device=pred_sample.device)
                     losses['loss_deform'] = loss_F.detach().item()
                     loss = loss + args.lambda_deform * loss_F
 
-                if args.model_config.floor_cond:
+                if args.model_config.floor_cond and args.lambda_floor > 0:
                     floor_height = batch['floor_height'].reshape(bsz, 1, 1) # (B, 1, 1)
                     sample_min_height = torch.amin(latents[..., 1], dim=(1, 2)).reshape(bsz, 1, 1)
                     floor_height = torch.minimum(floor_height, sample_min_height)
                     loss_floor = (torch.relu(floor_height - pred_sample[..., 1]) ** 2).mean()
                     losses['loss_floor'] = loss_floor.detach().item()
-                    loss += loss_floor
+                    loss += args.lambda_floor * loss_floor
 
+                knn_idx = None
+                if args.lambda_laplacian > 0.0 or args.lambda_edge > 0.0:
+                    knn_idx = build_knn_indices(batch['points_src'], args.laplacian_k)
+
+                if args.lambda_laplacian > 0.0:
+                    loss_laplacian = laplacian_deformation_loss(pred_sample, batch['points_tgt'], knn_idx)
+                    losses['loss_laplacian'] = loss_laplacian.detach().item()
+                    loss = loss + args.lambda_laplacian * loss_laplacian
+
+                if args.lambda_collision > 0.0:
+                    floor_h = batch['floor_height'] if 'floor_height' in batch else None
+                    loss_collision = collision_loss(pred_sample, floor_h, margin=args.collision_margin)
+                    losses['loss_collision'] = loss_collision.detach().item()
+                    loss = loss + args.lambda_collision * loss_collision
+
+                if args.lambda_edge > 0.0:
+                    loss_edge = edge_length_regularization(pred_sample, batch['points_tgt'], knn_idx)
+                    losses['loss_edge'] = loss_edge.detach().item()
+                    loss = loss + args.lambda_edge * loss_edge
+  
+
+  
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(cfg.train_batch_size)).mean()
                 train_loss += avg_loss.item() / cfg.gradient_accumulation_steps
@@ -368,6 +552,68 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
                 train_loss = 0.0
+
+                if accelerator.is_main_process:
+                    step_losses = {
+                        "loss": loss.detach().item(),
+                        "loss_xyz": losses.get("xyz", 0.0),
+                        "loss_mask": losses.get("mask", 0.0),
+                        "loss_vel": losses.get("loss_vel", 0.0),
+                        "loss_p": losses.get("loss_p", 0.0),
+                        "loss_F": losses.get("loss_deform", 0.0),
+                        "loss_floor": losses.get("loss_floor", 0.0),
+                        "loss_laplacian": losses.get("loss_laplacian", 0.0),
+                        "loss_collision": losses.get("loss_collision", 0.0),
+                        "loss_edge": losses.get("loss_edge", 0.0),
+                    }
+                    loss_rows.append([step_losses.get(h, 0.0) if h != "step" else global_step for h in loss_csv_header])
+
+                    for key, value in step_losses.items():
+                        if key not in loss_history:
+                            loss_history[key] = {"steps": [], "values": []}
+                        loss_history[key]["steps"].append(global_step)
+                        loss_history[key]["values"].append(float(value))
+
+                    if global_step % 500 == 0:
+                        if not os.path.exists(loss_csv_path):
+                            with open(loss_csv_path, "w", newline="") as f:
+                                writer = csv.writer(f)
+                                writer.writerow(loss_csv_header)
+                        if loss_rows:
+                            with open(loss_csv_path, "a", newline="") as f:
+                                writer = csv.writer(f)
+                                writer.writerows(loss_rows)
+                            loss_rows.clear()
+
+                        plot_keys = [
+                            "loss",
+                            "loss_xyz",
+                            "loss_mask",
+                            "loss_vel",
+                            "loss_p",
+                            "loss_F",
+                            "loss_floor",
+                            "loss_laplacian",
+                            "loss_collision",
+                            "loss_edge",
+                        ]
+                        for key in plot_keys:
+                            series = loss_history.get(key)
+                            if series is None:
+                                continue
+                            if not series["steps"]:
+                                continue
+                            plt.figure(figsize=(8, 4))
+                            plt.plot(series["steps"], series["values"], linewidth=1.5)
+                            plt.xlabel("step")
+                            plt.ylabel(key)
+                            plt.title(f"{key} curve")
+                            plt.tight_layout()
+                            plot_path = os.path.join(
+                                args.output_dir, f"{key}_curve_step_{global_step:06d}.png"
+                            )
+                            plt.savefig(plot_path, dpi=150)
+                            plt.close()
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -398,20 +644,60 @@ def main(args):
                 if global_step % cfg.validation_steps == 0 or global_step == 1:
                     if accelerator.is_main_process:
                         model.eval()
-                        pipeline = TrajPipeline(model=accelerator.unwrap_model(model), scheduler=DDIMScheduler.from_config(noise_scheduler.config))
+                        eval_scheduler = DDIMScheduler.from_config(noise_scheduler.config) if args.use_diffusion else None
+                        pipeline = TrajPipeline(model=accelerator.unwrap_model(model), scheduler=eval_scheduler)
                         logger.info(
                             f"Running validation... \n."
                         )
+                        seen_models = set()
                         for i, (batch, _) in enumerate(val_dataloader):
                             with torch.autocast("cuda"):
                                 gs = [1.0] if args.condition_drop_rate == 0 else [1.0, 2.0, 3.0]
                                 for guidance_scale in gs:
-                                    output = pipeline(batch['points_src'], batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], device=accelerator.device, batch_size=args.eval_batch_size, generator=torch.Generator().manual_seed(args.seed), n_frames=args.train_dataset.n_training_frames, guidance_scale=guidance_scale)
-                                    output = output.cpu().numpy()
-                                    tgt = batch['points_tgt'].cpu().numpy()
+                                    current_input = batch['points_src'].to(accelerator.device)
+                                    rollout_chunks = [current_input]
+                                    prev_chunk = current_input
+
+                                    for step_idx in range(ROLLOUT_STEPS):
+                                        if step_idx == 0:
+                                            step_start_vel = batch.get('start_vel', None)
+                                            if step_start_vel is not None:
+                                                step_start_vel = step_start_vel.to(accelerator.device)
+                                        else:
+                                            step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
+
+                                        pred_chunk = pipeline(
+                                            current_input,
+                                            batch['force'],
+                                            batch['E'],
+                                            batch['nu'],
+                                            batch['mask'][..., :1],
+                                            batch['drag_point'],
+                                            batch['floor_height'],
+                                            batch['gravity'],
+                                            batch['base_drag_coeff'],
+                                            start_vel=step_start_vel,
+                                            y=None if 'mat_type' not in batch else batch['mat_type'],
+                                            device=accelerator.device,
+                                            batch_size=current_input.shape[0],
+                                            generator=torch.Generator().manual_seed(args.seed),
+                                            n_frames=OUTPUT_FRAMES,
+                                            guidance_scale=guidance_scale,
+                                        )
+                                        rollout_chunks.append(pred_chunk)
+
+                                        prev_chunk = current_input
+                                        current_input = pred_chunk
+
+                                    output = torch.cat(rollout_chunks, dim=1).cpu().numpy()
+                                    tgt = build_raw_reference(batch, args.train_dataset, output.shape[1]).cpu().numpy()
                                     save_dir = os.path.join(vis_dir, f'{global_step:06d}')
                                     os.makedirs(save_dir, exist_ok=True)
                                     for j in range(output.shape[0]):
+                                        model_name = batch['model'][j]
+                                        if model_name in seen_models:
+                                            continue
+                                        seen_models.add(model_name)
                                         save_pointcloud_video(output[j:j+1].squeeze(), tgt[j:j+1].squeeze(), os.path.join(save_dir, f'{i*batch["points_src"].shape[0] + j}_{guidance_scale}.gif'),
                                             drag_mask=batch['mask'][j:j+1, 0, :, 0].cpu().numpy().squeeze(), vis_flag=args.train_dataset.dataset_path)
                                         # pred_name = f'{i*batch["points_src"].shape[0]+j}_pred.json'
@@ -434,6 +720,9 @@ def main(args):
     accelerator.wait_for_everyone()
     # if accelerator.is_main_process:
     #     unet = unet.to(torch.float32)
+    if log_file is not None:
+        log_file.flush()
+        log_file.close()
     accelerator.end_training()
 
 

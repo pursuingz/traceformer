@@ -11,7 +11,7 @@ class DeformLoss(torch.nn.Module):
         super().__init__()
 
         self.device = "cuda"
-        self.N = 2048
+        self.N = 512
         self.I33 = torch.eye(3, device=self.device).unsqueeze(0).repeat(self.N, 1, 1)
         self.dT = 0.0417
         self.grid_lim = 10

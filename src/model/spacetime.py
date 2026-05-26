@@ -453,6 +453,112 @@ class TemporalOnlyTransformerBlock(nn.Module):
 
 
 @maybe_allow_in_graph
+class SpatialTemporalTransformerBlockv3(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        self.spatial_block = SpatialOnlyTransformerBlock(
+            dim=dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            time_embed_dim=time_embed_dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            attention_bias=attention_bias,
+            qk_norm=qk_norm,
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+            final_dropout=final_dropout,
+            ff_inner_dim=ff_inner_dim,
+            ff_bias=ff_bias,
+            attention_out_bias=attention_out_bias,
+        )
+
+        self.temporal_block = TemporalOnlyTransformerBlock(
+            dim=dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            time_embed_dim=time_embed_dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            attention_bias=attention_bias,
+            qk_norm=qk_norm,
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+            final_dropout=final_dropout,
+            ff_inner_dim=ff_inner_dim,
+            ff_bias=ff_bias,
+            attention_out_bias=attention_out_bias,
+        )
+
+        self.hidden_fuse = nn.Sequential(
+            nn.LayerNorm(dim * 2, norm_eps, norm_elementwise_affine),
+            nn.Linear(dim * 2, dim),
+        )
+        self.encoder_fuse = nn.Sequential(
+            nn.LayerNorm(dim * 2, norm_eps, norm_elementwise_affine),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        B, F, _, _ = hidden_states.shape
+
+        if encoder_hidden_states.shape[0] != B * F:
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(F, 0)
+
+        spatial_hidden_states, spatial_encoder_hidden_states = self.spatial_block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        temporal_hidden_states, temporal_encoder_hidden_states = self.temporal_block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        hidden_states = hidden_states + self.hidden_fuse(
+            torch.cat(
+                [spatial_hidden_states - hidden_states, temporal_hidden_states - hidden_states],
+                dim=-1,
+            )
+        )
+        encoder_hidden_states = encoder_hidden_states + self.encoder_fuse(
+            torch.cat(
+                [spatial_encoder_hidden_states - encoder_hidden_states, temporal_encoder_hidden_states - encoder_hidden_states],
+                dim=-1,
+            )
+        )
+
+        return hidden_states, encoder_hidden_states
+
+
+@maybe_allow_in_graph
 class SpatialTemporalTransformerBlockv2(nn.Module):
     def __init__(
         self,
@@ -572,6 +678,278 @@ class SpatialTemporalTransformerBlockv2(nn.Module):
         hidden_states = rearrange(hidden_states, '(b n) f c -> b f n c', n=N)
 
         return hidden_states, encoder_hidden_states, encoder_hidden_states_time
+
+
+@maybe_allow_in_graph
+class SpatialTemporalTransformerBlockNoDiffusion(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        self.norm1_hidden = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+        self.norm1_encoder = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        self.norm2_hidden = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+        self.norm2_encoder = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+        self.norm_temp = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+        self.attn_temp = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        text_seq_length = encoder_hidden_states.size(1)
+
+        B, F, N, _ = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, N, hidden_states.shape[-1])
+        if encoder_hidden_states.shape[0] != B * F:
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(F, 0)
+
+        norm_hidden_states = self.norm1_hidden(hidden_states)
+        norm_encoder_hidden_states = self.norm1_encoder(encoder_hidden_states)
+        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+        hidden_states = hidden_states + attn_hidden_states
+        encoder_hidden_states = encoder_hidden_states + attn_encoder_hidden_states
+
+        norm_hidden_states = self.norm2_hidden(hidden_states)
+        norm_encoder_hidden_states = self.norm2_encoder(encoder_hidden_states)
+        ff_input = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+        ff_output = self.ff(ff_input)
+        hidden_states = hidden_states + ff_output[:, text_seq_length:]
+        encoder_hidden_states = encoder_hidden_states + ff_output[:, :text_seq_length]
+
+        hidden_states = rearrange(hidden_states, '(b f) n c -> (b n) f c', f=F)
+        hidden_states = self.attn_temp(self.norm_temp(hidden_states)) + hidden_states
+        hidden_states = rearrange(hidden_states, '(b n) f c -> b f n c', n=N)
+
+        return hidden_states, encoder_hidden_states
+
+
+class SpatialTemporalTransformerNoDiffusion(ModelMixin, ConfigMixin, PeftAdapterMixin):
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        num_attention_heads: int = 8,
+        attention_head_dim: int = 64,
+        in_channels: int = 3,
+        out_channels: Optional[int] = 3,
+        num_layers: int = 8,
+        dropout: float = 0.0,
+        attention_bias: bool = True,
+        sample_points: int = 2048,
+        sample_frames: int = 48,
+        patch_size: int = 1,
+        patch_size_t: Optional[int] = None,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        use_positional_embeddings: bool = True,
+        use_learned_positional_embeddings: bool = False,
+        cond_seq_length: int = 4,
+        qk_norm: bool = True,
+        activation_fn: str = "gelu-approximate",
+    ):
+        super().__init__()
+        inner_dim = num_attention_heads * attention_head_dim
+
+        if use_positional_embeddings and use_learned_positional_embeddings:
+            raise ValueError(
+                "There are no checkpoints available with disabled rotary embeddings and learned positional embeddings."
+            )
+
+        self.embedding_dropout = nn.Dropout(dropout)
+        self.cond_seq_length = cond_seq_length
+        self.gradient_checkpointing = False
+        self.use_positional_embeddings = use_positional_embeddings or use_learned_positional_embeddings
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                SpatialTemporalTransformerBlockNoDiffusion(
+                    dim=inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                    dropout=dropout,
+                    activation_fn=activation_fn,
+                    attention_bias=attention_bias,
+                    qk_norm=qk_norm,
+                    norm_elementwise_affine=norm_elementwise_affine,
+                    norm_eps=norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
+        self.norm_out = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
+
+        if patch_size_t is None:
+            output_dim = patch_size * patch_size * out_channels
+        else:
+            output_dim = patch_size * patch_size * patch_size_t * out_channels
+        self.proj_out = nn.Linear(inner_dim, output_dim)
+
+        if self.use_positional_embeddings:
+            self.embed_dim = inner_dim
+            persistent = use_learned_positional_embeddings
+            pos_embedding = self._get_positional_embeddings(sample_points, sample_frames)
+            self.register_buffer("pos_embedding", pos_embedding, persistent=persistent)
+
+    def _get_positional_embeddings(self, points: int, frames: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        pos_embedding = get_3d_sincos_pos_embed(
+            self.embed_dim,
+            points,
+            frames,
+            device=device,
+            output_type="pt",
+        )
+        pos_embedding = pos_embedding.flatten(0, 1)
+        joint_pos_embedding = pos_embedding.new_zeros(
+            1, self.cond_seq_length + points * frames, self.embed_dim, requires_grad=False
+        )
+        joint_pos_embedding.data[:, self.cond_seq_length:].copy_(pos_embedding)
+        return joint_pos_embedding
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        self.gradient_checkpointing = value
+
+    @property
+    def attn_processors(self) -> Dict[str, AttentionProcessor]:
+        processors = {}
+
+        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
+            if hasattr(module, "get_processor"):
+                processors[f"{name}.processor"] = module.get_processor()
+
+            for sub_name, child in module.named_children():
+                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
+
+            return processors
+
+        for name, module in self.named_children():
+            fn_recursive_add_processors(name, module, processors)
+
+        return processors
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Union[int, float, torch.LongTensor],
+        timestep_cond: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
+        force_drop_ids: Optional[torch.Tensor] = None,
+        ofs: Optional[Union[int, float, torch.LongTensor]] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        indices: Optional[torch.LongTensor] = None,
+        return_dict: bool = True,
+    ):
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            scale_lora_layers(self, lora_scale)
+        else:
+            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
+        B, F, N, C = hidden_states.shape
+        full_seq = torch.cat([encoder_hidden_states, hidden_states.reshape(B, F * N, -1)], axis=1)
+
+        if self.use_positional_embeddings:
+            pos_embedding = self.pos_embedding.to(dtype=full_seq.dtype)
+            hidden_states = full_seq + pos_embedding
+        else:
+            hidden_states = full_seq
+
+        hidden_states = self.embedding_dropout(hidden_states)
+        encoder_hidden_states = hidden_states[:, :self.cond_seq_length]
+        hidden_states = hidden_states[:, self.cond_seq_length:].reshape(B, F, N, C)
+
+        for _, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                def create_custom_forward(module):
+                    def custom_forward(h, e):
+                        return module(h, e, image_rotary_emb=image_rotary_emb)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    **ckpt_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+        hidden_states = rearrange(hidden_states, 'b f n c -> b (f n) c')
+        hidden_states = self.norm_final(hidden_states)
+        hidden_states = self.norm_out(hidden_states)
+        output = self.proj_out(hidden_states)
+
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
+
+        return output
 
 class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
     """
@@ -861,7 +1239,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states = hidden_states[:, :self.cond_seq_length]
         hidden_states = hidden_states[:, self.cond_seq_length:].reshape(B, F, N, C)
 
-        if self.transformer_block not in ["SpatialTemporalTransformerBlock", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
             encoder_hidden_states_time = hidden_states[:, :self.cond_seq_length_t]
             encoder_hidden_states_time = rearrange(encoder_hidden_states_time, 'b f n c -> (b n) f c')
             hidden_states = hidden_states[:, self.cond_seq_length_t:]
@@ -876,7 +1254,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         hidden_states,
@@ -897,7 +1275,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         **ckpt_kwargs,
                     )
             else:
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     hidden_states, encoder_hidden_states = block(
                         hidden_states=hidden_states,
                         encoder_hidden_states=encoder_hidden_states,
@@ -933,7 +1311,7 @@ class MDM_ST(nn.Module):
         self.n_points = n_points
         self.n_feats = n_feats
         self.latent_dim = model_config.latent_dim
-        self.cond_frame = 1 if model_config.frame_cond else 0
+        self.cond_frame = model_config.get('cond_frames', 1 if model_config.frame_cond else 0)
         self.frame_cond = model_config.frame_cond
 
         if model_config.get('point_embed', True):
@@ -946,7 +1324,7 @@ class MDM_ST(nn.Module):
             print('Use mask condition')
             self.mask_encoder = nn.Linear(1, self.latent_dim)
             self.cond_frame += 1
-        self.pred_offset = model_config.get('pred_offset', True)
+        self.pred_offset = model_config.get('pred_offset', False)
         self.num_neighbors = model_config.get('num_neighbors', 0)
         self.max_num_forces = model_config.get('max_num_forces', 1)
         self.model_config = model_config
@@ -988,8 +1366,19 @@ class MDM_ST(nn.Module):
             self.cond_seq_length += 1
 
         self.class_dropout_prob = model_config.get('class_dropout_prob', 0.0)
-        self.dit = SpaitalTemporalTransformer(sample_points=n_points, sample_frames=n_frame+self.cond_frame, in_channels=n_feats,
-            num_layers=model_config.n_layers, num_attention_heads=self.latent_dim // 64, time_embed_dim=self.latent_dim, cond_seq_length=self.cond_seq_length, cond_seq_length_t=self.cond_frame, transformer_block=model_config.transformer_block, num_classes=self.num_mat, class_dropout_prob=self.class_dropout_prob)
+        self.start_vel_encoder = nn.Linear(3, self.latent_dim)
+        if model_config.transformer_block == "SpatialTemporalTransformerNoDiffusion":
+            self.dit = SpatialTemporalTransformerNoDiffusion(
+                sample_points=n_points,
+                sample_frames=n_frame + self.cond_frame,
+                in_channels=n_feats,
+                num_layers=model_config.n_layers,
+                num_attention_heads=self.latent_dim // 64,
+                cond_seq_length=self.cond_seq_length,
+            )
+        else:
+            self.dit = SpaitalTemporalTransformer(sample_points=n_points, sample_frames=n_frame+self.cond_frame, in_channels=n_feats,
+                num_layers=model_config.n_layers, num_attention_heads=self.latent_dim // 64, time_embed_dim=self.latent_dim, cond_seq_length=self.cond_seq_length, cond_seq_length_t=self.cond_frame, transformer_block=model_config.transformer_block, num_classes=self.num_mat, class_dropout_prob=self.class_dropout_prob)
         
         self._init_weights()
 
@@ -1000,7 +1389,7 @@ class MDM_ST(nn.Module):
     def enable_gradient_checkpointing(self):
         self.dit._set_gradient_checkpointing(True)
 
-    def forward(self, x, timesteps, init_pc, force, E, nu, drag_mask, drag_point, floor_height, gravity_label=None, coeff=None, y=None, null_emb=None):
+    def forward(self, x, timesteps, init_pc, force, E, nu, drag_mask, drag_point, floor_height, gravity_label=None, coeff=None, y=None, null_emb=None, start_vel=None):
         
         """
         x: [batch_size, frame, n_points, n_feats], denoted x_t in the paper
@@ -1008,15 +1397,26 @@ class MDM_ST(nn.Module):
         """
         
         bs, n_frame, n_points, n_feats = x.shape
-        
-        init_pc = init_pc.reshape(bs, n_points, n_feats)
+
+        if init_pc.ndim == 4:
+            if getattr(self.model_config, 'cond_frames', 1) > 1:
+                # User wants multiple frames, keep all of them
+                init_pc_cond = init_pc
+            else:
+                # Default behavior: take the last frame
+                init_pc_cond = init_pc[:, -1:, :, :]
+            init_pc_base = init_pc[:, -1]
+        else:
+            init_pc_base = init_pc.reshape(bs, n_points, n_feats)
+            init_pc_cond = init_pc_base.unsqueeze(1)
+
         force = force.unsqueeze(1) if force.ndim == 2 else force
         drag_point = drag_point.unsqueeze(1) if drag_point.ndim == 2 else drag_point
         E = E.unsqueeze(1)
         nu = nu.unsqueeze(1)
 
         if self.num_neighbors > 0:
-            rel_dist = torch.cdist(init_pc, init_pc)
+            rel_dist = torch.cdist(init_pc_base, init_pc_base)
             dist, indices = rel_dist.topk(self.num_neighbors, largest = False)
             indices = indices.repeat_interleave(n_frame, 0)
             # indices = torch.cat([indices, torch.tensor([2048, 2049, 2050, 2051])[None, None].repeat(bs*n_frame, n_points, 1).to(indices.device)], axis=2)
@@ -1032,7 +1432,8 @@ class MDM_ST(nn.Module):
         elif self.force_as_latent:
             encoder_hidden_states = torch.cat([self.E_cond_encoder(E), self.nu_cond_encoder(nu)], axis=1)
             force = force.unsqueeze(1).repeat(1, n_points, 1, 1) # (B, n_points, n_forces, 3)
-            all_force = torch.cat([force, drag_mask.permute(0, 2, 1, 3)], dim=-1).reshape(bs, n_points, -1) # (B, n_points, n_forces, 4)
+            drag_mask_force = drag_mask.to(dtype=force.dtype)
+            all_force = torch.cat([force, drag_mask_force.permute(0, 2, 1, 3)], dim=-1).reshape(bs, n_points, -1) # (B, n_points, n_forces, 4)
         else:
             encoder_hidden_states = torch.cat([self.force_cond_encoder(force), self.E_cond_encoder(E),
                 self.nu_cond_encoder(nu), self.drag_point_encoder(drag_point[..., :3])], axis=1) 
@@ -1051,21 +1452,27 @@ class MDM_ST(nn.Module):
         if null_emb is not None:
             encoder_hidden_states = encoder_hidden_states * null_emb
         if self.frame_cond:
-            x = torch.cat([init_pc.unsqueeze(1), x], axis=1) # Condition on first frame
+            x = torch.cat([init_pc_cond, x], axis=1)
         if self.force_as_latent:
             all_force = all_force.unsqueeze(1).repeat(1, x.shape[1], 1, 1) # (B, n_frame, n_points, n_forces*4)
             x = torch.cat([x, all_force], dim=-1) # (B, n_frame, n_points, n_feats+n_forces * 4)
             n_feats = x.shape[-1]
         hidden_states = self.input_encoder(x.reshape(-1, n_points,
             n_feats)).reshape(bs, -1, n_points, self.latent_dim)
+        if start_vel is not None:
+            start_vel = start_vel[:, 0] if start_vel.ndim == 4 else start_vel
+            start_vel = start_vel.to(dtype=hidden_states.dtype)
+            start_vel_hidden = self.start_vel_encoder(start_vel)
+            hidden_states[:, 0] = hidden_states[:, 0] + start_vel_hidden
         if self.mask_cond:
-            mask = self.mask_encoder(drag_mask[:, :1])
+            mask_input = drag_mask[:, :1].to(dtype=self.mask_encoder.weight.dtype)
+            mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
-        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock"]:
+        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
-        output = output + init_pc.unsqueeze(1) if self.pred_offset else output
+        output = output + init_pc_base.unsqueeze(1) if self.pred_offset else output
             
         return output
 
@@ -1099,6 +1506,8 @@ if __name__ == "__main__":
         t_total = 0 
         for i in range(100):
             model = MDM_ST(point_num, frame_num, 3, cfg.model_config).to(device).to(torch.float16)
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Total trainable parameters: {total_params / 1e6:.2f}M")
             model.train()
             import time
             t0 = time.time()

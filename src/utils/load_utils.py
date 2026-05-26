@@ -71,7 +71,7 @@ def load_diffusion(device, model_cfg_path, diffusion_ckpt_path, seed=0):
     ckpt = load_file(diffusion_ckpt_path, device='cpu')
     model.load_state_dict(ckpt, strict=False)
     model.eval().requires_grad_(False)
-    noise_scheduler = DDIMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False)
+    noise_scheduler = DDIMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False) if cfg.use_diffusion else None
     pipeline = TrajPipeline(model=model, scheduler=noise_scheduler)
     return pipeline
 

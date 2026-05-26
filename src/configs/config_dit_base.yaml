@@ -1,11 +1,11 @@
 image_size: 128
 output_dir: ./outputs/dit_${model_config.n_layers}layers_${pc_size}p_${train_dataset.category}_${train_dataset.n_training_frames}frames_pointembed_latent${model_config.latent_dim}_deform${lambda_deform}_8gpus_base
 seed: 0
-train_batch_size: 2
-eval_batch_size: 4
+train_batch_size: 1
+eval_batch_size: 1
 num_train_epochs: 50
 max_train_steps: 60000
-gradient_accumulation_steps: 25
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 learning_rate: 1e-4
 scale_lr: false
@@ -13,7 +13,7 @@ lr_scheduler: "costant_with_warmup"
 lr_warmup_steps: 100
 use_8bit_adam: false
 allow_tf32: true
-dataloader_num_workers: 48
+dataloader_num_workers: 16
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_weight_decay: 1.e-2
@@ -38,28 +38,36 @@ set_grads_to_none: true
 lambda_vel: 1.0
 lambda_mask: 0.0
 lambda_momentum: 0.0
-lambda_deform: 0.001
-pc_size: 2048
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
 condition_drop_rate: 0.0
 model_type: 'dit_st'
+pred_offset: true
 model_config:
   n_layers: 8
   latent_dim: 256
   frame_cond: true
   point_embed: true
-  mask_cond: false
+  mask_cond: true
   pred_offset: true
   num_neighbors: -1
-  floor_cond: false
+  floor_cond: True
   max_num_forces: 1
   force_as_token: false
   force_as_latent: false
   coeff_cond: false
   class_token: false
-  transformer_block: SpatialTemporalTransformerBlock
+  transformer_block: SpatialTemporalTransformerBlock 
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: DATASET_FOLDER
+  dataset_path: site
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true # no gravity
   max_num_forces: ${model_config.max_num_forces}
@@ -70,7 +78,7 @@ train_dataset:
   repeat: 1
   seed: 0
   n_sample_pro_model: 300
-  n_frames_interval: 2
+  n_frames_interval: 1
   n_training_frames: 24
   batch_size: 20
   overfit: false

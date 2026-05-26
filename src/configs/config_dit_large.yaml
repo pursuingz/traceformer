@@ -39,6 +39,11 @@ lambda_vel: 1.0
 lambda_mask: 0.0
 lambda_momentum: 0.0
 lambda_deform: 0.001
+lambda_laplacian: 0.0
+lambda_collision: 0.0
+lambda_edge: 0.0
+laplacian_k: 8
+collision_margin: 0.01
 pc_size: 2048
 condition_drop_rate: 0.0
 model_type: 'dit_st'
@@ -58,7 +63,7 @@ model_config:
   coeff_cond: false
   num_mat: 4
   class_token: true
-  transformer_block: SpatialTemporalTransformerBlock
+  transformer_block: SpatialTemporalTransformerBlockv3
 train_dataset:
   category: hf-objaverse-v1
   dataset_path: DATASET_FOLDER

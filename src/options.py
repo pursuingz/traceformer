@@ -58,11 +58,16 @@ class TrainingConfig:
     lambda_mask : float
     lambda_momentum: float
     lambda_deform: float
+    lambda_laplacian: float
+    lambda_collision: float
+    lambda_edge: float
+    lambda_floor: float      # Floor collision penalty weight
+    laplacian_k: int
+    collision_margin: float
     overfit: bool
 
     # Diffusion Specific
     condition_drop_rate: float
-
     # Dataset
     train_dataset: Dict
 
@@ -71,6 +76,7 @@ class TrainingConfig:
     pred_offset: bool
     model_config: Dict
     pc_size: int
+    use_diffusion: bool = False
 
 @dataclass
 class TestingConfig:

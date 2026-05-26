@@ -181,7 +181,7 @@ def run_diffusion(args, output_dir):
     ckpt = load_file(args.model_path, device='cpu')
     model.load_state_dict(ckpt, strict=True)
     model.eval().requires_grad_(False)
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False)
+    noise_scheduler = DDPMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False) if cfg.use_diffusion else None
     pipeline = TrajPipeline(model=model, scheduler=noise_scheduler)
  
     pc_path = f'{output_dir}/point_cloud.ply'  
@@ -323,7 +323,7 @@ def run_diffusion(args, output_dir):
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output = pipeline(batch['points_src'], batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1],
             batch['drag_point'], batch['floor_height'], batch['gravity'], coeff=batch['E'], generator=torch.Generator().manual_seed(args.seed), 
-            device=device, batch_size=1, y=batch['mat_type'], n_frames=n_training_frames, num_inference_steps=25)
+            device=device, batch_size=1, y=batch['mat_type'], n_frames=n_training_frames, num_inference_steps=25 if cfg.use_diffusion else 1)
         output = output.cpu().numpy()  
         for j in range(output.shape[0]):
             if batch['gravity'][0] == 1:

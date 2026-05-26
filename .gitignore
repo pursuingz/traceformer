@@ -2,6 +2,8 @@
 *.pth
 *.safetensors
 
+# 数据与输出
 src/data_generation/data/  
 outputs/
 checkpoints/
+*.csv

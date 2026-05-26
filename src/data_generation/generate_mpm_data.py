@@ -1,10 +1,17 @@
 import sys
 sys.path.append('../')
- 
+
+import argparse
+import os
+
+_fallback_tmp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../tmp'))
+os.makedirs(_fallback_tmp_dir, exist_ok=True)
+os.environ.setdefault('TMPDIR', _fallback_tmp_dir)
+os.environ.setdefault('TEMP', _fallback_tmp_dir)
+os.environ.setdefault('TMP', _fallback_tmp_dir)
+
 import numpy as np
 import torch
-import argparse
-import os 
 import h5py
 import taichi as ti
 import warp as wp
@@ -23,6 +30,8 @@ from simulator.mpm.decode_param import decode_param_json
 from simulator.mpm.filling import get_particle_volume
 from tqdm import tqdm
 
+NO_FLOOR_HEIGHT = -2.4
+
 def run_generation(args):
     
     device = "cuda"
@@ -32,15 +41,15 @@ def run_generation(args):
     wp.init()
     ti.init(arch=ti.cuda, device_memory_GB=8.0)
      
-    N = 2048
+    N = 512
     center = [5, 5, 5]
     drag_size = [0.4, 0.4, 0.4]
     material_type_list = ['elastic', 'plasticine', 'sand']
-    
+
     if args.material not in material_type_list:
         raise ValueError(f"Invalid material type: {args.material}")
     material_type_index = material_type_list.index(args.material)
-    
+
     # Load objects config & get obj list
     print("Loading objects config...")
     material_params, bc_params, time_params, preprocessing_params, camera_params = decode_param_json(args.config)
@@ -52,7 +61,7 @@ def run_generation(args):
         suffix = '.glb'
     else:
         raise ValueError(f"Invalid dataset type: {args.dataset_type}")
-        
+    print(1)    
     start_idx = max(args.start_idx, 0)
     end_idx = min(args.end_idx, len(obj_list))
     idx_list = list(range(start_idx, end_idx)) 
@@ -63,23 +72,24 @@ def run_generation(args):
         os.makedirs(f'{output_dir}/visualization', exist_ok=True)
     
     for i in idx_list:
-        
-        obj_path = obj_list[i]  
+        print(2)
+        obj_path = obj_list[i] 
+        print(3) 
         if not os.path.exists(f'{data_dir}/{obj_path}{suffix}'):
             continue
-            
+        print(3)    
         torch.cuda.empty_cache()
         gc.collect()
         wp.clear_kernel_cache()
-        
+        print(3)
         output_idx = f'{i:05d}_{material_type_index:03d}'
         print(f'Generating {output_idx}...')
         output_path = f'{output_dir}/h5/{output_idx}.h5'
         if os.path.exists(output_path):
             continue
-        
+        print(3)
         seed_everything(output_idx)
-        
+        print(3)
         try:
             mesh = load_mesh(f'{data_dir}/{obj_path}{suffix}')
         except:
@@ -105,14 +115,19 @@ def run_generation(args):
         
         if points.shape[0] != N:
             continue
-        
+        '''
         log_E = np.random.uniform(4, 7)
         E = np.power(10, log_E)
         nu = np.random.uniform(0.05, 0.45) 
-        
+        '''
+        log_E = 6
+        E = np.power(10, log_E)
+        nu = 0.4
+
+
         material_params["material"] = args.material 
         if args.material == 'elastic':
-            force_num = np.random.randint(1, 2) # In our dataset, we only support one non-gravity force for elastic material, feel free to add more
+            force_num = 1
         elif args.material == 'plasticine':
             force_num = np.random.randint(0, 1)
             material_params["yield_stress"] = 10000
@@ -120,8 +135,10 @@ def run_generation(args):
             force_num = np.random.randint(0, 1) 
             material_params["friction"] = 0.3
             
-        if args.material == 'elastic':
-            floor_height = 0.2 
+        if args.disable_floor:
+            floor_height = NO_FLOOR_HEIGHT
+        elif args.material == 'elastic':
+            floor_height = 0.2
         else:
             per_grid_height = material_params["grid_lim"] / material_params["n_grid"]
             floor_height = int(points[:, 1].min().item() / per_grid_height) * per_grid_height - 1e-3
@@ -134,7 +151,7 @@ def run_generation(args):
         frame_dt = time_params["frame_dt"]
         frame_num = time_params["frame_num"]
         step_per_frame = int(frame_dt / substep_dt)
-        
+        print(3)
         material_params["E"] = E
         material_params["nu"] = nu
         grid_lim = material_params["grid_lim"]
@@ -155,7 +172,8 @@ def run_generation(args):
         mpm_solver.add_surface_collider([0, 0, grid_lim-0.2], [0, 0, -1], surface='cut')
         
         # Floor
-        mpm_solver.add_surface_collider([0, floor_height, 0], [0, 1, 0], surface='cut')
+        if not args.disable_floor:
+            mpm_solver.add_surface_collider([0, floor_height, 0], [0, 1, 0], surface='cut')
         mpm_solver.add_surface_collider([0, grid_lim-0.2, 0], [0, -1, 0], surface='cut')
         
         drag_point_list = []
@@ -164,7 +182,7 @@ def run_generation(args):
         total_mask = np.zeros_like(particle_volume.cpu().numpy())
 
         for j in range(force_num):
-
+            
             force_coeff = np.random.uniform(0.02, 0.2)
             drag_point_idx = np.random.randint(0, N)
             drag_point = points[drag_point_idx].cpu().numpy()
@@ -259,12 +277,13 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='outputs_mpm')
     parser.add_argument('--dataset_type', type=str, default='objaverse')
     parser.add_argument('--config', type=str, default='configs/objaverse_mpm.json')  
-    parser.add_argument('--uid_list', type=str, default='configs/objaverse_valid_uid_list_example.json')
+    parser.add_argument('--uid_list', type=str, default='configs/objaverse_valid_uid_list.json')
     parser.add_argument('--start_idx', type=int, default=0)
     parser.add_argument('--end_idx', type=int, default=1) 
     parser.add_argument('--warp_cache_dir', type=str, default='warp_cache') 
     parser.add_argument('--material', type=str, default='elastic')
     parser.add_argument('--visualization', action='store_true')
+    parser.add_argument('--disable_floor', action='store_true', help='Disable floor collider in MPM simulation')
     args = parser.parse_args()
     
     run_generation(args)

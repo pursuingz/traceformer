@@ -1,19 +1,21 @@
-pc_size: 2048
+pc_size: 512
 eval_batch_size: 1
 dataloader_num_workers: 4
 seed: 0 
 pred_offset: true
 model_type: 'dit_st'
 num_inference_steps: 4
+resume: 'outputs/18/checkpoint-12000/model.safetensors'
+vis_dir: 'vis_results'
 model_config:
   n_layers: 8
   latent_dim: 256
   frame_cond: true
   point_embed: true
-  mask_cond: false
+  mask_cond: true
   pred_offset: true
   num_neighbors: -1
-  floor_cond: false
+  floor_cond: true
   max_num_forces: 1
   force_as_token: false
   force_as_latent: false
@@ -23,13 +25,13 @@ model_config:
 train_dataset:
   category: hf-objaverse-v1
   dataset_list: DATASET_ITEM_LIST_TEST
-  dataset_path: DATASET_FOLDER
-  has_graivty: false
+  dataset_path: test
+  has_gravity: false
 
   norm_fac: 5
   stage: 'deform'
   mode: 'diff'
-  pc_size: 2048
+  pc_size: 512
   repeat: 1
   seed: 0
   n_sample_pro_model: 300

@@ -1,7 +1,7 @@
 {
     "substep_dt": 1e-4,
-    "frame_dt": 0.0417,
-    "frame_num": 48,
+    "frame_dt": 0.0834,
+    "frame_num": 24,
     "nu": 0.4,
     "E": 2e6,
     "material": "elastic",

@@ -32,6 +32,12 @@ if __name__ == '__main__':
     parser.add_argument('--from_file', action='store_true',
                         help='Build metadata from file instead of from records of processings.' +
                              'Useful when some processing fail to generate records but file already exists.')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Limit the number of objects to process')
+    parser.add_argument('--start_idx', type=int, default=0,
+                        help='Start index (0-based, inclusive) after loading metadata')
+    parser.add_argument('--end_idx', type=int, default=None,
+                        help='End index (0-based, exclusive) after loading metadata')
     dataset_utils.add_args(parser)
     opt = parser.parse_args(sys.argv[2:])
     opt = edict(vars(opt))
@@ -49,6 +55,19 @@ if __name__ == '__main__':
         metadata = pd.read_csv(os.path.join(opt.output_dir, 'metadata.csv'))
     else:
         metadata = dataset_utils.get_metadata(**opt)
+    
+    # limit number of objects
+    if opt.limit is not None:
+        metadata = metadata.head(opt.limit)
+        print(f'Limited to {len(metadata)} objects')
+
+    if opt.end_idx is not None:
+        metadata = metadata.iloc[opt.start_idx:opt.end_idx]
+    else:
+        metadata = metadata.iloc[opt.start_idx:]
+
+    print(f'Using range [{opt.start_idx}, {opt.end_idx}) -> {len(metadata)} objects')
+    
     metadata.set_index('sha256', inplace=True)
     
     # merge downloaded

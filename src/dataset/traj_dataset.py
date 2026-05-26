@@ -21,6 +21,8 @@ class TrajDataset(Dataset):
         self.n_sample_pro_model = cfg.n_sample_pro_model
         self.n_frames_interval = cfg.n_frames_interval
         self.n_training_frames = cfg.n_training_frames
+        self.input_frames = cfg.get('input_frames', 3)
+        self.output_frames = cfg.get('output_frames', 3)
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
@@ -48,7 +50,7 @@ class TrajDataset(Dataset):
                 self.split_lst = self.split_lst[-8:]
                 print('Test split:', self.split_lst)
         self.split_lst_save = self.split_lst.copy()
-        self.split_lst_pcl_len = [49] * len(self.split_lst_save)
+        self.split_lst_pcl_len = [25] * len(self.split_lst_save)
         # if not os.path.exists(os.path.join(self.dataset_path, f'info_deform_ae_{split}.json')):
         self.prepare_data_lst()
         # with open(os.path.join(self.dataset_path, f'info_deform_ae_{split}.json'), "w") as f:
@@ -66,6 +68,18 @@ class TrajDataset(Dataset):
 
     def prepare_data_lst(self): 
         self.models = []
+        # Dynamically read actual frame counts from h5 files
+        self.split_lst_pcl_len = []
+        for model_name in self.split_lst_save:
+            try:
+                model_metas = h5py.File(os.path.join(self.dataset_path, f'{model_name}'), 'r')
+                num_frames = model_metas['x'].shape[0]
+                self.split_lst_pcl_len.append(num_frames)
+                model_metas.close()
+            except Exception as e:
+                print(f"Warning: Failed to read frame count from {model_name}: {e}")
+                self.split_lst_pcl_len.append(49)  # fallback to default
+        
         if self.stage == 'deform':
             if self.mode == 'ae':
                 if self.split == 'train':
@@ -76,9 +90,13 @@ class TrajDataset(Dataset):
                         for i in range(1, self.batch_size + 1):
                             self.models += [{"model": m, "indices": [i-1, i]}]
             elif self.mode == 'diff':
-                # models_out, indices_out = self.subdivide_into_sequences(self.split_lst_save * self.repeat, self.split_lst_pcl_len * self.repeat)
-                # self.models += [{"model": m, "start_idx": indices_out[i]} for i, m in enumerate(models_out)]
-                self.models += [{"model": m, "start_idx": 0} for i, m in enumerate(self.split_lst_save)]
+                required_span = (self.input_frames + self.output_frames - 1) * self.n_frames_interval + 1
+                for model_name, total_frames in zip(self.split_lst_save, self.split_lst_pcl_len):
+                    max_start = total_frames - required_span
+                    if max_start < 0:
+                        continue
+                    for start_idx in range(0, max_start + 1, 5):
+                        self.models.append({"model": model_name, "start_idx": start_idx})
             else:
                 raise NotImplementedError("mode not implemented")
     
@@ -158,24 +176,53 @@ class TrajDataset(Dataset):
         
         model = self.models[index]
         model_name = model["model"]
+        start_idx = model["start_idx"]
+
+        input_indices = np.arange(start_idx, start_idx + self.input_frames * self.n_frames_interval, self.n_frames_interval)
+        output_indices = np.arange(
+            start_idx + self.input_frames * self.n_frames_interval,
+            start_idx + (self.input_frames + self.output_frames) * self.n_frames_interval,
+            self.n_frames_interval,
+        )
+        all_indices = np.concatenate([input_indices, output_indices])
 
         model_info = {}
         model_info["model"] = model_name
-        model_info["indices"] = np.arange(self.n_training_frames)
+        model_info["indices"] = all_indices
         
         model_data = {}
         model_data['model'] = model_name
+        model_data['start_idx'] = torch.tensor(start_idx).long()
         
         model_metas = h5py.File(os.path.join(self.dataset_path, f'{model_name}'), 'r')
         model_pcls = torch.from_numpy(np.array(model_metas['x']))
+
+        if all_indices[-1] >= model_pcls.shape[0]:
+            raise IndexError(f"Invalid frame indices {all_indices} for sequence length {model_pcls.shape[0]} in {model_name}.")
 
         # if model_pcls[0].shape[0] > self.pc_size:
         #     ind = np.random.default_rng(seed=self.seed).choice(model_pcls[0].shape[0], self.pc_size, replace=False)
         #     points_src = model_pcls[:1]
         #     points_tgt = model_pcls[1:(self.n_training_frames*self.n_frames_interval+1):self.n_frames_interval][:, ind]
         # else: # No need to do fps in new dataset case (input is 2048 points)
-        points_src = model_pcls[:1]
-        points_tgt = model_pcls[1:(self.n_training_frames*self.n_frames_interval+1):self.n_frames_interval]
+        if model_pcls[0].shape[0] > self.pc_size:
+            ind = np.random.default_rng(seed=self.seed).choice(model_pcls[0].shape[0], self.pc_size, replace=False)
+        else:
+            ind = np.arange(model_pcls[0].shape[0])
+
+        model_data['point_indices'] = torch.from_numpy(np.array(ind)).long()
+        points_src = model_pcls[input_indices]
+        points_tgt = model_pcls[output_indices]
+
+        # Per-particle velocity at start_idx.
+        # Rule: first frame velocity is zero; otherwise use central difference from neighboring frames.
+        if start_idx == 0:
+            start_vel = torch.zeros_like(model_pcls[0])
+        else:
+            prev_idx = max(start_idx - 1, 0)
+            next_idx = min(start_idx + 1, model_pcls.shape[0] - 1)
+            denom = max(next_idx - prev_idx, 1)
+            start_vel = (model_pcls[next_idx] - model_pcls[prev_idx]) / float(denom)
 
         if not 'drag_point' in model_metas: # Assume drag direction cross the sphere center
             drag_dir = np.array(model_metas['drag_force'])
@@ -191,12 +238,19 @@ class TrajDataset(Dataset):
         model_data['drag_point'] = (torch.from_numpy(drag_point).float() - self.cfg.norm_fac) / 2
         model_data['points_src'] = (points_src.float() - self.cfg.norm_fac) / 2
         model_data['points_tgt'] = (points_tgt.float() - self.cfg.norm_fac) / 2
+        model_data['start_vel'] = start_vel.float() / 2
 
         model_data['vol'] = torch.from_numpy(np.array(model_metas['vol']))
         model_data['F'] = torch.from_numpy(np.array(model_metas['F']))
-        model_data['F'] = model_data['F'][1:(self.n_training_frames*self.n_frames_interval+1):self.n_frames_interval]
+        if model_data['F'].shape[0] == model_pcls.shape[0]:
+            model_data['F'] = model_data['F'][output_indices]
+        else:
+            model_data['F'] = model_data['F'][np.clip(output_indices - 1, 0, model_data['F'].shape[0] - 1)]
         model_data['C'] = torch.from_numpy(np.array(model_metas['C']))
-        model_data['C'] = model_data['C'][1:(self.n_training_frames*self.n_frames_interval+1):self.n_frames_interval]
+        if model_data['C'].shape[0] == model_pcls.shape[0]:
+            model_data['C'] = model_data['C'][output_indices]
+        else:
+            model_data['C'] = model_data['C'][np.clip(output_indices - 1, 0, model_data['C'].shape[0] - 1)]
 
         mask = torch.from_numpy(np.array(model_metas['drag_mask'])).bool()
 
@@ -270,9 +324,31 @@ class TrajDataset(Dataset):
         model_data['drag_point'] = all_drag_points
 
         if model_pcls[0].shape[0] > self.pc_size:
-            ind = np.random.default_rng(seed=self.seed).choice(model_pcls[0].shape[0], self.pc_size, replace=False)
             model_data['points_src'] = model_data['points_src'][:, ind]
             model_data['points_tgt'] = model_data['points_tgt'][:, ind]
+            model_data['start_vel'] = model_data['start_vel'][ind]
+            mask = mask[:, ind] if mask.shape[-1] > self.pc_size else mask
+
+        all_mask = torch.zeros(self.max_num_forces, self.pc_size).bool()
+        all_mask[:mask.shape[0]] = mask
+        all_mask = all_mask[force_order]
+
+        model_data['mask'] = all_mask[..., None] # (n_forces, pc_size, 1) for compatibility
+        model_data['E'] = torch.log10(torch.from_numpy(np.array(model_metas['E'])).unsqueeze(-1).float()) if np.array(model_metas['E']) > 0 else torch.zeros(1).float()
+        model_data['nu'] = torch.from_numpy(np.array(model_metas['nu'])).unsqueeze(-1).float()
+
+        return model_data, model_info
+        model_data['force'] = all_forces
+
+        all_drag_points = torch.zeros(self.max_num_forces, 4)
+        all_drag_points[:model_data['drag_point'].shape[0]] = model_data['drag_point']
+        all_drag_points = all_drag_points[force_order]
+        model_data['drag_point'] = all_drag_points
+
+        if model_pcls[0].shape[0] > self.pc_size:
+            model_data['points_src'] = model_data['points_src'][:, ind]
+            model_data['points_tgt'] = model_data['points_tgt'][:, ind]
+            model_data['start_vel'] = model_data['start_vel'][ind]
             mask = mask[:, ind] if mask.shape[-1] > self.pc_size else mask
 
         all_mask = torch.zeros(self.max_num_forces, self.pc_size).bool()
