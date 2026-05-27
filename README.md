@@ -1,7 +1,4 @@
-<h1 align="center">PhysCtrl: Generative Physics for Controllable and Physics-Grounded Video Generation  </h1>
-<p align="center"><a href="https://arxiv.org/abs/2509.20358"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
-<a href='https://cwchenwang.github.io/physctrl/'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
-<a href='https://huggingface.co/spaces/chenwang/physctrl'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Live_Demo-blue'></a>
+<h1 align="center">Traceformer  </h1>
 </p>
 
 
