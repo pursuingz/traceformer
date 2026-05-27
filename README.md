@@ -1,6 +1,11 @@
 <h1 align="center">Traceformer  </h1>
 </p>
 
+##Traceformer
+Traceformer is a physics-driven 3D point cloud trajectory generation framework based on a spatiotemporal Transformer architecture. It represents a major evolution and performance-driven reconstruction of PhysCtrl (a diffusion-based generative physics framework for video generation), a breakthrough work presented at NeurIPS 2025.
+
+The traditional PhysCtrl relies on iterative denoising diffusion models, which suffer from fundamental limitations such as slow training convergence, low inference efficiency, the inability to generate videos of arbitrary lengths, and being restricted to initialization from a static rest state. Traceformer thoroughly overcomes these pain points through a newly designed input scheme, non-diffusion deterministic prediction, and an autoregressive rolling mechanism. While maintaining high-fidelity physical simulation effects, it significantly boosts both training and inference efficiency.
+
 
 ## 📦 Installation
 
