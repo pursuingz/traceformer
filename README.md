@@ -5,7 +5,7 @@
 ## 📦 Installation
 
 ```bash
-python3.10 -m venv physctrl
+python3.10 -m venv traceformer
 source physctrl/bin/activate
 # CAUTION: change it to your CUDA version
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118 xformers
