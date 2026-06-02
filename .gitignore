@@ -1,12 +1,17 @@
 **/__pycache__/
 *.pth
 *.safetensors
+*.bin
+*.pkl
 
 # 虚拟环境
 physctrl/
 
 # 数据与输出
-src/data_generation/data/  
+src/data_generation/data/
 outputs/
 checkpoints/
 *.csv
+
+# 训练产物副本(checkpoint/log/曲线图,不入库)
+23(sota)/

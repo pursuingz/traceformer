@@ -1,0 +1,60 @@
+# Eval config aligned to training run 23 (sota).
+# 关键原则:除了 split 由 eval.py 强制为 'val',其余字段严格镜像 23(sota)/config.yaml,
+# 否则训练/评测分布不一致(重力开关、帧间隔、norm_fac、块类型),指标无意义。
+
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+# use_diffusion=false -> 确定性单步推理(pipeline 走 scheduler=None 分支)。与 run 23 一致。
+use_diffusion: false
+# 确定性路径下 pipeline 忽略此值(t=0 单步),保留占位即可。
+num_inference_steps: 1
+
+# !!! 改成你训练机上 run 23 checkpoint 的真实路径 !!!
+# 默认指向最终步;若早期 step 验证更好,换成对应 checkpoint-XXXXX。
+resume: '23(sota)/checkpoint-60000/model.safetensors'
+vis_dir: 'vis_results_23'
+
+# 与 23(sota)/config.yaml 的 model_config 逐字段一致。
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 原版串行块,不是 v3
+
+# 与 run 23 训练的 train_dataset 一致;split='val' 由 eval.py 传入 -> 取打乱后末 8 个 model(held-out)。
+# random.seed(0) 固定,split 可复现。
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site                 # 与训练同源,保证 val split 是同分布 held-out
+  dataset_list: DATASET_ITEM_LIST     # 非现存文件 -> 自动枚举 site/*.h5,复现训练时的列表
+  has_gravity: true                   # 必须 true,与 run 23 一致(eval_base.yaml 误设 false)
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1                # 必须 1,与 run 23 一致(eval_base.yaml 误设 2)
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  # 显式写死,规避 eval.py 先建 dataset 后 create_model 设值的顺序问题(否则会退回默认 3)
+  input_frames: 5
+  output_frames: 5

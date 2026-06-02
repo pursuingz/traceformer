@@ -91,3 +91,4 @@ class TestingConfig:
     eval_batch_size: int
     seed: int
     num_inference_steps: int
+    use_diffusion: bool = False

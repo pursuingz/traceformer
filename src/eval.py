@@ -70,7 +70,15 @@ def main(args):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             current_input = batch['points_src'].to(device)
             rollout_chunks = [current_input]
-            for _ in range(ROLLOUT_STEPS):
+            prev_chunk = current_input
+            for step_idx in range(ROLLOUT_STEPS):
+                if step_idx == 0:
+                    step_start_vel = batch.get('start_vel', None)
+                    if step_start_vel is not None:
+                        step_start_vel = step_start_vel.to(device)
+                else:
+                    step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
+
                 pred_chunk = pipeline(
                     current_input,
                     batch['force'],
@@ -81,7 +89,7 @@ def main(args):
                     batch['floor_height'],
                     batch['gravity'],
                     batch['base_drag_coeff'],
-                    start_vel=batch.get('start_vel', None),
+                    start_vel=step_start_vel,
                     y=None if args.model_config.get('num_mat', 0) == 0 else batch['mat_type'],
                     device=device,
                     batch_size=args.eval_batch_size,
@@ -90,6 +98,7 @@ def main(args):
                     num_inference_steps=args.num_inference_steps,
                 )
                 rollout_chunks.append(pred_chunk)
+                prev_chunk = current_input
                 current_input = pred_chunk
 
             first_pred = rollout_chunks[1]
