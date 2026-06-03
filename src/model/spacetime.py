@@ -559,6 +559,128 @@ class SpatialTemporalTransformerBlockv3(nn.Module):
 
 
 @maybe_allow_in_graph
+class SpatialTemporalTransformerBlockv4(nn.Module):
+    r"""
+    Lean 并行块:空间注意力与时间注意力**并行**作用于同一份输入,各自相对输入的增量经
+    hidden_fuse 融合,之后只过 **一个共享 FFN**(对 [encoder, hidden] 联合做通道混合)。
+
+    相比 v3:去掉了时间分支的独立 FFN 和重复的 AdaLN —— 它们是 v3 把两个各自完整的
+    子块并联带来的冗余,也是 v3 单块 ~1.6x 参数、被迫减层的主因。v4 单块仅比 v1 串行块
+    多一个 fuse 投影(LayerNorm + Linear(2d->d)),参数接近 v1,因而能在等参预算下堆到
+    与 v1 相同的层数,从而干净地隔离「并行注意力 vs 串行注意力」这一个变量。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        # 空间注意力(联合处理 hidden 点 token 与 encoder 条件 token)
+        self.norm1 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        # 时间注意力(逐点跨帧)
+        self.norm_temp = AdaLayerNorm(dim, chunk_dim=1)
+        self.attn_temp = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+        )
+
+        # 融合两条注意力分支的增量(仅 hidden);encoder 只由空间注意力更新,无需 fuse
+        self.hidden_fuse = nn.Sequential(
+            nn.LayerNorm(dim * 2, norm_eps, norm_elementwise_affine),
+            nn.Linear(dim * 2, dim),
+        )
+
+        # 唯一共享 FFN(融合后,对 [encoder, hidden] 联合做通道混合)
+        self.norm2 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        B, F, N, C = hidden_states.shape
+        h0 = hidden_states.reshape(-1, N, C)          # (B*F, N, C) 原始输入
+        text_seq_length = encoder_hidden_states.size(1)
+
+        enc = encoder_hidden_states
+        if enc.shape[0] != B * F:
+            enc = enc.repeat_interleave(F, 0)
+        temb_s = temb.repeat_interleave(F, 0)
+
+        # ---- 分支 1:空间注意力(并行)----
+        norm_h, norm_enc, gate_msa, enc_gate_msa = self.norm1(h0, enc, temb_s)
+        attn_h, attn_enc = self.attn1(
+            hidden_states=norm_h,
+            encoder_hidden_states=norm_enc,
+            image_rotary_emb=image_rotary_emb,
+        )
+        spatial_h = h0 + gate_msa * attn_h            # (B*F, N, C)
+        enc = enc + enc_gate_msa * attn_enc           # encoder 仅此处更新
+
+        # ---- 分支 2:时间注意力(并行,作用于同一份原始输入)----
+        ht = rearrange(hidden_states, 'b f n c -> (b n) f c')
+        temb_t = temb.repeat_interleave(N, 0)
+        norm_ht = self.norm_temp(ht, temb=temb_t)
+        temporal_h = ht + self.attn_temp(norm_ht)
+        temporal_h = rearrange(temporal_h, '(b n) f c -> (b f) n c', n=N)  # 回到 (B*F, N, C)
+
+        # ---- 融合两分支相对输入的增量 + 残差 ----
+        hidden_states = h0 + self.hidden_fuse(
+            torch.cat([spatial_h - h0, temporal_h - h0], dim=-1)
+        )
+
+        # ---- 共享 FFN(对 [encoder, hidden] 联合)----
+        norm_h2, norm_enc2, gate_ff, enc_gate_ff = self.norm2(hidden_states, enc, temb_s)
+        ff_in = torch.cat([norm_enc2, norm_h2], dim=1)
+        ff_out = self.ff(ff_in)
+        hidden_states = hidden_states + gate_ff * ff_out[:, text_seq_length:]
+        enc = enc + enc_gate_ff * ff_out[:, :text_seq_length]
+
+        hidden_states = rearrange(hidden_states, '(b f) n c -> b f n c', f=F)
+        return hidden_states, enc
+
+
+@maybe_allow_in_graph
 class SpatialTemporalTransformerBlockv2(nn.Module):
     def __init__(
         self,
@@ -1081,6 +1203,8 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             TransformerBlock = SpatialTemporalTransformerBlockv2
         elif transformer_block == "SpatialTemporalTransformerBlockv3":
             TransformerBlock = SpatialTemporalTransformerBlockv3
+        elif transformer_block == "SpatialTemporalTransformerBlockv4":
+            TransformerBlock = SpatialTemporalTransformerBlockv4
         elif transformer_block == "SpatialOnlyTransformerBlock":
             TransformerBlock = SpatialOnlyTransformerBlock
         elif transformer_block == "TemporalOnlyTransformerBlock":
