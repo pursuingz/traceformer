@@ -15,3 +15,6 @@ checkpoints/
 
 # 训练产物副本(checkpoint/log/曲线图,不入库)
 23(sota)/
+
+# 项目级 Claude 规范,本地用,不入库
+CLAUDE.md
