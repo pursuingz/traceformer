@@ -1592,7 +1592,7 @@ class MDM_ST(nn.Module):
             mask_input = drag_mask[:, :1].to(dtype=self.mask_encoder.weight.dtype)
             mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
-        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
+        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
