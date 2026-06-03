@@ -46,9 +46,13 @@ class TrajDataset(Dataset):
         else:
             if split == 'train':
                 self.split_lst = self.split_lst[:-4]
-            else:
+            elif split == 'test':
+                # 单独 eval:只评最后 4 个 —— train 用 [:-4],这 4 个训练完全没见过,是干净 held-out
+                self.split_lst = self.split_lst[-4:]
+                print('Eval (clean held-out) split:', self.split_lst)
+            else:  # 'val':训练过程中的验证,保持原状 [-8:],不动
                 self.split_lst = self.split_lst[-8:]
-                print('Test split:', self.split_lst)
+                print('Val split:', self.split_lst)
         self.split_lst_save = self.split_lst.copy()
         self.split_lst_pcl_len = [25] * len(self.split_lst_save)
         # if not os.path.exists(os.path.join(self.dataset_path, f'info_deform_ae_{split}.json')):

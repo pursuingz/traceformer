@@ -58,7 +58,7 @@ def chamfer_distance(pred, gt):
 
 loss_deform = DeformLoss().to('cuda')
 def main(args):
-    val_dataset = TrajDataset('val', args.train_dataset)
+    val_dataset = TrajDataset('test', args.train_dataset)   # 单独 eval 只评最后 4 个干净 held-out
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers)
 
     device = 'cuda'
