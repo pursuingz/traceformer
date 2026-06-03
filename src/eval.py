@@ -47,6 +47,15 @@ def build_raw_reference(batch, dataset_cfg, target_frames):
 
     return torch.stack(raw_sequences, dim=0)
 
+
+def chamfer_distance(pred, gt):
+    """双向 Chamfer(L2,置换不变)。pred/gt: (..., P, 3) -> 标量(对所有帧/样本取均值)。"""
+    pred = pred.reshape(-1, pred.shape[-2], pred.shape[-1]).float()
+    gt = gt.reshape(-1, gt.shape[-2], gt.shape[-1]).float()
+    d = torch.cdist(pred, gt)                       # (BT, P, P) 欧氏距离
+    cd = d.min(dim=2)[0].mean(dim=1) + d.min(dim=1)[0].mean(dim=1)
+    return cd.mean()
+
 loss_deform = DeformLoss().to('cuda')
 def main(args):
     val_dataset = TrajDataset('val', args.train_dataset)
@@ -61,10 +70,13 @@ def main(args):
     noise_scheduler = DDIMScheduler(num_train_timesteps=1000, prediction_type='sample', clip_sample=False) if args.use_diffusion else None
     pipeline = TrajPipeline(model=model, scheduler=noise_scheduler)
 
-    total_loss_p = 0.0
-    total_loss_xyz = 0.0
+    total_loss_xyz = 0.0          # 首段 MSE(头 5 帧,保留向后兼容)
+    total_mse_full = 0.0          # 全 rollout MSE(25 帧)
+    total_chamfer = 0.0           # 全 rollout 平均 Chamfer
+    total_mse_step = torch.zeros(ROLLOUT_STEPS)   # 每个 rollout step 的 MSE(误差累积曲线)
     total_loss_F = 0.0
     total_loss_F_gt = 0.0
+    n_batches = 0
     seen_models = set()
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -108,11 +120,23 @@ def main(args):
                         C=batch['C'].to(device), frame_interval=2, norm_fac=args.train_dataset.norm_fac)
                 loss_F_gt = loss_deform(x=batch['points_tgt'].to(device), vol=batch['vol'].to(device), F=batch['F'].to(device),
                         C=batch['C'].to(device), frame_interval=2, norm_fac=args.train_dataset.norm_fac)
-                total_loss_F += loss_F
-                total_loss_F_gt += loss_F_gt
-            total_loss_xyz += F.mse_loss(first_pred, batch['points_tgt'].to(device))
+                total_loss_F += loss_F.item()
+                total_loss_F_gt += loss_F_gt.item()
+            total_loss_xyz += F.mse_loss(first_pred, batch['points_tgt'].to(device)).item()
 
             gt_vis = build_raw_reference(batch, args.train_dataset, output.shape[1])
+
+            # ---- 全 rollout 量化指标(output 与 gt_vis 均为 25 帧,同归一化空间)----
+            gt_vis_dev = gt_vis.to(device)
+            out_f = output.float()
+            gt_f = gt_vis_dev.float()
+            total_mse_full += F.mse_loss(out_f, gt_f).item()
+            total_chamfer += chamfer_distance(out_f, gt_f).item()
+            for s in range(ROLLOUT_STEPS):
+                lo = (s + 1) * OUTPUT_FRAMES       # 跳过 [0:5] 输入段,只评 4 个预测段
+                hi = lo + OUTPUT_FRAMES
+                total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
+            n_batches += 1
 
             output = output.cpu().numpy()
             tgt = gt_vis.cpu().numpy()
@@ -129,7 +153,16 @@ def main(args):
                 np.save(os.path.join(save_dir, f'{batch["model"][j]}.npy'), output[j:j+1].squeeze())
             torch.cuda.empty_cache()
     generate_html_from_exts(save_dir, os.path.join(save_dir, f'visualize.html'), 'gif')
-    print(total_loss_p, total_loss_xyz, total_loss_F, total_loss_F_gt)
+
+    n = max(n_batches, 1)
+    per_step = (total_mse_step / n).tolist()
+    print(f'===== eval metrics (mean over {n_batches} batches) =====')
+    print(f'  MSE first-chunk : {total_loss_xyz / n:.6e}')
+    print(f'  MSE full-rollout: {total_mse_full / n:.6e}')
+    print(f'  Chamfer  (mean) : {total_chamfer / n:.6e}')
+    print('  MSE per step    : ' + ', '.join(f'step{k+1}={v:.6e}' for k, v in enumerate(per_step)))
+    print(f'  loss_F (pred)   : {total_loss_F / n:.6e}')
+    print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

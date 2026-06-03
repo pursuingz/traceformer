@@ -1,0 +1,57 @@
+# Eval config for A2 实验 v3-5L(并行块,等参对照 run23)。
+# 严格镜像 eval_23.yaml,仅改 4 处:transformer_block / n_layers / resume / vis_dir。
+# 数据集、split、norm_fac、重力、帧间隔全部与 run23 一致 -> 同一 held-out val,指标可直接对比。
+
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+# use_diffusion=false -> 确定性单步推理。与 run23 一致(A2 唯一变量是架构,推理路径必须相同)。
+use_diffusion: false
+num_inference_steps: 1
+
+# !!! 改成训练机上 v3-5L checkpoint 的真实路径 !!!
+# output_dir=./outputs/A2_v3_parallel_5L -> 训完取最终步(或与 run23 同 step 对比更公平)。
+resume: 'outputs/A2_v3_parallel_5L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_v3_5L'
+
+# 与 config_v3_5L.yaml 的 model_config 逐字段一致。
+model_config:
+  n_layers: 5                                            # 改:等参对齐 v1-8L
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlockv3  # 改:并行块,A2 唯一变量
+
+# 与 run23 完全相同的 val split(random.seed(0) 固定,取打乱后末 8 个 model)。
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 5

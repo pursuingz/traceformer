@@ -16,7 +16,7 @@ num_inference_steps: 1
 
 # !!! 改成你训练机上 run 23 checkpoint 的真实路径 !!!
 # 默认指向最终步;若早期 step 验证更好,换成对应 checkpoint-XXXXX。
-resume: '23(sota)/checkpoint-60000/model.safetensors'
+resume: '23(sota)/checkpoint-45000/model.safetensors'
 vis_dir: 'vis_results_23'
 
 # 与 23(sota)/config.yaml 的 model_config 逐字段一致。
