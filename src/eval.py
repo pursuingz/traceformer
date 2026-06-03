@@ -31,21 +31,25 @@ def create_model(args):
 
 def build_raw_reference(batch, dataset_cfg, target_frames):
     raw_sequences = []
+    full_valid = True
+    interval = dataset_cfg.get('n_frames_interval', 1)
     for j, model_name in enumerate(batch['model']):
         h5_path = os.path.join(dataset_cfg.dataset_path, model_name)
         with h5py.File(h5_path, 'r') as model_metas:
             model_pcls = torch.from_numpy(np.array(model_metas['x']))
 
         point_indices = batch['point_indices'][j].cpu().numpy()
-        end_idx = min(target_frames, model_pcls.shape[0])
-        raw_seq = model_pcls[:end_idx][:, point_indices].float()
+        start = int(batch['start_idx'][j]) if 'start_idx' in batch else 0
+        # 与 rollout 输出逐帧对齐:从 start_idx 起、按 n_frames_interval 取帧
+        sel = start + np.arange(target_frames) * interval
+        if sel[-1] >= model_pcls.shape[0]:
+            full_valid = False                       # GT 不够覆盖整段 rollout,该窗口不计入 rollout 指标
+        sel = np.clip(sel, 0, model_pcls.shape[0] - 1)
+        raw_seq = model_pcls[sel][:, point_indices].float()
         raw_seq = (raw_seq - dataset_cfg.norm_fac) / 2
-        if raw_seq.shape[0] < target_frames:
-            pad_count = target_frames - raw_seq.shape[0]
-            raw_seq = torch.cat([raw_seq, raw_seq[-1:].repeat(pad_count, 1, 1)], dim=0)
         raw_sequences.append(raw_seq)
 
-    return torch.stack(raw_sequences, dim=0)
+    return torch.stack(raw_sequences, dim=0), full_valid
 
 
 def chamfer_distance(pred, gt):
@@ -77,6 +81,7 @@ def main(args):
     total_loss_F = 0.0
     total_loss_F_gt = 0.0
     n_batches = 0
+    n_full = 0                    # GT 帧数足够覆盖整段 rollout 的窗口数(rollout 指标的分母)
     seen_models = set()
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -124,19 +129,22 @@ def main(args):
                 total_loss_F_gt += loss_F_gt.item()
             total_loss_xyz += F.mse_loss(first_pred, batch['points_tgt'].to(device)).item()
 
-            gt_vis = build_raw_reference(batch, args.train_dataset, output.shape[1])
+            gt_vis, full_valid = build_raw_reference(batch, args.train_dataset, output.shape[1])
 
-            # ---- 全 rollout 量化指标(output 与 gt_vis 均为 25 帧,同归一化空间)----
-            gt_vis_dev = gt_vis.to(device)
-            out_f = output.float()
-            gt_f = gt_vis_dev.float()
-            total_mse_full += F.mse_loss(out_f, gt_f).item()
-            total_chamfer += chamfer_distance(out_f, gt_f).item()
-            for s in range(ROLLOUT_STEPS):
-                lo = (s + 1) * OUTPUT_FRAMES       # 跳过 [0:5] 输入段,只评 4 个预测段
-                hi = lo + OUTPUT_FRAMES
-                total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
             n_batches += 1
+            # ---- 全 rollout 指标:仅在 GT 帧数足够覆盖整段 rollout 的窗口上算 ----
+            # start_idx>0 的窗口 rollout 会越过序列末尾,GT 不存在,计入只会污染指标。
+            if full_valid:
+                gt_vis_dev = gt_vis.to(device)
+                out_f = output.float()
+                gt_f = gt_vis_dev.float()
+                total_mse_full += F.mse_loss(out_f, gt_f).item()
+                total_chamfer += chamfer_distance(out_f, gt_f).item()
+                for s in range(ROLLOUT_STEPS):
+                    lo = (s + 1) * OUTPUT_FRAMES   # 跳过 [0:5] 输入段,只评 4 个预测段
+                    hi = lo + OUTPUT_FRAMES
+                    total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
+                n_full += 1
 
             output = output.cpu().numpy()
             tgt = gt_vis.cpu().numpy()
@@ -155,11 +163,13 @@ def main(args):
     generate_html_from_exts(save_dir, os.path.join(save_dir, f'visualize.html'), 'gif')
 
     n = max(n_batches, 1)
-    per_step = (total_mse_step / n).tolist()
-    print(f'===== eval metrics (mean over {n_batches} batches) =====')
-    print(f'  MSE first-chunk : {total_loss_xyz / n:.6e}')
-    print(f'  MSE full-rollout: {total_mse_full / n:.6e}')
-    print(f'  Chamfer  (mean) : {total_chamfer / n:.6e}')
+    nf = max(n_full, 1)
+    per_step = (total_mse_step / nf).tolist()
+    print('===== eval metrics =====')
+    print(f'  windows: {n_batches} total, {n_full} full-horizon (rollout 指标分母)')
+    print(f'  MSE first-chunk : {total_loss_xyz / n:.6e}   (全 {n_batches} 窗口, 逐样本对齐)')
+    print(f'  MSE full-rollout: {total_mse_full / nf:.6e}   (仅 {n_full} 全程窗口)')
+    print(f'  Chamfer  (mean) : {total_chamfer / nf:.6e}')
     print('  MSE per step    : ' + ', '.join(f'step{k+1}={v:.6e}' for k, v in enumerate(per_step)))
     print(f'  loss_F (pred)   : {total_loss_F / n:.6e}')
     print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
