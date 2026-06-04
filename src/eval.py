@@ -17,6 +17,26 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from utils.visualization import save_pointcloud_video, save_pointcloud_json, save_threejs_html, generate_html_from_exts
 
+try:
+    from scipy.spatial import ConvexHull
+    _HAS_HULL = True
+except Exception:
+    _HAS_HULL = False
+
+
+def cloud_volume(pc):
+    """点云体积。优先凸包真实体积;无 scipy 时退化为协方差行列式 sqrt(det Σ)(~length^3)。
+    退化/共面导致凸包失败时返回 None,该帧不计入。"""
+    if _HAS_HULL:
+        try:
+            return float(ConvexHull(pc).volume)
+        except Exception:
+            return None
+    c = pc - pc.mean(axis=0)
+    cov = (c.T @ c) / pc.shape[0]
+    return float(np.sqrt(max(float(np.linalg.det(cov)), 0.0)))
+
+
 INPUT_FRAMES = 5
 OUTPUT_FRAMES = 5
 ROLLOUT_STEPS = 4
@@ -82,6 +102,17 @@ def main(args):
     total_loss_F_gt = 0.0
     n_batches = 0
     n_full = 0                    # GT 帧数足够覆盖整段 rollout 的窗口数(rollout 指标的分母)
+    # ---- 物理合理性指标 ----
+    total_vel_mse = 0.0           # 速度误差(帧差, vs GT)
+    total_acc_mse = 0.0           # 加速度误差(二阶差, vs GT)
+    total_vol_err = 0.0           # 体积相对误差 |Vp-Vg|/Vg(vs GT)
+    n_vol = 0                     # 成功算出体积的帧数(凸包可能退化失败)
+    total_vol_drift = 0.0         # 预测体积自漂移 |Vp(t)-Vp(0)|/Vp(0)
+    n_vol_drift = 0
+    total_floor_rate = 0.0        # 地面穿透率(预测帧, 占全部点比例)
+    total_floor_depth = 0.0       # 平均穿透深度(归一化单位)
+    total_floor_rate_gt = 0.0     # GT 参考(应≈0)
+    n_floor_gt = 0
     seen_models = set()
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -129,6 +160,12 @@ def main(args):
                 total_loss_F_gt += loss_F_gt.item()
             total_loss_xyz += F.mse_loss(first_pred, batch['points_tgt'].to(device)).item()
 
+            # ---- 地面穿透(只看预测帧, 不需要 GT; Y 轴朝上, gravity=[0,-1,0]) ----
+            floor_h = batch['floor_height'].to(device).view(-1, 1, 1)   # (B,1,1) 归一化空间
+            y_pred = output[:, INPUT_FRAMES:, :, 1]                     # (B, pred_frames, N)
+            total_floor_rate += (y_pred < floor_h).float().mean().item()
+            total_floor_depth += torch.clamp(floor_h - y_pred, min=0).mean().item()
+
             gt_vis, full_valid = build_raw_reference(batch, args.train_dataset, output.shape[1])
 
             n_batches += 1
@@ -144,6 +181,35 @@ def main(args):
                     lo = (s + 1) * OUTPUT_FRAMES   # 跳过 [0:5] 输入段,只评 4 个预测段
                     hi = lo + OUTPUT_FRAMES
                     total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
+
+                # ---- 速度 / 加速度误差(归一化空间, vs GT) ----
+                v_pred = out_f[:, 1:] - out_f[:, :-1]
+                v_gt = gt_f[:, 1:] - gt_f[:, :-1]
+                total_vel_mse += F.mse_loss(v_pred, v_gt).item()
+                total_acc_mse += F.mse_loss(v_pred[:, 1:] - v_pred[:, :-1],
+                                            v_gt[:, 1:] - v_gt[:, :-1]).item()
+
+                # ---- 体积保持(反归一化到真实尺度后算体积) ----
+                norm_fac = args.train_dataset.norm_fac
+                out_real = (out_f * 2 + norm_fac).cpu().numpy()
+                gt_real = (gt_f * 2 + norm_fac).cpu().numpy()
+                for b in range(out_real.shape[0]):
+                    vp = [cloud_volume(out_real[b, t]) for t in range(out_real.shape[1])]
+                    vg = [cloud_volume(gt_real[b, t]) for t in range(gt_real.shape[1])]
+                    for t in range(len(vp)):
+                        if vp[t] is not None and vg[t] is not None and vg[t] > 1e-9:
+                            total_vol_err += abs(vp[t] - vg[t]) / vg[t]
+                            n_vol += 1
+                    if vp[0] is not None and vp[0] > 1e-9:
+                        for t in range(1, len(vp)):
+                            if vp[t] is not None:
+                                total_vol_drift += abs(vp[t] - vp[0]) / vp[0]
+                                n_vol_drift += 1
+
+                # ---- GT 地面穿透参考(应≈0) ----
+                y_gt = gt_f[:, INPUT_FRAMES:, :, 1]
+                total_floor_rate_gt += (y_gt < floor_h).float().mean().item()
+                n_floor_gt += 1
                 n_full += 1
 
             output = output.cpu().numpy()
@@ -173,6 +239,17 @@ def main(args):
     print('  MSE per step    : ' + ', '.join(f'step{k+1}={v:.6e}' for k, v in enumerate(per_step)))
     print(f'  loss_F (pred)   : {total_loss_F / n:.6e}')
     print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
+    nv = max(n_vol, 1)
+    nvd = max(n_vol_drift, 1)
+    nfg = max(n_floor_gt, 1)
+    print('  --- 物理合理性 ---')
+    print(f'  速度误差 vMSE   : {total_vel_mse / nf:.6e}   (帧差, vs GT, {n_full} 全程窗口)')
+    print(f'  加速度误差 aMSE : {total_acc_mse / nf:.6e}   (二阶差, vs GT)')
+    print(f'  体积相对误差    : {total_vol_err / nv * 100:.3f}%   (|Vp-Vg|/Vg, {n_vol} 帧, {"凸包" if _HAS_HULL else "协方差近似"})')
+    print(f'  体积自漂移      : {total_vol_drift / nvd * 100:.3f}%   (|Vp(t)-Vp(0)|/Vp(0), 近不可压应小)')
+    print(f'  地面穿透率      : {total_floor_rate / n * 100:.3f}%   (预测帧占全部点比例, 全 {n_batches} 窗口)')
+    print(f'  地面穿透深度    : {total_floor_depth / n:.6e}   (归一化单位)')
+    print(f'  地面穿透率(GT)  : {total_floor_rate_gt / nfg * 100:.3f}%   (参考, 应≈0)')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
