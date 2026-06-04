@@ -77,6 +77,10 @@ class TrainingConfig:
     model_config: Dict
     pc_size: int
     use_diffusion: bool = False
+    # Rollout-aware training (scheduled sampling): perturb conditioning points_src with
+    # noise to mimic autoregressive drift at rollout time; target stays clean. 0.0 = off.
+    rollout_input_noise_std: float = 0.0
+    rollout_noise_warmup_steps: int = 0
 
 @dataclass
 class TestingConfig:

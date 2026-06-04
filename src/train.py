@@ -441,6 +441,7 @@ def main(args):
                 latents = batch['points_tgt'] # (bsz, n_frames, n_points, 3)
 
                 bsz = latents.shape[0]
+                cond_points_src = batch['points_src']
                 if args.use_diffusion:
                     noise = torch.randn_like(latents)
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -448,11 +449,19 @@ def main(args):
                     model_input = noise_scheduler.add_noise(latents, noise, timesteps)
                 else:
                     timesteps = torch.zeros((bsz,), device=latents.device, dtype=torch.long)
+                    # Rollout-aware (scheduled sampling): perturb the conditioning frames so the
+                    # model learns to correct its own drift at autoregressive rollout time. The
+                    # target (latents) stays clean. std=0 -> disabled (default for all A2 configs).
+                    sigma = args.rollout_input_noise_std
+                    if sigma > 0:
+                        if args.rollout_noise_warmup_steps > 0:
+                            sigma = sigma * min(1.0, global_step / args.rollout_noise_warmup_steps)
+                        cond_points_src = batch['points_src'] + torch.randn_like(batch['points_src']) * sigma
                     # Use the last source frame repeated as input, instead of zeros,
                     # so that PointEmbed produces differentiated per-point embeddings.
                     # Add small noise to break uniformity across the 5 output frames,
                     # otherwise all output-frame tokens would have identical embeddings.
-                    last_src_frame = batch['points_src'][:, -1:, :, :]  # (B, 1, N, 3)
+                    last_src_frame = cond_points_src[:, -1:, :, :]  # (B, 1, N, 3)
                     model_input = last_src_frame.repeat(1, OUTPUT_FRAMES, 1, 1)  # (B, F, N, 3)
                     model_input = model_input + torch.randn_like(model_input) * 0.02
                     #print("Running training without diffusion.")
@@ -465,7 +474,7 @@ def main(args):
                     null_emb = None
 
                 # Predict the noise residual
-                pred_sample = model(model_input, timesteps, batch['points_src'], batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=batch.get('start_vel', None))
+                pred_sample = model(model_input, timesteps, cond_points_src, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=batch.get('start_vel', None))
                 losses = {}
 
                 loss = F.mse_loss(pred_sample.float(), latents.float())
