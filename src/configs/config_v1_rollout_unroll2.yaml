@@ -1,0 +1,95 @@
+# Phase 1b:多步展开 rollout 训练(DAgger 式,默认不 BPTT),串行 baseline 上的正向贡献。
+# 基于 config_dit_base.yaml(= run23 串行 8L),仅改 3 处:
+#   1. output_dir              -> 独立目录
+#   2. rollout_unroll_steps: 2 -> 训练时多展开 1 个 chunk(共 2 chunk):chunk0 走完整 loss,
+#                                 chunk1 把上一步预测喂回当条件、加 MSE+vel loss(复刻 eval rollout)
+#   3. rollout_bptt: false     -> 喂回时 detach,模型训自己产生的真实误差,省显存稳(K=2 起步)
+# 架构(SpatialTemporalTransformerBlock / n_layers:8)、数据、损失权重、步数全部冻结 = run23。
+# 与 A2 正交:不改架构,A2 对比不受影响。1a 的输入加噪关闭(rollout_input_noise_std: 0)。
+image_size: 128
+output_dir: ./outputs/rollout_v1_unroll2_8L         # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+rollout_input_noise_std: 0.0                        # 1a 输入加噪关闭(已证伪,不叠加)
+rollout_unroll_steps: 2                             # 改 2:展开 2 个 chunk
+rollout_bptt: false                                # 改 3:喂回 detach(DAgger,非 BPTT)
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

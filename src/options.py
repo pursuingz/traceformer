@@ -81,6 +81,12 @@ class TrainingConfig:
     # noise to mimic autoregressive drift at rollout time; target stays clean. 0.0 = off.
     rollout_input_noise_std: float = 0.0
     rollout_noise_warmup_steps: int = 0
+    # 1b multi-step rollout training: unroll K chunks during training, feeding each predicted
+    # chunk back as conditioning (mirrors eval.py rollout). 1 = off (single chunk, == run23).
+    rollout_unroll_steps: int = 1
+    # If True keep the autograd graph across chunks (true BPTT). If False detach the fed-back
+    # prediction (DAgger-style exposure: model trains on its own real errors, cheaper/stable).
+    rollout_bptt: bool = False
 
 @dataclass
 class TestingConfig:

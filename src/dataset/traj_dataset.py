@@ -23,6 +23,9 @@ class TrajDataset(Dataset):
         self.n_training_frames = cfg.n_training_frames
         self.input_frames = cfg.get('input_frames', 3)
         self.output_frames = cfg.get('output_frames', 3)
+        # 1b: number of output chunks to reserve per window for multi-step rollout training.
+        # 1 = single chunk (default, == run23 / eval). Only the training split uses >1.
+        self.rollout_unroll_steps = cfg.get('rollout_unroll_steps', 1)
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
@@ -94,7 +97,8 @@ class TrajDataset(Dataset):
                         for i in range(1, self.batch_size + 1):
                             self.models += [{"model": m, "indices": [i-1, i]}]
             elif self.mode == 'diff':
-                required_span = (self.input_frames + self.output_frames - 1) * self.n_frames_interval + 1
+                # 1b: reserve rollout_unroll_steps output chunks so multi-step GT exists in the window.
+                required_span = (self.input_frames + self.output_frames * self.rollout_unroll_steps - 1) * self.n_frames_interval + 1
                 for model_name, total_frames in zip(self.split_lst_save, self.split_lst_pcl_len):
                     max_start = total_frames - required_span
                     if max_start < 0:
@@ -218,6 +222,17 @@ class TrajDataset(Dataset):
         points_src = model_pcls[input_indices]
         points_tgt = model_pcls[output_indices]
 
+        # 1b: GT for the extra rollout chunks (chunks 1..K-1); chunk 0 stays in points_tgt above.
+        # F/C/vol and all existing losses remain tied to chunk 0 only.
+        points_tgt_roll = None
+        if self.rollout_unroll_steps > 1:
+            roll_indices = np.arange(
+                start_idx + (self.input_frames + self.output_frames) * self.n_frames_interval,
+                start_idx + (self.input_frames + self.output_frames * self.rollout_unroll_steps) * self.n_frames_interval,
+                self.n_frames_interval,
+            )
+            points_tgt_roll = model_pcls[roll_indices]
+
         # Per-particle velocity at start_idx.
         # Rule: first frame velocity is zero; otherwise use central difference from neighboring frames.
         if start_idx == 0:
@@ -242,6 +257,8 @@ class TrajDataset(Dataset):
         model_data['drag_point'] = (torch.from_numpy(drag_point).float() - self.cfg.norm_fac) / 2
         model_data['points_src'] = (points_src.float() - self.cfg.norm_fac) / 2
         model_data['points_tgt'] = (points_tgt.float() - self.cfg.norm_fac) / 2
+        if points_tgt_roll is not None:
+            model_data['points_tgt_roll'] = (points_tgt_roll.float() - self.cfg.norm_fac) / 2
         model_data['start_vel'] = start_vel.float() / 2
 
         model_data['vol'] = torch.from_numpy(np.array(model_metas['vol']))
@@ -330,6 +347,8 @@ class TrajDataset(Dataset):
         if model_pcls[0].shape[0] > self.pc_size:
             model_data['points_src'] = model_data['points_src'][:, ind]
             model_data['points_tgt'] = model_data['points_tgt'][:, ind]
+            if 'points_tgt_roll' in model_data:
+                model_data['points_tgt_roll'] = model_data['points_tgt_roll'][:, ind]
             model_data['start_vel'] = model_data['start_vel'][ind]
             mask = mask[:, ind] if mask.shape[-1] > self.pc_size else mask
 
@@ -352,6 +371,8 @@ class TrajDataset(Dataset):
         if model_pcls[0].shape[0] > self.pc_size:
             model_data['points_src'] = model_data['points_src'][:, ind]
             model_data['points_tgt'] = model_data['points_tgt'][:, ind]
+            if 'points_tgt_roll' in model_data:
+                model_data['points_tgt_roll'] = model_data['points_tgt_roll'][:, ind]
             model_data['start_vel'] = model_data['start_vel'][ind]
             mask = mask[:, ind] if mask.shape[-1] > self.pc_size else mask
 

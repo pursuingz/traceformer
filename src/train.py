@@ -262,6 +262,9 @@ def main(args):
     
     args.train_dataset.input_frames = INPUT_FRAMES
     args.train_dataset.output_frames = OUTPUT_FRAMES
+    # 1b: forward the top-level unroll setting to the dataset so it reserves K output chunks
+    # per window and emits points_tgt_roll. Single source of truth = top-level config.
+    args.train_dataset.rollout_unroll_steps = args.rollout_unroll_steps
     args.model_config.cond_frames = INPUT_FRAMES
     model = MDM_ST(args.pc_size, OUTPUT_FRAMES, n_feats=3, model_config=args.model_config)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -541,6 +544,38 @@ def main(args):
                     loss_edge = edge_length_regularization(pred_sample, batch['points_tgt'], knn_idx)
                     losses['loss_edge'] = loss_edge.detach().item()
                     loss = loss + args.lambda_edge * loss_edge
+
+                # ---- 1b: multi-step rollout training (DAgger / optional BPTT) ----
+                # Continue from the chunk-0 prediction, feed predictions back as conditioning EXACTLY
+                # like eval.py rollout (init_pc = last pred chunk; start_vel = pred[:,1]-prev[:,-1]),
+                # and add MSE(+vel) loss on chunks 1..K-1. chunk 0 above keeps its full loss bundle.
+                # rollout_unroll_steps==1 -> skipped entirely (== run23). bptt=False detaches the
+                # fed-back chunk so the model trains on its own real errors without backprop-through-time.
+                if (not args.use_diffusion) and args.rollout_unroll_steps > 1 and 'points_tgt_roll' in batch:
+                    roll_tgt = batch['points_tgt_roll']                       # (B, (K-1)*F, N, 3)
+                    timesteps0 = torch.zeros((bsz,), device=latents.device, dtype=torch.long)
+                    prev_init = cond_points_src                              # conditioning of chunk 0
+                    init_pc = pred_sample if args.rollout_bptt else pred_sample.detach()
+                    step_start_vel = init_pc[:, 1, :, :] - prev_init[:, -1, :, :]
+                    roll_loss = 0.0
+                    for k in range(1, args.rollout_unroll_steps):
+                        tgt_k = roll_tgt[:, (k - 1) * OUTPUT_FRAMES:k * OUTPUT_FRAMES]
+                        model_input_k = init_pc[:, -1:, :, :].repeat(1, OUTPUT_FRAMES, 1, 1)
+                        model_input_k = model_input_k + torch.randn_like(model_input_k) * 0.02
+                        pred_k = model(model_input_k, timesteps0, init_pc, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=step_start_vel)
+                        loss_k = F.mse_loss(pred_k.float(), tgt_k.float())
+                        if args.lambda_vel > 0.:
+                            tv = tgt_k[:, 1:] - tgt_k[:, :-1]
+                            pv = pred_k[:, 1:] - pred_k[:, :-1]
+                            loss_k = loss_k + args.lambda_vel * F.mse_loss(pv.float(), tv.float())
+                        roll_loss = roll_loss + loss_k
+                        prev_init = init_pc
+                        nxt = pred_k if args.rollout_bptt else pred_k.detach()
+                        step_start_vel = nxt[:, 1, :, :] - prev_init[:, -1, :, :]
+                        init_pc = nxt
+                    roll_loss = roll_loss / (args.rollout_unroll_steps - 1)
+                    losses['roll'] = roll_loss.detach().item()
+                    loss = loss + roll_loss
   
 
   
