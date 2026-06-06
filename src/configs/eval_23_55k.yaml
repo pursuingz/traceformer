@@ -1,6 +1,6 @@
-# Eval config for Phase 1b:多步展开 rollout 训练(串行 8L)。
-# 严格镜像 eval_23.yaml(同架构串行 8L、同数据、同 split、同 norm_fac),只改 resume / vis_dir。
-# eval 不设 rollout_unroll_steps(默认 1)-> 推理路径与 run23 完全一致 -> 与 run23 / A2 各臂可直接对比。
+# run23 baseline @ checkpoint-55000(仅为与 1b@55000 同 step 对比而存在)。
+# 与 eval_23.yaml 逐字段相同,只差 resume 的 step / vis_dir。
+# eval_23.yaml 保持指向 45000(A2 的锚点),不要动它。
 pc_size: 512
 eval_batch_size: 1
 dataloader_num_workers: 4
@@ -11,10 +11,8 @@ model_type: 'dit_st'
 use_diffusion: false
 num_inference_steps: 1
 
-# !!! 改成训练机上 rollout_v1_unroll2_8L checkpoint 的真实路径 !!!
-# 当前对比点 = 55000(与 run23@55000 同 step,见 eval_23_55k.yaml)。
-resume: 'outputs/rollout_v1_unroll2_8L/checkpoint-55000/model.safetensors'
-vis_dir: 'vis_results_rollout_v1_unroll2'
+resume: '23(sota)/checkpoint-55000/model.safetensors'
+vis_dir: 'vis_results_23_55k'
 
 model_config:
   n_layers: 8
@@ -30,7 +28,7 @@ model_config:
   force_as_latent: false
   coeff_cond: false
   class_token: false
-  transformer_block: SpatialTemporalTransformerBlock   # 串行,与训练一致
+  transformer_block: SpatialTemporalTransformerBlock
 
 train_dataset:
   category: hf-objaverse-v1
