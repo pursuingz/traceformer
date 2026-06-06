@@ -87,6 +87,11 @@ class TrainingConfig:
     # If True keep the autograd graph across chunks (true BPTT). If False detach the fed-back
     # prediction (DAgger-style exposure: model trains on its own real errors, cheaper/stable).
     rollout_bptt: bool = False
+    # 1b-v2: weight on the rollout-chunk loss (chunk 0 always keeps weight 1). Full weight (1.0)
+    # cannibalises single-step/base-fit accuracy; down-weight to keep it sharp. Linearly ramped
+    # from 0 over rollout_warmup_steps so base fit is established before rollout loss kicks in.
+    rollout_loss_weight: float = 1.0
+    rollout_warmup_steps: int = 0
 
 @dataclass
 class TestingConfig:

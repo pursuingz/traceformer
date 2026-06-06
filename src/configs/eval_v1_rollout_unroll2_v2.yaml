@@ -1,0 +1,51 @@
+# Eval config for Phase 1b-v2(加权/warmup 的 rollout 训练,串行 8L)。
+# 镜像 eval_23.yaml,只改 resume / vis_dir。eval 不设 rollout_* -> 推理路径同 run23,指标可直接比。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+
+# !!! 改成训练机上 rollout_v1_unroll2_v2_8L checkpoint 的真实路径(对比同 step,如 55000/60000)!!!
+resume: 'outputs/rollout_v1_unroll2_v2_8L/checkpoint-60000/model.safetensors'
+vis_dir: 'vis_results_rollout_v1_unroll2_v2'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 5

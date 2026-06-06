@@ -551,7 +551,10 @@ def main(args):
                 # and add MSE(+vel) loss on chunks 1..K-1. chunk 0 above keeps its full loss bundle.
                 # rollout_unroll_steps==1 -> skipped entirely (== run23). bptt=False detaches the
                 # fed-back chunk so the model trains on its own real errors without backprop-through-time.
-                if (not args.use_diffusion) and args.rollout_unroll_steps > 1 and 'points_tgt_roll' in batch:
+                roll_w = args.rollout_loss_weight
+                if args.rollout_warmup_steps > 0:
+                    roll_w = roll_w * min(1.0, global_step / args.rollout_warmup_steps)
+                if (not args.use_diffusion) and args.rollout_unroll_steps > 1 and 'points_tgt_roll' in batch and roll_w > 0:
                     roll_tgt = batch['points_tgt_roll']                       # (B, (K-1)*F, N, 3)
                     timesteps0 = torch.zeros((bsz,), device=latents.device, dtype=torch.long)
                     prev_init = cond_points_src                              # conditioning of chunk 0
@@ -575,7 +578,7 @@ def main(args):
                         init_pc = nxt
                     roll_loss = roll_loss / (args.rollout_unroll_steps - 1)
                     losses['roll'] = roll_loss.detach().item()
-                    loss = loss + roll_loss
+                    loss = loss + roll_w * roll_loss
   
 
   

@@ -1,0 +1,97 @@
+# Phase 1b-v2:多步展开 rollout 训练 + 加权/warmup(修 1b 的「剂量过头」)。
+# 1b@55000 诊断:per-step 倍率 2.01→1.05 单调收窄(抗漂移机制有效),但 full-weight rollout loss
+# 把 chunk0 单步精度吃掉了(first-chunk +51%),导致净亏。本臂降权 + warmup 保住 base fit。
+# 基于 config_v1_rollout_unroll2.yaml,仅改 3 处:
+#   1. output_dir
+#   2. rollout_loss_weight: 0.5  -> 后续 chunk loss 降权(chunk0 恒权重 1),保单步精度
+#   3. rollout_warmup_steps: 20000 -> 权重从 0 线性 ramp 到 0.5,前期先训纯 chunk0 打牢基础
+# 架构/数据/损失权重/步数仍冻结 = run23,与 A2 正交。
+image_size: 128
+output_dir: ./outputs/rollout_v1_unroll2_v2_8L      # 改 1
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+rollout_input_noise_std: 0.0
+rollout_unroll_steps: 2
+rollout_bptt: false
+rollout_loss_weight: 0.5                            # 改 2:后续 chunk loss 降权
+rollout_warmup_steps: 20000                         # 改 3:权重 0→0.5 线性 ramp(前 20000 步)
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
