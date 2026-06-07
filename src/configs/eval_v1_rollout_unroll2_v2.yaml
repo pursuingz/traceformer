@@ -11,7 +11,7 @@ use_diffusion: false
 num_inference_steps: 1
 
 # !!! 改成训练机上 rollout_v1_unroll2_v2_8L checkpoint 的真实路径(对比同 step,如 55000/60000)!!!
-resume: 'outputs/rollout_v1_unroll2_v2_8L/checkpoint-60000/model.safetensors'
+resume: 'outputs/rollout_v1_unroll2_v2_8L/checkpoint-55000/model.safetensors'
 vis_dir: 'vis_results_rollout_v1_unroll2_v2'
 
 model_config:
