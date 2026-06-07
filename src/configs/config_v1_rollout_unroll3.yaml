@@ -1,0 +1,99 @@
+# Phase 1c:K=3 多步展开 rollout 训练(DAgger 式),rollout-training 这一族的最后一发。
+# 1b 诊断:抗漂移机制真(per-step 倍率单调收窄,K=2 末步收到 1.05),但 full-rollout 仍 +16% 净负;
+# 1b-v2 降权走反更差(末步退回 1.34、full-rollout +43%)。结论:rollout 权重越大越好,该推 horizon 不是降权。
+# 本臂把展开推到 3 chunk(覆盖更远的 step),目标把 step3/step4 倍率压到 <1.0,让 full-rollout 净降。
+# 判定门槛:只有 full-rollout < run23 才算贡献(first-chunk 退一点可接受);过不了 1.0 → 整族证伪,不主张。
+# 基于 config_v1_rollout_unroll2.yaml(=1b),仅改 2 处:
+#   1. output_dir              -> 独立目录
+#   2. rollout_unroll_steps: 3 -> 训练展开 3 个 chunk(chunk0 完整 loss;chunk1/2 喂回预测 + MSE+vel)
+# 权重保持 1b 最优(w=1.0、无 warmup,均默认)。架构/数据/损失权重/步数仍冻结 = run23,与 A2 正交。
+# windowing:required_span=(5+5*3-1)*1+1=20 ≤ n_training_frames=24,每 model 2 窗。
+image_size: 128
+output_dir: ./outputs/rollout_v1_unroll3_8L         # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+rollout_input_noise_std: 0.0                        # 1a 输入加噪关闭(已证伪,不叠加)
+rollout_unroll_steps: 3                             # 改 2:展开 3 个 chunk(K=3)
+rollout_bptt: false                                # 喂回 detach(DAgger,非 BPTT),同 1b
+rollout_loss_weight: 1.0                            # 保持 1b 最优(v2 降权已证伪)
+rollout_warmup_steps: 0                             # 无 warmup(同 1b)
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
