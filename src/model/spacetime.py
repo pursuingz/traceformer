@@ -1449,6 +1449,9 @@ class MDM_ST(nn.Module):
             self.mask_encoder = nn.Linear(1, self.latent_dim)
             self.cond_frame += 1
         self.pred_offset = model_config.get('pred_offset', False)
+        # Phase 2: 把网络原始输出当逐帧速度,cumsum 积分成位置(锚点=最后输入帧)。默认 False
+        # -> run23/A2/rollout 各臂走原 pred_offset 路径,字节不变。无新增参数(cumsum 无参)。
+        self.pred_velocity = model_config.get('pred_velocity', False)
         self.num_neighbors = model_config.get('num_neighbors', 0)
         self.max_num_forces = model_config.get('max_num_forces', 1)
         self.model_config = model_config
@@ -1596,8 +1599,12 @@ class MDM_ST(nn.Module):
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
-        output = output + init_pc_base.unsqueeze(1) if self.pred_offset else output
-            
+        if self.pred_velocity:
+            # 原始输出 = 逐帧速度;cumsum 积分成位置,锚点为最后输入帧(init_pc_base)
+            output = init_pc_base.unsqueeze(1) + torch.cumsum(output, dim=1)
+        elif self.pred_offset:
+            output = output + init_pc_base.unsqueeze(1)
+
         return output
 
 if __name__ == "__main__":

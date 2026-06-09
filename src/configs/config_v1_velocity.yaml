@@ -1,0 +1,93 @@
+# Phase 2:速度/逐帧积分预测(新输入方案,串行 baseline 上的候选正向贡献)。
+# 思路:run23 的 pred_offset 是「静态锚(最后输入帧)+ 每帧独立大位移」,远帧目标幅度大、条件差。
+# 本臂把网络原始输出当「逐帧速度」,cumsum 积分成位置 → 每步目标小且平稳、内建时间平滑与跨步耦合。
+# 实现:仅 spacetime.py forward 改 cumsum 重构(gated by pred_velocity),无新增参数(仍 16.09M)。
+# 基于 config_dit_base.yaml(= run23 串行 8L),仅改 2 处:
+#   1. output_dir
+#   2. model_config.pred_velocity: true  (新开关;pred_offset 保持 true,forward 里 velocity 优先)
+# 架构/数据/损失权重/步数/lr 全部冻结 = run23,唯一变量 = 输出参数化,与 A2/rollout 正交。
+image_size: 128
+output_dir: ./outputs/velocity_v1_8L                # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  pred_velocity: true                               # 改 2:开速度积分(forward 里优先于 pred_offset)
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
