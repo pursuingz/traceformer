@@ -644,14 +644,21 @@ def main(args):
                             "loss_collision",
                             "loss_edge",
                         ]
+                        plot_window = 7500   # 曲线始终只显示最近 7500 step,避免长程压缩看不清近期
+                        cutoff = global_step - plot_window
                         for key in plot_keys:
                             series = loss_history.get(key)
                             if series is None:
                                 continue
                             if not series["steps"]:
                                 continue
+                            # 截取最近 plot_window 个 step(steps 单调递增)
+                            win_steps = [s for s in series["steps"] if s >= cutoff]
+                            win_values = series["values"][len(series["steps"]) - len(win_steps):]
+                            if not win_steps:
+                                continue
                             plt.figure(figsize=(8, 4))
-                            plt.plot(series["steps"], series["values"], linewidth=1.5)
+                            plt.plot(win_steps, win_values, linewidth=1.5)
                             plt.xlabel("step")
                             plt.ylabel(key)
                             plt.title(f"{key} curve")
