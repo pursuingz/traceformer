@@ -1,0 +1,102 @@
+# Phase 1d:rollout 训练改进版 —— horizon curriculum + 训练窗口随机采样 + 纯 DAgger 喂回。
+# 思路:1b 族的病灶 = 单步精度(first-chunk)被 rollout loss 吃掉。本臂用 horizon curriculum
+#   先把单步打牢再逐步加 horizon,并随机采样训练窗口起点(数据增强),喂回时不加输入噪声(1a 已证伪)。
+# 基于 config_dit_base.yaml(= run23 串行 8L),仅改 / 加:
+#   1. output_dir
+#   2. 顶层 rollout_curriculum:[[step, K, windows/model], ...] 升序;每阶段在切换点重建 train loader,
+#      各阶段用各自的窗口长度(=各自起点范围)与采样密度:
+#        step 0–10000   K=1,每 model 采 8 窗口,起点 [0, total-10]≈[0,15](纯单步,不加载 roll-GT)
+#        step 10000–25000 K=2,每 model 采 4 窗口,起点 [0, total-15]≈[0,10]
+#        step 25000–60000 K=3,每 model 采 2 窗口,起点 [0, total-20]≈[0,5]
+#   3. 顶层 rollout_random_window: true(窗口起点在各阶段范围内随机采样)
+#   rollout_loss_weight 用默认 1.0(1b 最优;1b-v2 降权已证伪)、rollout_bptt 默认 false(DAgger 喂回 detach)。
+#   喂回纯 DAgger(不加输入噪声)。架构/数据/损失权重/步数/lr 全部冻结 = run23。
+image_size: 128
+output_dir: ./outputs/rollout_v1_curriculum_8L          # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+# 改 2 / 3:rollout 改进开关(顶层 TrainingConfig 字段)
+rollout_curriculum: [[0, 1, 8], [10000, 2, 4], [25000, 3, 2]]   # [step, K, windows/model];切换点重建 loader
+rollout_random_window: true                                     # 窗口起点在各阶段范围内随机采样(eval 不受影响)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

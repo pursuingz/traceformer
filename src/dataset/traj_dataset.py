@@ -26,6 +26,10 @@ class TrajDataset(Dataset):
         # 1b: number of output chunks to reserve per window for multi-step rollout training.
         # 1 = single chunk (default, == run23 / eval). Only the training split uses >1.
         self.rollout_unroll_steps = cfg.get('rollout_unroll_steps', 1)
+        # curriculum: draw window start frame at random over [0, max_start] at getitem time.
+        self.rollout_random_window = cfg.get('rollout_random_window', False)
+        # curriculum: number of random windows to emit per model (None -> stride-5 count).
+        self.windows_per_model = cfg.get('windows_per_model', None)
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
@@ -103,8 +107,17 @@ class TrajDataset(Dataset):
                     max_start = total_frames - required_span
                     if max_start < 0:
                         continue
-                    for start_idx in range(0, max_start + 1, 5):
-                        self.models.append({"model": model_name, "start_idx": start_idx})
+                    if self.rollout_random_window:
+                        # random-start windows: draw the actual start frame over [0, max_start] at
+                        # getitem time (start_idx=-1 marker). windows_per_model controls how many
+                        # windows this model contributes per epoch (curriculum: 8 / 4 / 2 for K=1/2/3);
+                        # falls back to the stride-5 count when unset.
+                        n_win = self.windows_per_model if self.windows_per_model else len(range(0, max_start + 1, 5))
+                        for _ in range(n_win):
+                            self.models.append({"model": model_name, "start_idx": -1, "max_start": max_start})
+                    else:
+                        for start_idx in range(0, max_start + 1, 5):
+                            self.models.append({"model": model_name, "start_idx": start_idx})
             else:
                 raise NotImplementedError("mode not implemented")
     
@@ -185,6 +198,8 @@ class TrajDataset(Dataset):
         model = self.models[index]
         model_name = model["model"]
         start_idx = model["start_idx"]
+        if start_idx < 0:   # random-window mode: draw a start over [0, max_start]
+            start_idx = int(np.random.randint(0, model["max_start"] + 1))
 
         input_indices = np.arange(start_idx, start_idx + self.input_frames * self.n_frames_interval, self.n_frames_interval)
         output_indices = np.arange(

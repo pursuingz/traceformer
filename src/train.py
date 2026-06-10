@@ -84,6 +84,28 @@ OUTPUT_FRAMES = 5
 ROLLOUT_STEPS = 4
 
 
+def current_stage(global_step, curriculum, default_K):
+    """Curriculum over (unroll horizon K, windows-per-model). Entries are [step, K, n_win]
+    (n_win optional), step-ascending. Returns (K, n_win) for the largest threshold <= global_step.
+    None curriculum -> (default_K, None)."""
+    if not curriculum:
+        return default_K, None
+    def _parse(e):
+        return int(e[1]), (int(e[2]) if len(e) > 2 else None)
+    K, nw = _parse(curriculum[0])
+    for e in curriculum:
+        if global_step >= int(e[0]):
+            K, nw = _parse(e)
+    return K, nw
+
+
+def _seed_worker(worker_id):
+    """Give each DataLoader worker a distinct numpy/random seed so random-window starts differ."""
+    import numpy as _np, random as _r, torch as _t
+    s = (_t.initial_seed() + worker_id) % (2 ** 32)
+    _np.random.seed(s); _r.seed(s)
+
+
 def build_raw_reference(batch, dataset_cfg, target_frames):
     raw_sequences = []
     for j, model_name in enumerate(batch['model']):
@@ -264,7 +286,18 @@ def main(args):
     args.train_dataset.output_frames = OUTPUT_FRAMES
     # 1b: forward the top-level unroll setting to the dataset so it reserves K output chunks
     # per window and emits points_tgt_roll. Single source of truth = top-level config.
-    args.train_dataset.rollout_unroll_steps = args.rollout_unroll_steps
+    # Curriculum: the train loader is rebuilt at each stage boundary (see the train loop), so each
+    # stage uses its own K (-> window length / start-frame range) and windows-per-model sampling.
+    # None -> fixed rollout_unroll_steps. Initial loader uses the stage at step 0; resume corrects
+    # it via the rebuild check at the top of the loop.
+    curriculum = OmegaConf.to_container(args.rollout_curriculum) if args.get('rollout_curriculum', None) else None
+    args.train_dataset.rollout_random_window = args.get('rollout_random_window', False)
+    if curriculum:
+        K0, nw0 = current_stage(0, curriculum, args.rollout_unroll_steps)
+        args.train_dataset.rollout_unroll_steps = K0
+        args.train_dataset.windows_per_model = nw0
+    else:
+        args.train_dataset.rollout_unroll_steps = args.rollout_unroll_steps
     args.model_config.cond_frames = INPUT_FRAMES
     model = MDM_ST(args.pc_size, OUTPUT_FRAMES, n_feats=3, model_config=args.model_config)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -313,7 +346,7 @@ def main(args):
     #     from dataset.water_dataset import TrajDataset
     # Dataset and DataLoaders creation:
     train_dataset = TrajDataset('train', args.train_dataset)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, pin_memory=True)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, pin_memory=True, worker_init_fn=_seed_worker)
 
     val_dataset = TrajDataset('val', args.train_dataset)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers)
@@ -436,9 +469,27 @@ def main(args):
 
     loss_deform = DeformLoss()
 
-    for epoch in range(first_epoch, args.num_train_epochs):
+    # curriculum: rebuild the train loader whenever the stage (K, windows-per-model) changes.
+    def _build_train_loader(K, n_win):
+        args.train_dataset.rollout_unroll_steps = K
+        args.train_dataset.windows_per_model = n_win
+        ds = TrajDataset('train', args.train_dataset)
+        dl = torch.utils.data.DataLoader(ds, batch_size=args.train_batch_size, shuffle=True,
+                                         num_workers=args.dataloader_num_workers, pin_memory=True,
+                                         worker_init_fn=_seed_worker)
+        return accelerator.prepare(dl)
+
+    cur_stage = current_stage(0, curriculum, args.rollout_unroll_steps)  # matches the initial loader
+    while global_step < args.max_train_steps:
         model.train()
         train_loss = 0.0
+        if curriculum:
+            stage_now = current_stage(global_step, curriculum, args.rollout_unroll_steps)
+            if stage_now != cur_stage:
+                cur_stage = stage_now
+                train_dataloader = _build_train_loader(cur_stage[0], cur_stage[1])
+                if accelerator.is_main_process:
+                    logger.info(f"[curriculum] step {global_step}: rebuilt loader K={cur_stage[0]} windows/model={cur_stage[1]}")
         for step, (batch, _) in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 latents = batch['points_tgt'] # (bsz, n_frames, n_points, 3)
@@ -554,17 +605,20 @@ def main(args):
                 roll_w = args.rollout_loss_weight
                 if args.rollout_warmup_steps > 0:
                     roll_w = roll_w * min(1.0, global_step / args.rollout_warmup_steps)
-                if (not args.use_diffusion) and args.rollout_unroll_steps > 1 and 'points_tgt_roll' in batch and roll_w > 0:
-                    roll_tgt = batch['points_tgt_roll']                       # (B, (K-1)*F, N, 3)
+                # curriculum over the unroll horizon K (None -> fixed rollout_unroll_steps).
+                # dataset reserved roll-GT for k_max chunks; here we use only the first cur_K-1.
+                cur_K = cur_stage[0] if curriculum else args.rollout_unroll_steps
+                if (not args.use_diffusion) and cur_K > 1 and 'points_tgt_roll' in batch and roll_w > 0:
+                    roll_tgt = batch['points_tgt_roll'][:, :(cur_K - 1) * OUTPUT_FRAMES]   # (B, (cur_K-1)*F, N, 3)
                     timesteps0 = torch.zeros((bsz,), device=latents.device, dtype=torch.long)
                     prev_init = cond_points_src                              # conditioning of chunk 0
                     init_pc = pred_sample if args.rollout_bptt else pred_sample.detach()
                     step_start_vel = init_pc[:, 1, :, :] - prev_init[:, -1, :, :]
                     roll_loss = 0.0
-                    for k in range(1, args.rollout_unroll_steps):
+                    for k in range(1, cur_K):
                         tgt_k = roll_tgt[:, (k - 1) * OUTPUT_FRAMES:k * OUTPUT_FRAMES]
+                        # pure DAgger: feed back the model's own clean prediction, no extra input noise.
                         model_input_k = init_pc[:, -1:, :, :].repeat(1, OUTPUT_FRAMES, 1, 1)
-                        model_input_k = model_input_k + torch.randn_like(model_input_k) * 0.02
                         pred_k = model(model_input_k, timesteps0, init_pc, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=step_start_vel)
                         loss_k = F.mse_loss(pred_k.float(), tgt_k.float())
                         if args.lambda_vel > 0.:
@@ -576,7 +630,7 @@ def main(args):
                         nxt = pred_k if args.rollout_bptt else pred_k.detach()
                         step_start_vel = nxt[:, 1, :, :] - prev_init[:, -1, :, :]
                         init_pc = nxt
-                    roll_loss = roll_loss / (args.rollout_unroll_steps - 1)
+                    roll_loss = roll_loss / (cur_K - 1)
                     losses['roll'] = roll_loss.detach().item()
                     loss = loss + roll_w * roll_loss
   
@@ -769,6 +823,8 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+            if curriculum and current_stage(global_step, curriculum, args.rollout_unroll_steps) != cur_stage:
+                break   # stage changed mid-epoch -> exit inner loop so the loader is rebuilt
 
     # Save the custom diffusion layers
     accelerator.wait_for_everyone()

@@ -92,6 +92,16 @@ class TrainingConfig:
     # from 0 over rollout_warmup_steps so base fit is established before rollout loss kicks in.
     rollout_loss_weight: float = 1.0
     rollout_warmup_steps: int = 0
+    # Curriculum over (unroll horizon K, windows-per-model): list of [step_threshold, K, n_win],
+    # step-ascending. e.g. [[0,1,8],[10000,2,4],[25000,3,2]] = K=1 sampling 8 windows/model, then
+    # K=2 sampling 4, then K=3 sampling 2. The train loader is rebuilt at each stage boundary, so
+    # each stage uses its own window length (=> its own start-frame range) and sampling density.
+    # None = off (fall back to the fixed rollout_unroll_steps). Back-compatible with 2-element
+    # entries [step, K] (then windows-per-model falls back to the stride-5 count).
+    rollout_curriculum: Optional[List] = None
+    # Draw each training window's start frame at random over the whole trajectory (data aug),
+    # instead of the fixed stride-5 grid. Eval is unaffected (test split stays deterministic).
+    rollout_random_window: bool = False
 
 @dataclass
 class TestingConfig:
