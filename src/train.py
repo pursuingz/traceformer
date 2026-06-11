@@ -698,7 +698,7 @@ def main(args):
                             "loss_collision",
                             "loss_edge",
                         ]
-                        plot_window = 7500   # 曲线始终只显示最近 7500 step,避免长程压缩看不清近期
+                        plot_window = 15000   # 曲线始终只显示最近 15000 step,避免长程压缩看不清近期
                         cutoff = global_step - plot_window
                         for key in plot_keys:
                             series = loss_history.get(key)
