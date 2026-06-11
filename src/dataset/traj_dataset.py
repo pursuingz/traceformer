@@ -107,11 +107,16 @@ class TrajDataset(Dataset):
                     max_start = total_frames - required_span
                     if max_start < 0:
                         continue
-                    if self.rollout_random_window:
-                        # random-start windows: draw the actual start frame over [0, max_start] at
-                        # getitem time (start_idx=-1 marker). windows_per_model controls how many
-                        # windows this model contributes per epoch (curriculum: 8 / 4 / 2 for K=1/2/3);
-                        # falls back to the stride-5 count when unset.
+                    if self.split == 'val':
+                        # 训练中每 500 步的 validation:固定取每个 model 第 1-5 帧(start_idx=0)
+                        # 作为输入再 rollout,不随机采样 —— 这样各 checkpoint 的 val 视图完全可比/可复现。
+                        # 只影响 val;train 仍走随机窗口,test(eval.py)仍走 stride-5 的多窗口。
+                        self.models.append({"model": model_name, "start_idx": 0})
+                    elif self.rollout_random_window:
+                        # random-start windows (train only): draw the actual start frame over
+                        # [0, max_start] at getitem time (start_idx=-1 marker). windows_per_model
+                        # controls how many windows this model contributes per epoch (curriculum:
+                        # 8 / 4 / 2 for K=1/2/3); falls back to the stride-5 count when unset.
                         n_win = self.windows_per_model if self.windows_per_model else len(range(0, max_start + 1, 5))
                         for _ in range(n_win):
                             self.models.append({"model": model_name, "start_idx": -1, "max_start": max_start})
