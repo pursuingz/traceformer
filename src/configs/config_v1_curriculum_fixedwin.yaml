@@ -1,0 +1,100 @@
+# 析因消融 臂(01):curriculum 固定窗口 —— 隔离「rollout / DAgger curriculum」单独的边际贡献。
+# 基于 config_v1_rollout_curriculum.yaml(= 1d),相对 1d 仅改 2 处:
+#   1. output_dir(独立目录)
+#   2. rollout_random_window: false  —— 关掉随机窗口,起点回到 stride-5 固定网格
+# 与 1d 的【唯一差别 = 随机窗口 on→off】;与 run23 的【唯一差别 = 加了 horizon curriculum / DAgger 喂回】。
+#   固定窗口下 dataset 走 stride-5 分支(忽略 windows_per_model 的 8/4/2):
+#     K=1 起点{0,5,10,15}=4窗口 / K=2 {0,5,10}=3 / K=3 {0,5}=2(= 1b/1c 的窗口口径)。
+#   各阶段仍按 curriculum 在切换点重建 loader、改 K(展开步数)。
+#   注:固定窗口的每阶段窗口数(4/3/2)与 1d 随机的(8/4/2)略不同,这是固定窗口的必然结果;
+#     固定总步数下只改 epoch 切分、对训练分布影响可忽略(见 §5 台账注)。
+# 架构 / 数据 / 损失权重 / 步数 / batch / lr 全部冻结 = run23 = 1d。
+image_size: 128
+output_dir: ./outputs/ablation_curriculum_fixedwin_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+# rollout 改进开关:保留 curriculum,关掉随机窗口(本臂唯一相对 1d 的变量)
+rollout_curriculum: [[0, 1, 8], [10000, 2, 4], [25000, 3, 2]]   # 同 1d:切换点重建 loader、改 K
+rollout_random_window: false                                    # 改 2:关随机窗口 → 起点回 stride-5
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
