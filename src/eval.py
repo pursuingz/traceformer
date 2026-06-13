@@ -51,6 +51,7 @@ def create_model(args):
 
 def build_raw_reference(batch, dataset_cfg, target_frames):
     raw_sequences = []
+    valid_counts = []          # 每样本 GT 真实覆盖的帧数(< target_frames 即起点越界,用于 partial-rollout)
     full_valid = True
     interval = dataset_cfg.get('n_frames_interval', 1)
     for j, model_name in enumerate(batch['model']):
@@ -62,6 +63,7 @@ def build_raw_reference(batch, dataset_cfg, target_frames):
         start = int(batch['start_idx'][j]) if 'start_idx' in batch else 0
         # 与 rollout 输出逐帧对齐:从 start_idx 起、按 n_frames_interval 取帧
         sel = start + np.arange(target_frames) * interval
+        valid_counts.append(int(np.sum(sel < model_pcls.shape[0])))   # GT 覆盖到第几帧
         if sel[-1] >= model_pcls.shape[0]:
             full_valid = False                       # GT 不够覆盖整段 rollout,该窗口不计入 rollout 指标
         sel = np.clip(sel, 0, model_pcls.shape[0] - 1)
@@ -69,7 +71,7 @@ def build_raw_reference(batch, dataset_cfg, target_frames):
         raw_seq = (raw_seq - dataset_cfg.norm_fac) / 2
         raw_sequences.append(raw_seq)
 
-    return torch.stack(raw_sequences, dim=0), full_valid
+    return torch.stack(raw_sequences, dim=0), full_valid, valid_counts
 
 
 def chamfer_distance(pred, gt):
@@ -113,6 +115,14 @@ def main(args):
     total_floor_depth = 0.0       # 平均穿透深度(归一化单位)
     total_floor_rate_gt = 0.0     # GT 参考(应≈0)
     n_floor_gt = 0
+    # ---- 非0起点 partial-rollout(检验 (01) 固定窗口优势是否只是 start=0 评测对齐 artifact)----
+    # full-rollout 只测 start=0;(01) stride-5 网格恰好每 epoch 命中 start=0,(11) 随机起点几乎抽不到。
+    # 这里对每个窗口按 GT 实际覆盖的 chunk 数累计 per-step,并单列「仅 start>0」,区分:
+    #   (11) 在 start>0 上追平/反超 (01) → 优势是评测对齐 artifact;(01) 仍全面赢 → 真链质量更好。
+    total_mse_step_all = torch.zeros(ROLLOUT_STEPS)   # 所有起点:GT 覆盖该 step 的 chunk 才计入
+    cnt_step_all = torch.zeros(ROLLOUT_STEPS)
+    total_mse_step_nz = torch.zeros(ROLLOUT_STEPS)    # 仅 start>0
+    cnt_step_nz = torch.zeros(ROLLOUT_STEPS)
     seen_models = set()
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -166,7 +176,7 @@ def main(args):
             total_floor_rate += (y_pred < floor_h).float().mean().item()
             total_floor_depth += torch.clamp(floor_h - y_pred, min=0).mean().item()
 
-            gt_vis, full_valid = build_raw_reference(batch, args.train_dataset, output.shape[1])
+            gt_vis, full_valid, valid_counts = build_raw_reference(batch, args.train_dataset, output.shape[1])
 
             n_batches += 1
             # ---- 全 rollout 指标:仅在 GT 帧数足够覆盖整段 rollout 的窗口上算 ----
@@ -212,6 +222,24 @@ def main(args):
                 n_floor_gt += 1
                 n_full += 1
 
+            # ---- 非0起点 partial-rollout per-step:对每个窗口按 GT 覆盖到的 chunk 数累计 ----
+            # 对 start=0 窗口与上面 per-step 等价;对 start>0 窗口补上原被 full_valid 排除的早段 rollout。
+            out_dev = output.float()
+            gtv_dev = gt_vis.to(device).float()
+            for b in range(out_dev.shape[0]):
+                nvalid = valid_counts[b]
+                start_b = int(batch['start_idx'][b]) if 'start_idx' in batch else 0
+                for s in range(ROLLOUT_STEPS):
+                    lo = (s + 1) * OUTPUT_FRAMES
+                    hi = lo + OUTPUT_FRAMES
+                    if hi <= nvalid:                          # 该 chunk 的 5 帧 GT 全部存在才计入
+                        m = F.mse_loss(out_dev[b, lo:hi], gtv_dev[b, lo:hi]).item()
+                        total_mse_step_all[s] += m
+                        cnt_step_all[s] += 1
+                        if start_b > 0:
+                            total_mse_step_nz[s] += m
+                            cnt_step_nz[s] += 1
+
             output = output.cpu().numpy()
             tgt = gt_vis.cpu().numpy()
             vis_dir = args.vis_dir
@@ -237,6 +265,12 @@ def main(args):
     print(f'  MSE full-rollout: {total_mse_full / nf:.6e}   (仅 {n_full} 全程窗口)')
     print(f'  Chamfer  (mean) : {total_chamfer / nf:.6e}')
     print('  MSE per step    : ' + ', '.join(f'step{k+1}={v:.6e}' for k, v in enumerate(per_step)))
+    # ---- 非0起点 partial-rollout(评测对齐 artifact 判据)----
+    safe_step = lambda tot, cnt: (tot / torch.clamp(cnt, min=1)).tolist()
+    per_step_all = safe_step(total_mse_step_all, cnt_step_all)
+    per_step_nz = safe_step(total_mse_step_nz, cnt_step_nz)
+    print('  per-step(所有起点): ' + ', '.join(f'step{k+1}={v:.6e}(n={int(cnt_step_all[k])})' for k, v in enumerate(per_step_all)))
+    print('  per-step(仅start>0): ' + ', '.join(f'step{k+1}={v:.6e}(n={int(cnt_step_nz[k])})' for k, v in enumerate(per_step_nz)))
     print(f'  loss_F (pred)   : {total_loss_F / n:.6e}')
     print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
     nv = max(n_vol, 1)
