@@ -292,6 +292,7 @@ def main(args):
     # it via the rebuild check at the top of the loop.
     curriculum = OmegaConf.to_container(args.rollout_curriculum) if args.get('rollout_curriculum', None) else None
     args.train_dataset.rollout_random_window = args.get('rollout_random_window', False)
+    args.train_dataset.rollout_force_start0 = args.get('rollout_force_start0', False)
     if curriculum:
         K0, nw0 = current_stage(0, curriculum, args.rollout_unroll_steps)
         args.train_dataset.rollout_unroll_steps = K0

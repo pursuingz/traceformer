@@ -1,0 +1,100 @@
+# Phase 1d 衍生臂:curriculum + 随机窗口 + 每 epoch 必含 start=0。
+# 基于 config_v1_rollout_curriculum.yaml(= 1d),相对 1d 仅改 / 加 2 处:
+#   1. output_dir(独立目录)
+#   2. rollout_force_start0: true —— 随机窗口里每 model 每阶段固定第一个窗口为 start=0,其余仍随机。
+# 动机:start>0 判据已证 (01) fixedwin 比 (11) 1d 好纯因 start=0 训练密度(1d 随机起点 ~60-69% epoch
+#   抽不到 start=0)。本臂把 start=0 密度补回(每 epoch 每 model 必有 1 个 start=0),其余 n_win-1 个
+#   仍随机覆盖整轨迹中段。检验:在保证 start=0 密度下,随机覆盖见到的中段动态能否帮 start=0 的远步
+#   抗漂移 → 若净赢 (01),则随机覆盖有真实价值;若仅追平 (01),则 start=0 密度是唯一因素。
+#   各阶段窗口数仍 8/4/2,其中 1 个固定 start=0 → 实际随机窗口 7/3/1 个。
+# 架构 / 数据 / 损失权重 / 步数 / batch / lr 全部冻结 = run23 = 1d。
+image_size: 128
+output_dir: ./outputs/curriculum_randwin_force0_8L      # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+# rollout 改进开关(同 1d)+ 改 2:必含 start=0
+rollout_curriculum: [[0, 1, 8], [10000, 2, 4], [25000, 3, 2]]   # [step, K, windows/model];同 1d
+rollout_random_window: true                                     # 同 1d:窗口起点随机
+rollout_force_start0: true                                      # 改 2:每 model 每阶段固定 1 个 start=0
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

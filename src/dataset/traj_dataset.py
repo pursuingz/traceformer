@@ -28,6 +28,8 @@ class TrajDataset(Dataset):
         self.rollout_unroll_steps = cfg.get('rollout_unroll_steps', 1)
         # curriculum: draw window start frame at random over [0, max_start] at getitem time.
         self.rollout_random_window = cfg.get('rollout_random_window', False)
+        # with random windows, force one window per model to start at 0 (restore start=0 density).
+        self.rollout_force_start0 = cfg.get('rollout_force_start0', False)
         # curriculum: number of random windows to emit per model (None -> stride-5 count).
         self.windows_per_model = cfg.get('windows_per_model', None)
         self.batch_size = cfg.batch_size
@@ -118,6 +120,10 @@ class TrajDataset(Dataset):
                         # controls how many windows this model contributes per epoch (curriculum:
                         # 8 / 4 / 2 for K=1/2/3); falls back to the stride-5 count when unset.
                         n_win = self.windows_per_model if self.windows_per_model else len(range(0, max_start + 1, 5))
+                        if self.rollout_force_start0 and n_win > 0:
+                            # one fixed start=0 window per model per epoch; rest stay random.
+                            self.models.append({"model": model_name, "start_idx": 0})
+                            n_win -= 1
                         for _ in range(n_win):
                             self.models.append({"model": model_name, "start_idx": -1, "max_start": max_start})
                     else:

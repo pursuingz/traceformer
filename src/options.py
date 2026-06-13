@@ -102,6 +102,10 @@ class TrainingConfig:
     # Draw each training window's start frame at random over the whole trajectory (data aug),
     # instead of the fixed stride-5 grid. Eval is unaffected (test split stays deterministic).
     rollout_random_window: bool = False
+    # With random windows on, force one window per model per epoch to start at 0 (rest stay random).
+    # Restores the start=0 training density that pure random sampling dilutes, while keeping the
+    # mid-trajectory coverage of random windows. Only affects training; eval is unchanged.
+    rollout_force_start0: bool = False
 
 @dataclass
 class TestingConfig:
