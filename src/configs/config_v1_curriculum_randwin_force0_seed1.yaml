@@ -1,0 +1,100 @@
+# force0 重跑(seed 方差对照):= config_v1_curriculum_randwin_force0.yaml,仅改 2 处:
+#   1. seed: 0 -> 1（顶层 seed 经 train.py set_seed+seed_everything 播种全局 RNG:
+#      改变模型初始化 / 数据 shuffle 顺序 / worker 随机窗口起点抽样 → 全新优化轨迹）
+#   2. output_dir(独立目录,checkpoint 不与原 force0 run 冲突)
+# 目的:force0 @42500/45000 全面最差且训练曲线 0-18000 与 1d 几乎重合 → 疑为后段(K=3)落进
+#   更差的优化盆地(单 run 抖动),而非机制必然差。本 run 换 seed 重跑判定:
+#   - 落回 (01) 3.276e-3 与 1d 4.296e-3 之间 → 原反常 = 盆地/run 抖动(运气),force0 机制无罪。
+#   - 仍全面最差 → 机制性(K=3 随机覆盖减半),再针对性改。
+# train_dataset.seed 保持 0(点采样子集不变,只让优化轨迹变,控住额外变量)。
+# 其余(架构/数据/损失/步数/batch/lr/curriculum/force_start0)全部冻结 = force0。
+image_size: 128
+output_dir: ./outputs/curriculum_randwin_force0_seed1_8L   # 改 2:独立目录
+seed: 1                                                    # 改 1:换 seed → 新优化轨迹
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+# 同 force0:curriculum + 随机窗口 + 必含 start=0
+rollout_curriculum: [[0, 1, 8], [10000, 2, 4], [25000, 3, 2]]
+rollout_random_window: true
+rollout_force_start0: true
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
