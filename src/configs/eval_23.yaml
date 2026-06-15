@@ -40,8 +40,8 @@ model_config:
 # random.seed(0) 固定,split 可复现。
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: site                 # 与训练同源,保证 val split 是同分布 held-out
-  dataset_list: DATASET_ITEM_LIST     # 非现存文件 -> 自动枚举 site/*.h5,复现训练时的列表
+  dataset_path: data_test            # 新 held-out test 集(14 model,同分布,训练全未见);_test 结尾→走 [:100] 全用
+  dataset_list: DATASET_ITEM_LIST     # 非现存文件 -> 自动枚举 data_test/*.h5
   has_gravity: true                   # 必须 true,与 run 23 一致(eval_base.yaml 误设 false)
   max_num_forces: 1
   norm_fac: 5

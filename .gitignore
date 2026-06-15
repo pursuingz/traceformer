@@ -9,6 +9,9 @@ physctrl/
 
 # 数据与输出
 src/data_generation/data/
+*.h5
+!src/data_test/          # 例外:14 个 eval 用 held-out h5 入库,方便 push/pull 同步到服务器
+!src/data_test/*.h5
 outputs/
 checkpoints/
 *.csv

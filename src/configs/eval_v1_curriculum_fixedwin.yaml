@@ -33,7 +33,7 @@ model_config:
 
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: site
+  dataset_path: data_test   # 新 held-out test 集(14 model,同分布);_test 结尾→[:100] 全用
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: 1
