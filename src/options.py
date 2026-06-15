@@ -106,6 +106,11 @@ class TrainingConfig:
     # Restores the start=0 training density that pure random sampling dilutes, while keeping the
     # mid-trajectory coverage of random windows. Only affects training; eval is unchanged.
     rollout_force_start0: bool = False
+    # Single-step (no rollout) data aug: keep run23's fixed stride-5 windows {0,5,10,...} AND append
+    # this many extra random-start windows per model per epoch. Default 0 = run23 unchanged.
+    # Differs from rollout_random_window (which REPLACES the fixed grid); here the canonical windows
+    # stay and randoms are additive. Only affects the train split; eval/val windows are unchanged.
+    train_extra_random_windows: int = 0
 
 @dataclass
 class TestingConfig:

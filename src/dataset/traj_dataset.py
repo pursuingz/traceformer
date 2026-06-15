@@ -32,6 +32,8 @@ class TrajDataset(Dataset):
         self.rollout_force_start0 = cfg.get('rollout_force_start0', False)
         # curriculum: number of random windows to emit per model (None -> stride-5 count).
         self.windows_per_model = cfg.get('windows_per_model', None)
+        # single-step aug: extra random-start windows appended on top of the fixed stride-5 grid.
+        self.train_extra_random_windows = cfg.get('train_extra_random_windows', 0)
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
@@ -129,6 +131,12 @@ class TrajDataset(Dataset):
                     else:
                         for start_idx in range(0, max_start + 1, 5):
                             self.models.append({"model": model_name, "start_idx": start_idx})
+                        # single-step data aug (train only): append extra random-start windows on top
+                        # of the fixed grid. Eval/val keep deterministic windows (this branch is also
+                        # hit by eval.py's 'test' split, so gate on train).
+                        if self.split == 'train' and self.train_extra_random_windows > 0:
+                            for _ in range(self.train_extra_random_windows):
+                                self.models.append({"model": model_name, "start_idx": -1, "max_start": max_start})
             else:
                 raise NotImplementedError("mode not implemented")
     

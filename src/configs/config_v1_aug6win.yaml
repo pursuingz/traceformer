@@ -1,0 +1,97 @@
+# 单步数据增强臂:run23 的固定 stride-5 窗口 {0,5,10,15} + 每 model 额外 2 个随机窗口 = 6 窗口/model。
+# 基于 config_dit_base.yaml(= run23),相对 run23 仅改 / 加 2 处:
+#   1. output_dir(独立目录)
+#   2. train_extra_random_windows: 2 —— 固定窗口全保留,额外叠加 2 个随机起点窗口(仅 train split)。
+# 关键:不 rollout(无 rollout_curriculum / rollout_random_window)→ 纯单步 K=1,不喂回预测,
+#   不会触发 rollout 族「钝化单步算子」的死穴。与已证伪的 (10) randwin-only 的区别:
+#   (10) 是「替换」固定网格为等量全随机 → 丢了 canonical 窗口稳定训练(n=14 上 +13% 负);
+#   本臂是「叠加」→ canonical 单步训练不动,只补中段多样性,有机会中性偏正。
+# 检验:n=14 held-out 上 first-chunk / full-rollout / start>0 per-step 是否 ≤ run23。
+# 架构 / 数据 / 损失权重 / 步数 / batch / lr 全部冻结 = run23。
+image_size: 128
+output_dir: ./outputs/aug6win_8L            # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+train_extra_random_windows: 2               # 改 2:每 model 额外 2 个随机窗口(单步,仅 train)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

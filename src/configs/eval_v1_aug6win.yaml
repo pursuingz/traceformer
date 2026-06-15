@@ -1,0 +1,52 @@
+# Eval config for 单步数据增强臂(aug6win)。镜像 eval_23.yaml,只改 resume / vis_dir。
+# eval 不带 train_extra_random_windows —— test 窗口必须确定可复现(eval.py 走固定 stride-5),
+#   与 run23 / 其余臂同口径。dataset_path: data_test(14-model held-out,n=14 口径)。
+# 与 run23@45000(first-chunk 4.357e-4 / full-rollout 4.982e-3 / start>0 5.358e-4·3.606e-3·1.013e-2)对照。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+
+resume: 'outputs/aug6win_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_aug6win'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test   # n=14 held-out 同口径
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 5
