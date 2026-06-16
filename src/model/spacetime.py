@@ -681,6 +681,213 @@ class SpatialTemporalTransformerBlockv4(nn.Module):
 
 
 @maybe_allow_in_graph
+class TemporalSpatialTransformerBlock(nn.Module):
+    r"""
+    串行块,但轴序与 SpatialTemporalTransformerBlock(S->F->T)**相反**:T -> F -> S
+    (时间注意力 -> FFN -> 空间注意力)。模块集合与 v1 完全一致,仅前向顺序反转,
+    因此参数量 == v1 串行块。用作 v5 并行块的第二条流。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        # 时间注意力(逐点跨帧)—— 先做
+        self.norm_temp = AdaLayerNorm(dim, chunk_dim=1)
+        self.attn_temp = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+        )
+
+        # FFN(对 [encoder, hidden] 联合)—— 中间
+        self.norm2 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+        # 空间注意力(联合 hidden 点 token 与 encoder 条件 token)—— 最后
+        self.norm1 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        temb_in = temb
+        text_seq_length = encoder_hidden_states.size(1)
+        B, F, N, C = hidden_states.shape
+
+        # ---- Temporal Attention(先,encoder 不参与)----
+        ht = rearrange(hidden_states, 'b f n c -> (b n) f c')
+        temb_t = temb_in.repeat_interleave(N, 0)
+        norm_ht = self.norm_temp(ht, temb=temb_t)
+        ht = self.attn_temp(norm_ht) + ht
+        hidden_states = rearrange(ht, '(b n) f c -> (b f) n c', n=N)   # (B*F, N, C)
+
+        if encoder_hidden_states.shape[0] != B * F:
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(F, 0)
+        temb_s = temb_in.repeat_interleave(F, 0)
+
+        # ---- Feed Forward(中,对 [encoder, hidden] 联合)----
+        norm_hidden_states, norm_encoder_hidden_states, gate_ff, enc_gate_ff = self.norm2(
+            hidden_states, encoder_hidden_states, temb_s
+        )
+        ff_output = self.ff(torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1))
+        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
+        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+
+        # ---- Spatial Attention(后,联合 hidden + encoder)----
+        norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
+            hidden_states, encoder_hidden_states, temb_s
+        )
+        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+        hidden_states = hidden_states + gate_msa * attn_hidden_states
+        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
+
+        hidden_states = rearrange(hidden_states, '(b f) n c -> b f n c', f=F)
+        return hidden_states, encoder_hidden_states
+
+
+@maybe_allow_in_graph
+class SpatialTemporalTransformerBlockv5(nn.Module):
+    r"""
+    并行双向串行块:两条**各自完整、轴序相反**的串行流并联——
+      流 A = S->F->T(SpatialTemporalTransformerBlock)
+      流 B = T->F->S(TemporalSpatialTransformerBlock)
+    各自相对同一份输入的增量经 fuse 投影(LayerNorm + Linear(2d->d))合并 + 残差。
+
+    与 v3 的区别:v3 并联的是「SpatialOnly(S+F)」与「TemporalOnly(T)」两个**不完整**子块
+    (各自只看一个轴,到 fuse 才相遇);v5 的每条流本身是完整串行块(块内已有跨轴信息流),
+    再把两种相反轴序并联 → 同时获得两种轴序的归纳偏置。针对 A2「串行(单一轴序)> 并行
+    (无块内跨轴流)」的发现:v5 既保留串行块内的跨轴流,又补上「轴序对称」。
+
+    参数:每块 = 2 个 v1 串行块 + 2 个 fuse 投影 ≈ 2x v1 块。等参对齐点:v5-4L ≈ v1-8L(run23)。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        common = dict(
+            dim=dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            time_embed_dim=time_embed_dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            attention_bias=attention_bias,
+            qk_norm=qk_norm,
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+            final_dropout=final_dropout,
+            ff_inner_dim=ff_inner_dim,
+            ff_bias=ff_bias,
+            attention_out_bias=attention_out_bias,
+        )
+        self.sft_block = SpatialTemporalTransformerBlock(**common)   # 流 A:S->F->T
+        self.tfs_block = TemporalSpatialTransformerBlock(**common)   # 流 B:T->F->S
+
+        self.hidden_fuse = nn.Sequential(
+            nn.LayerNorm(dim * 2, norm_eps, norm_elementwise_affine),
+            nn.Linear(dim * 2, dim),
+        )
+        self.encoder_fuse = nn.Sequential(
+            nn.LayerNorm(dim * 2, norm_eps, norm_elementwise_affine),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        B, F, _, _ = hidden_states.shape
+        # 两条流共享同一份输入;encoder 先统一到 (B*F, text, C),保证两流与 fuse 同 batch 维。
+        if encoder_hidden_states.shape[0] != B * F:
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(F, 0)
+
+        sft_h, sft_enc = self.sft_block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+        tfs_h, tfs_enc = self.tfs_block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        hidden_states = hidden_states + self.hidden_fuse(
+            torch.cat([sft_h - hidden_states, tfs_h - hidden_states], dim=-1)
+        )
+        encoder_hidden_states = encoder_hidden_states + self.encoder_fuse(
+            torch.cat([sft_enc - encoder_hidden_states, tfs_enc - encoder_hidden_states], dim=-1)
+        )
+
+        return hidden_states, encoder_hidden_states
+
+
+@maybe_allow_in_graph
 class SpatialTemporalTransformerBlockv2(nn.Module):
     def __init__(
         self,
@@ -1205,6 +1412,8 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             TransformerBlock = SpatialTemporalTransformerBlockv3
         elif transformer_block == "SpatialTemporalTransformerBlockv4":
             TransformerBlock = SpatialTemporalTransformerBlockv4
+        elif transformer_block == "SpatialTemporalTransformerBlockv5":
+            TransformerBlock = SpatialTemporalTransformerBlockv5
         elif transformer_block == "SpatialOnlyTransformerBlock":
             TransformerBlock = SpatialOnlyTransformerBlock
         elif transformer_block == "TemporalOnlyTransformerBlock":
@@ -1363,7 +1572,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states = hidden_states[:, :self.cond_seq_length]
         hidden_states = hidden_states[:, self.cond_seq_length:].reshape(B, F, N, C)
 
-        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
             encoder_hidden_states_time = hidden_states[:, :self.cond_seq_length_t]
             encoder_hidden_states_time = rearrange(encoder_hidden_states_time, 'b f n c -> (b n) f c')
             hidden_states = hidden_states[:, self.cond_seq_length_t:]
@@ -1378,7 +1587,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         hidden_states,
@@ -1399,7 +1608,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         **ckpt_kwargs,
                     )
             else:
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     hidden_states, encoder_hidden_states = block(
                         hidden_states=hidden_states,
                         encoder_hidden_states=encoder_hidden_states,
@@ -1595,7 +1804,7 @@ class MDM_ST(nn.Module):
             mask_input = drag_mask[:, :1].to(dtype=self.mask_encoder.weight.dtype)
             mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
-        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
+        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
