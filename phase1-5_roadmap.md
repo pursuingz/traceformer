@@ -99,3 +99,18 @@ A2 已完成:控制深度与参数后,串行全面优于并行(full-rollout +55%
 - **Phase 5:** 最低 ROI,仅富余时。
 
 每步用 held-out 量化指标下结论,不看训练 loss 曲线。
+
+---
+
+## aug6win 硬化计划(2026-06-16,搁置中)
+
+**已确立:aug6win 是 Phase 1 第一个 n=14 站得住的正贡献。** 单步数据增强 = run23 固定窗口 {0,5,10,15} + 每 model 额外 2 个随机窗口(单步,不 rollout)。@45000 n=14 vs run23:full-rollout −10.5%、first-chunk −8.5%、start>0 每步 −9~13%、Chamfer/vMSE/aMSE 全赢;唯一退步体积自漂移 +21%。机制:additive 增强(canonical 不动 + 补多样性),与已证伪的 (10) replace 式形成干净对照。代码 commit `078b6d1`(train_extra_random_windows flag)+ `b6947bb`(n=14 eval 数据)。
+
+**硬化成论文级证据,需补三步(按优先级):**
+1. **@60000 收敛点复测**:run23 + aug6win 都训到 60000、同 n=14 eval,确认 @45000 优势在训练终点保住(不是中途的暂时领先)。
+2. **N 扫描**:`train_extra_random_windows = 0 / 2 / 4 / 6`,画「随机窗口数 vs full-rollout」曲线。单调/有最优 → 从「一个幸运设置」升级为「有规律的方法」。N 已是 config 参数,扫描只改一个数,各 21h 一臂。
+3. **(可选)seed 复跑**:n=14 多指标已稳,补 1 个 seed 让正贡献无懈可击(对照 force0 两 seed 暴露的方差问题)。
+
+**论文定位:** 把 aug6win 写成正贡献(确定性回归之上的训练侧增益),(10) replace 式作配对负 ablation 解释「为何增强必须 additive」。这是除「去扩散」外的第二个候选正贡献。
+
+**判据:** @60000 + N 扫描后 full-rollout 仍 ≤ run23 且 start>0 per-step 全步不输 → 确立;否则降级为「@45000 偶发、需更多验证」。
