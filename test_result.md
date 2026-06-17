@@ -128,3 +128,18 @@ eval_v1_curriculum_randwin_force0_seed1.yaml结果
   地面穿透率      : 0.656%   (预测帧占全部点比例, 全 56 窗口)
   地面穿透深度    : 1.830859e-03   (归一化单位)
   地面穿透率(GT)  : 0.000%   (参考, 应≈0)
+
+
+========================================
+eval_v5_4L.yaml结果 (@45000, data_test n=14) —— Phase 4 v5 双向并行,证伪
+===== eval metrics =====
+  windows: 56 total, 14 full-horizon
+  MSE first-chunk : 5.755040e-04
+  MSE full-rollout: 6.032240e-03
+  Chamfer  (mean) : 7.884955e-02
+  MSE per step    : step1=1.827145e-04, step2=2.142511e-03, step3=8.336484e-03, step4=1.949949e-02
+  per-step(所有起点): step1=5.755039e-04(n=56), step2=3.733807e-03(n=42), step3=1.010652e-02(n=28), step4=1.949949e-02(n=14)
+  per-step(仅start>0): step1=7.064337e-04(n=42), step2=4.529455e-03(n=28), step3=1.187655e-02(n=14), step4=0(n=0)
+  loss_F (pred)   : 2.987017e-02 / (gt ref) 8.513581e-03
+  vMSE 1.614338e-04 / aMSE 2.643137e-05
+  体积相对 7.458% / 体积自漂移 9.391% / 地面穿透 0.771%
