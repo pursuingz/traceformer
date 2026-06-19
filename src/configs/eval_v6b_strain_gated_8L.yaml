@@ -1,0 +1,50 @@
+# Eval config for v6b strain-gated local-global block. Mirrors config_v6b model_config,
+# changing only resume / vis_dir. dataset_path data_test (n=14 held-out, 同口径).
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+
+resume: 'outputs/v6b_strain_gated_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_v6b_strain_gated'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: 16
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlockv6b
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 5
