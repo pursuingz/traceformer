@@ -1,0 +1,100 @@
+# Fine-tune run23@60k with low-lr, constant K=2 rollout (DAgger), fixed windows.
+# Based on config_dit_base.yaml (= run23). Hypothesis: 1d's rollout warmup failed because its
+# single-chunk phase was under-trained (only ~10k steps before rollout kicked in). Here the single
+# step operator is FULLY trained first (= run23@60k), then we GENTLY (low lr) add K=2 rollout
+# feedback so we keep most of the converged single-step precision while adding drift robustness.
+# Changes vs config_dit_base.yaml (= run23), everything else FROZEN:
+#   1. output_dir
+#   2. init_from_checkpoint        -> load run23@60k weights only (fresh optimizer/scheduler)
+#   3. learning_rate 1e-4 -> 3e-5  -> low-lr fine-tune (preserve the trained single-step operator)
+#   4. rollout_unroll_steps 1 -> 2 -> constant K=2 the whole run (NO curriculum, NO random window)
+# DAgger feedback is clean (no input noise; 1a falsified input noise). rollout_loss_weight stays 1.0,
+# rollout_warmup_steps 0 -> K=2 active from step 0 (the single step is already trained, no warmup needed).
+image_size: 128
+output_dir: ./outputs/v1_ft_rollout_k2_lowlr          # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000                                 # 在 run23@60k 之上再微调 60k 步(本run global_step 0->60000)
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 3e-5                                     # 改 3:低 lr 微调(run23 用 1e-4)
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest                          # 续训本run自身checkpoint;首次启动无→走 init_from_checkpoint
+init_from_checkpoint: '23(sota)/checkpoint-60000/model.safetensors'   # 改 2:只load run23@60k权重
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+rollout_unroll_steps: 2                                 # 改 4:恒定 K=2 rollout(无 curriculum、无 random window)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock    # 与 run23 完全一致(v1 串行,load 权重必须对齐)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

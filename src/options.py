@@ -111,6 +111,13 @@ class TrainingConfig:
     # Differs from rollout_random_window (which REPLACES the fixed grid); here the canonical windows
     # stay and randoms are additive. Only affects the train split; eval/val windows are unchanged.
     train_extra_random_windows: int = 0
+    # Weights-only init from another run's checkpoint (path to a model.safetensors). Loads ONLY the
+    # model weights, leaving a FRESH optimizer/scheduler and global_step=0, so you can fine-tune a
+    # converged model (e.g. run23@60k) at a different (lower) lr. Distinct from resume_from_checkpoint,
+    # which restores optimizer+scheduler+step from THIS run's own output_dir. Skipped if this run
+    # already has its own checkpoint to resume (so an interrupted fine-tune resumes correctly).
+    # None = off.
+    init_from_checkpoint: Optional[str] = None
 
 @dataclass
 class TestingConfig:

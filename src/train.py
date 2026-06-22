@@ -426,12 +426,13 @@ def main(args):
     ]
 
     # Potentially load in the weights and states from a previous save
+    resumed = False
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
+            dirs = os.listdir(args.output_dir) if os.path.isdir(args.output_dir) else []
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
@@ -449,8 +450,27 @@ def main(args):
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+            resumed = True
     else:
         initial_global_step = 0
+
+    # Weights-only init (fine-tune a converged model at a fresh/lower lr). Only when we did NOT
+    # resume this run's own checkpoint, so an interrupted fine-tune resumes from its own latest
+    # checkpoint instead of re-initialising from the source every restart. Optimizer/scheduler/
+    # global_step stay fresh -> the run's own learning_rate governs the fine-tune.
+    if not resumed and args.get('init_from_checkpoint', None):
+        from safetensors.torch import load_file
+        ckpt = load_file(args.init_from_checkpoint, device='cpu')
+        missing, unexpected = accelerator.unwrap_model(model).load_state_dict(ckpt, strict=False)
+        accelerator.print(
+            f"Init weights from {args.init_from_checkpoint} "
+            f"(loaded={len(ckpt)} tensors, missing={len(missing)}, unexpected={len(unexpected)})"
+        )
+        if len(missing) > 50 or len(unexpected) > 50:
+            accelerator.print(
+                "  [WARN] large key mismatch -> check the fine-tune config's architecture "
+                "matches the source checkpoint."
+            )
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
