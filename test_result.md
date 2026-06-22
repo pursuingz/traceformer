@@ -143,3 +143,40 @@ eval_v5_4L.yaml结果 (@45000, data_test n=14) —— Phase 4 v5 双向并行,�
   loss_F (pred)   : 2.987017e-02 / (gt ref) 8.513581e-03
   vMSE 1.614338e-04 / aMSE 2.643137e-05
   体积相对 7.458% / 体积自漂移 9.391% / 地面穿透 0.771%
+
+
+
+========================================
+eval_v6_local_global_8L.yaml结果 (@45000, data_test n=14) —— v1串行 + 门控静态kNN局部消息 + aug6win,混合(start>0赢/start=0败)
+===== eval metrics =====
+  windows: 56 total, 14 full-horizon
+  MSE first-chunk : 3.716e-04
+  MSE full-rollout: 5.477e-03
+  Chamfer  (mean) : 8.134e-02
+  per-step(所有起点): step1=3.716e-04, step2=2.739e-03, step3=8.206e-03, step4=1.714e-02
+  per-step(仅start>0): step1=4.374e-04(n=42), step2=3.057e-03(n=28), step3=8.449e-03(n=14)
+  loss_F (pred)   : 2.600e-02
+  vMSE 1.432e-04 / aMSE 1.998e-05
+  体积相对 7.724% / 体积自漂移 8.770% / 地面穿透 0.677% / 穿透深度 2.001e-03
+
+
+========================================
+eval_v6b_strain_gated_8L.yaml结果 (@45000, data_test n=14) —— v6 + strain-gate(边长变化率门控局部消息),证伪·全面更差
+===== eval metrics =====
+  windows: 56 total, 14 full-horizon (rollout 指标分母)
+  MSE first-chunk : 4.389255e-04   (全 56 窗口, 逐样本对齐)
+  MSE full-rollout: 6.325590e-03   (仅 14 全程窗口)
+  Chamfer  (mean) : 8.401290e-02
+  MSE per step    : step1=1.792536e-04, step2=2.217739e-03, step3=8.835914e-03, step4=2.039505e-02
+  per-step(所有起点): step1=4.389254e-04(n=56), step2=3.379530e-03(n=42), step3=1.016612e-02(n=28), step4=2.039505e-02(n=14)
+  per-step(仅start>0): step1=5.254827e-04(n=42), step2=3.960426e-03(n=28), step3=1.149633e-02(n=14), step4=0.000000e+00(n=0)
+  loss_F (pred)   : 2.636895e-02
+  loss_F (gt ref) : 8.513588e-03
+  --- 物理合理性 ---
+  速度误差 vMSE   : 1.534680e-04   (帧差, vs GT, 14 全程窗口)
+  加速度误差 aMSE : 2.180011e-05   (二阶差, vs GT)
+  体积相对误差    : 7.799%   (|Vp-Vg|/Vg, 350 帧, 凸包)
+  体积自漂移      : 9.120%   (|Vp(t)-Vp(0)|/Vp(0), 近不可压应小)
+  地面穿透率      : 0.889%   (预测帧占全部点比例, 全 56 窗口)
+  地面穿透深度    : 3.226173e-03   (归一化单位)
+  地面穿透率(GT)  : 0.000%   (参考, 应≈0)
