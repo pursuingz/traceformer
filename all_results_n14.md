@@ -15,6 +15,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | force0-s0 | force0 seed=0 | 串行v1 8L | 16.092 | 随机+必含start0 | 课程K1→2→3+喂回 |
 | force0-s1 | force0 seed=1 | 串行v1 8L | 16.092 | 随机+必含start0 | 课程K1→2→3+喂回 |
 | ft-k2 | 低lr K=2 微调(†@30k) | 串行v1 8L | 16.092 | 固定{0,5,10,15} | K=2 恒定喂回(纯DAgger) |
+| velocity | 逐帧速度 cumsum 积分(输出侧) | 串行v1 8L | 16.092 | 固定{0,5,10,15} | K=1 单步 |
 
 ## B. 主精度(含 full-rollout vs run23 的 Δ)
 | 臂 | first-chunk | full-rollout | Δvs run23 | Chamfer |
@@ -30,6 +31,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | force0-s0 | 8.518e-04 | 6.634e-03 | +33.2% | 8.115e-02 |
 | force0-s1 | 1.001e-03 | 7.700e-03 | +54.6% | 8.468e-02 |
 | ft-k2 (†@30k) | 4.918e-04 | 4.977e-03 | -0.1% | 7.522e-02 |
+| velocity | 4.963e-04 | 6.510e-03 | +30.7% | 7.778e-02 |
 
 ## C. per-step MSE(所有起点,n=56/42/28/14)
 | 臂 | step1 | step2 | step3 | step4 |
@@ -45,6 +47,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | force0-s0 | 8.518e-04 | 4.726e-03 | 1.154e-02 | 2.108e-02 |
 | force0-s1 | 1.001e-03 | 5.637e-03 | 1.366e-02 | 2.374e-02 |
 | ft-k2 (†@30k) | 4.918e-04 | 3.124e-03 | 8.639e-03 | 1.549e-02 |
+| velocity | 4.963e-04 | 3.271e-03 | 1.007e-02 | 2.151e-02 |
 
 ## D. per-step MSE(仅 start>0,公平起点,n=42/28/14)
 | 臂 | step1 | step2 | step3 |
@@ -60,6 +63,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | force0-s0 | 1.063e-03 | 5.883e-03 | 1.362e-02 |
 | force0-s1 | 1.238e-03 | 6.895e-03 | 1.597e-02 |
 | ft-k2 (†@30k) | 6.057e-04 | 3.732e-03 | 9.940e-03 |
+| velocity | 6.106e-04 | 3.873e-03 | 1.132e-02 |
 
 ## E. 物理合理性
 | 臂 | loss_F(pred) | vMSE | aMSE | 体积相对% | 体积自漂移% | 地面穿透% | 穿透深度 |
@@ -75,6 +79,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | force0-s0 | 3.580e-02 | 1.587e-04 | 2.243e-05 | 7.713 | 9.519 | 0.581 | 1.679e-03 |
 | force0-s1 | 3.956e-02 | 1.762e-04 | 2.751e-05 | 6.166 | 8.210 | 0.656 | 1.831e-03 |
 | ft-k2 (†@30k) | 2.929e-02 | 1.428e-04 | 2.424e-05 | 6.217 | 8.512 | 0.512 | 1.290e-03 |
+| velocity | 2.833e-02 | 1.757e-04 | 1.873e-05 | 6.090 | 9.057 | 1.045 | 5.850e-03 |
 
 ---
 
