@@ -1,7 +1,8 @@
 # Eval config for Phase 2(速度/逐帧积分预测,串行 8L)。
 # 镜像 eval_23.yaml,只改 resume / vis_dir,并加 model_config.pred_velocity: true(必须与训练一致,
 # 否则 forward 重构方式不同 = 分布错位)。eval 推理路径仍同 run23(use_diffusion=false, 1 step)。
-# 与 run23 同 step 对比(eval_23_55k.yaml = 55000)。
+# 2026-06-23 切到 n=14 口径:checkpoint 55000→45000(对齐 n=14 表所有臂的锚点,run23 n=14 基线
+# 只有 @45000)、dataset_path site→data_test(14-model held-out)。旧 @55000/n=4 结果作废,见实验记录.md §5。
 pc_size: 512
 eval_batch_size: 1
 dataloader_num_workers: 4
@@ -12,8 +13,8 @@ model_type: 'dit_st'
 use_diffusion: false
 num_inference_steps: 1
 
-resume: 'outputs/velocity_v1_8L/checkpoint-55000/model.safetensors'
-vis_dir: 'vis_results_velocity_v1'
+resume: 'outputs/velocity_v1_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_velocity_v1_n14'
 
 model_config:
   n_layers: 8
@@ -34,7 +35,7 @@ model_config:
 
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: site
+  dataset_path: data_test            # n=14 held-out（同分布，训练全未见）；_test 结尾→走 [:100] 全用
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: 1
