@@ -1105,6 +1105,119 @@ class SpatialTemporalTransformerBlockv6b(nn.Module):
 
 
 @maybe_allow_in_graph
+class SpatialTemporalTransformerBlockv8(nn.Module):
+    r"""
+    Transolver-inspired physics-slice serial block.
+
+    The block keeps the proven v1 ordering (spatial mixing -> FFN -> temporal
+    attention), but replaces point-level spatial self-attention with a learned
+    slice bottleneck: points are softly assigned to a small set of input-dependent
+    physical-state tokens, those slices attend together with the existing condition
+    tokens, and the updated slices are desliced back to points.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+        num_slices: int = 32,
+    ):
+        super().__init__()
+
+        self.num_slices = num_slices
+        self.norm1 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.slice_proj = nn.Linear(dim, num_slices)
+        self.slice_attn = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        self.norm2 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+        self.norm_temp = AdaLayerNorm(dim, chunk_dim=1)
+        self.attn_temp = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        temb_in = temb
+        text_seq_length = encoder_hidden_states.size(1)
+        B, F, N, C = hidden_states.shape
+
+        h = hidden_states.reshape(B * F, N, C)
+        if encoder_hidden_states.shape[0] != B * F:
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(F, 0)
+        temb = temb_in.repeat_interleave(F, 0)
+
+        norm_h, norm_enc, gate_msa, enc_gate_msa = self.norm1(h, encoder_hidden_states, temb)
+
+        assign = torch.softmax(self.slice_proj(norm_h), dim=-1)              # (B*F, N, M)
+        denom = assign.sum(dim=1).unsqueeze(-1).clamp_min(1e-6)
+        slice_tokens = torch.einsum("bnm,bnc->bmc", assign, norm_h) / denom  # (B*F, M, C)
+
+        attn_slice, attn_enc = self.slice_attn(
+            hidden_states=slice_tokens,
+            encoder_hidden_states=norm_enc,
+            image_rotary_emb=None,
+        )
+
+        point_delta = torch.einsum("bnm,bmc->bnc", assign, attn_slice)
+        h = h + gate_msa * point_delta
+        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_enc
+
+        norm_h, norm_enc, gate_ff, enc_gate_ff = self.norm2(h, encoder_hidden_states, temb)
+        ff_out = self.ff(torch.cat([norm_enc, norm_h], dim=1))
+        h = h + gate_ff * ff_out[:, text_seq_length:]
+        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_out[:, :text_seq_length]
+
+        h = rearrange(h, "(b f) n c -> (b n) f c", f=F)
+        temb = temb_in.repeat_interleave(N, 0)
+        norm_h = self.norm_temp(h, temb=temb)
+        h = self.attn_temp(norm_h) + h
+        hidden_states = rearrange(h, "(b n) f c -> b f n c", n=N)
+
+        return hidden_states, encoder_hidden_states
+
+
+@maybe_allow_in_graph
 class SpatialTemporalTransformerBlockv7(nn.Module):
     r"""
     Physics-state token serial block.
@@ -1688,6 +1801,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         transformer_block: str = "SpatialTemporalTransformerBlock",
         num_classes: int = 0,
         class_dropout_prob: float = 0.0,
+        physics_slices: int = 32,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -1735,25 +1849,30 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             TransformerBlock = SpatialTemporalTransformerBlockv6b
         elif transformer_block == "SpatialTemporalTransformerBlockv7":
             TransformerBlock = SpatialTemporalTransformerBlockv7
+        elif transformer_block == "SpatialTemporalTransformerBlockv8":
+            TransformerBlock = SpatialTemporalTransformerBlockv8
         elif transformer_block == "SpatialOnlyTransformerBlock":
             TransformerBlock = SpatialOnlyTransformerBlock
         elif transformer_block == "TemporalOnlyTransformerBlock":
             TransformerBlock = TemporalOnlyTransformerBlock
 
         # 3. Define spatio-temporal transformers blocks
+        block_kwargs = dict(
+            dim=inner_dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            time_embed_dim=time_embed_dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            attention_bias=attention_bias,
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+        )
+        if transformer_block == "SpatialTemporalTransformerBlockv8":
+            block_kwargs["num_slices"] = physics_slices
         self.transformer_blocks = nn.ModuleList(
             [
-                TransformerBlock(
-                    dim=inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    time_embed_dim=time_embed_dim,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_elementwise_affine=norm_elementwise_affine,
-                    norm_eps=norm_eps,
-                )
+                TransformerBlock(**block_kwargs)
                 for _ in range(num_layers)
             ]
         )
@@ -1894,7 +2013,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states = hidden_states[:, :self.cond_seq_length]
         hidden_states = hidden_states[:, self.cond_seq_length:].reshape(B, F, N, C)
 
-        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
             encoder_hidden_states_time = hidden_states[:, :self.cond_seq_length_t]
             encoder_hidden_states_time = rearrange(encoder_hidden_states_time, 'b f n c -> (b n) f c')
             hidden_states = hidden_states[:, self.cond_seq_length_t:]
@@ -1909,7 +2028,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     if self.transformer_block == "SpatialTemporalTransformerBlockv6":
                         hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
@@ -1952,7 +2071,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         **ckpt_kwargs,
                     )
             else:
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     if self.transformer_block == "SpatialTemporalTransformerBlockv6":
                         hidden_states, encoder_hidden_states = block(
                             hidden_states=hidden_states,
@@ -2076,7 +2195,7 @@ class MDM_ST(nn.Module):
             )
         else:
             self.dit = SpaitalTemporalTransformer(sample_points=n_points, sample_frames=n_frame+self.cond_frame, in_channels=n_feats,
-                num_layers=model_config.n_layers, num_attention_heads=self.latent_dim // 64, time_embed_dim=self.latent_dim, cond_seq_length=self.cond_seq_length, cond_seq_length_t=self.cond_frame, transformer_block=model_config.transformer_block, num_classes=self.num_mat, class_dropout_prob=self.class_dropout_prob)
+                num_layers=model_config.n_layers, num_attention_heads=self.latent_dim // 64, time_embed_dim=self.latent_dim, cond_seq_length=self.cond_seq_length, cond_seq_length_t=self.cond_frame, transformer_block=model_config.transformer_block, num_classes=self.num_mat, class_dropout_prob=self.class_dropout_prob, physics_slices=model_config.get('physics_slices', 32))
         
         self._init_weights()
 
@@ -2190,7 +2309,7 @@ class MDM_ST(nn.Module):
             mask_input = drag_mask[:, :1].to(dtype=self.mask_encoder.weight.dtype)
             mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
-        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
+        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
