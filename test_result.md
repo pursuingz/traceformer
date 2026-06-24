@@ -206,3 +206,26 @@ loss_F (gt ref) : 8.513581e-03
 地面穿透深度    : 5.850166e-03   (归一化单位)
 地面穿透率(GT)  : 0.000%   (参考, 应≈0)
 ```
+
+## v8_physics_slice_8L — n=14(@45000,data_test,2026-06-24,commit 待回填)
+基线=aug6win(同用 train_extra_random_windows=2)。Transolver slice 瓶颈替换点级空间注意力,16.158M。
+
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 5.907095e-04   (全 56 窗口, 逐样本对齐)
+MSE full-rollout: 5.685990e-03   (仅 14 全程窗口)
+Chamfer  (mean) : 7.748289e-02
+MSE per step    : step1=1.349542e-04, step2=1.937056e-03, step3=8.217814e-03, step4=1.814013e-02
+per-step(所有起点): step1=5.907095e-04(n=56), step2=3.990817e-03(n=42), step3=1.060659e-02(n=28), step4=1.814013e-02(n=14)
+per-step(仅start>0): step1=7.426280e-04(n=42), step2=5.017695e-03(n=28), step3=1.299537e-02(n=14), step4=0.000000e+00(n=0)
+loss_F (pred)   : 3.322764e-02
+loss_F (gt ref) : 8.513588e-03
+--- 物理合理性 ---
+速度误差 vMSE   : 1.427770e-04   (帧差, vs GT, 14 全程窗口)
+加速度误差 aMSE : 2.134926e-05   (二阶差, vs GT)
+体积相对误差    : 5.507%   (|Vp-Vg|/Vg, 350 帧, 凸包)
+体积自漂移      : 7.465%   (|Vp(t)-Vp(0)|/Vp(0), 近不可压应小)
+地面穿透率      : 0.732%   (预测帧占全部点比例, 全 56 窗口)
+地面穿透深度    : 1.738645e-03   (归一化单位)
+```
