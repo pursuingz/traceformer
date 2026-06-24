@@ -207,7 +207,7 @@ loss_F (gt ref) : 8.513581e-03
 地面穿透率(GT)  : 0.000%   (参考, 应≈0)
 ```
 
-## v8_physics_slice_8L — n=14(@45000,data_test,2026-06-24,commit 待回填)
+## v8_physics_slice_8L — n=14(@45000,data_test,2026-06-24,代码 commit 22b81df / 台账 18df5de)
 基线=aug6win(同用 train_extra_random_windows=2)。Transolver slice 瓶颈替换点级空间注意力,16.158M。
 
 ```
