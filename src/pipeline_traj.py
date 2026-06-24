@@ -17,6 +17,7 @@ class TrajPipeline(DiffusionPipeline):
         device, 
         y = None,
         start_vel = None,
+        points_rest = None,
         batch_size: int = 1, 
         num_inference_steps: int = 50, 
         guidance_scale=1.0, 
@@ -40,6 +41,7 @@ class TrajPipeline(DiffusionPipeline):
         floor_height = floor_height.to(device)
         coeff = coeff.to(device)
         start_vel = start_vel.to(device) if start_vel is not None else None
+        points_rest = points_rest.to(device) if points_rest is not None else init_pc[:, 0]
         gravity = gravity.to(device) if gravity is not None else None
         y = y.to(device) if y is not None else None
 
@@ -53,6 +55,7 @@ class TrajPipeline(DiffusionPipeline):
             mask = torch.cat([mask] * 2)
             drag_point = torch.cat([drag_point] * 2)
             floor_height = torch.cat([floor_height] * 2)
+            points_rest = torch.cat([points_rest] * 2)
             if start_vel is not None:
                 start_vel = torch.cat([start_vel] * 2)
             null_emb = torch.cat([torch.tensor([0] * batch_size).to(sample.dtype), null_emb])
@@ -61,7 +64,7 @@ class TrajPipeline(DiffusionPipeline):
             t = torch.zeros((batch_size,), device=device, dtype=torch.long)
             sample_input = torch.cat([sample] * 2) if do_classifier_free_guidance else sample
             t = torch.cat([t] * 2) if do_classifier_free_guidance else t
-            model_output = self.model(sample_input, t, init_pc, force, E, nu, mask, drag_point, floor_height=floor_height, gravity_label=gravity, coeff=coeff, y=y, null_emb=null_emb, start_vel=start_vel)
+            model_output = self.model(sample_input, t, init_pc, force, E, nu, mask, drag_point, floor_height=floor_height, gravity_label=gravity, coeff=coeff, y=y, null_emb=null_emb, start_vel=start_vel, points_rest=points_rest)
             if do_classifier_free_guidance:
                 model_pred_uncond, model_pred_cond = model_output.chunk(2)
                 model_output = model_pred_uncond + guidance_scale * (model_pred_cond - model_pred_uncond)
@@ -72,7 +75,7 @@ class TrajPipeline(DiffusionPipeline):
                 t = torch.tensor([t] * batch_size, device=device)
                 sample_input = torch.cat([sample] * 2) if do_classifier_free_guidance else sample
                 t = torch.cat([t] * 2) if do_classifier_free_guidance else t
-                model_output = self.model(sample_input, t, init_pc, force, E, nu, mask, drag_point, floor_height=floor_height, gravity_label=gravity, coeff=coeff, y=y, null_emb=null_emb, start_vel=start_vel)
+                model_output = self.model(sample_input, t, init_pc, force, E, nu, mask, drag_point, floor_height=floor_height, gravity_label=gravity, coeff=coeff, y=y, null_emb=null_emb, start_vel=start_vel, points_rest=points_rest)
                 if do_classifier_free_guidance:
                     model_pred_uncond, model_pred_cond = model_output.chunk(2)
                     model_output = model_pred_uncond + guidance_scale * (model_pred_cond - model_pred_uncond)

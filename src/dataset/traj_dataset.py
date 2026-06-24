@@ -253,6 +253,7 @@ class TrajDataset(Dataset):
             ind = np.arange(model_pcls[0].shape[0])
 
         model_data['point_indices'] = torch.from_numpy(np.array(ind)).long()
+        points_rest = model_pcls[0]
         points_src = model_pcls[input_indices]
         points_tgt = model_pcls[output_indices]
 
@@ -289,6 +290,7 @@ class TrajDataset(Dataset):
         else:
             model_data['floor_height'] = (torch.from_numpy(np.array(model_metas['floor_height'])).unsqueeze(-1).float() - self.cfg.norm_fac) / 2
         model_data['drag_point'] = (torch.from_numpy(drag_point).float() - self.cfg.norm_fac) / 2
+        model_data['points_rest'] = (points_rest.float() - self.cfg.norm_fac) / 2
         model_data['points_src'] = (points_src.float() - self.cfg.norm_fac) / 2
         model_data['points_tgt'] = (points_tgt.float() - self.cfg.norm_fac) / 2
         if points_tgt_roll is not None:
@@ -379,6 +381,7 @@ class TrajDataset(Dataset):
         model_data['drag_point'] = all_drag_points
 
         if model_pcls[0].shape[0] > self.pc_size:
+            model_data['points_rest'] = model_data['points_rest'][ind]
             model_data['points_src'] = model_data['points_src'][:, ind]
             model_data['points_tgt'] = model_data['points_tgt'][:, ind]
             if 'points_tgt_roll' in model_data:

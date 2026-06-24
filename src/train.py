@@ -550,7 +550,7 @@ def main(args):
                     null_emb = None
 
                 # Predict the noise residual
-                pred_sample = model(model_input, timesteps, cond_points_src, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=batch.get('start_vel', None))
+                pred_sample = model(model_input, timesteps, cond_points_src, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=batch.get('start_vel', None), points_rest=batch.get('points_rest', None))
                 losses = {}
 
                 loss = F.mse_loss(pred_sample.float(), latents.float())
@@ -641,7 +641,7 @@ def main(args):
                         tgt_k = roll_tgt[:, (k - 1) * OUTPUT_FRAMES:k * OUTPUT_FRAMES]
                         # pure DAgger: feed back the model's own clean prediction, no extra input noise.
                         model_input_k = init_pc[:, -1:, :, :].repeat(1, OUTPUT_FRAMES, 1, 1)
-                        pred_k = model(model_input_k, timesteps0, init_pc, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=step_start_vel)
+                        pred_k = model(model_input_k, timesteps0, init_pc, batch['force'], batch['E'], batch['nu'], batch['mask'][..., :1], batch['drag_point'], batch['floor_height'], batch['gravity'], batch['base_drag_coeff'], y=None if 'mat_type' not in batch else batch['mat_type'], null_emb=null_emb, start_vel=step_start_vel, points_rest=batch.get('points_rest', None))
                         loss_k = F.mse_loss(pred_k.float(), tgt_k.float())
                         if args.lambda_vel > 0.:
                             tv = tgt_k[:, 1:] - tgt_k[:, :-1]
@@ -807,6 +807,7 @@ def main(args):
                                             batch['gravity'],
                                             batch['base_drag_coeff'],
                                             start_vel=step_start_vel,
+                                            points_rest=batch.get('points_rest', None),
                                             y=None if 'mat_type' not in batch else batch['mat_type'],
                                             device=accelerator.device,
                                             batch_size=current_input.shape[0],

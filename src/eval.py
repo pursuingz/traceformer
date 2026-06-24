@@ -148,6 +148,7 @@ def main(args):
                     batch['gravity'],
                     batch['base_drag_coeff'],
                     start_vel=step_start_vel,
+                    points_rest=batch.get('points_rest', None),
                     y=None if args.model_config.get('num_mat', 0) == 0 else batch['mat_type'],
                     device=device,
                     batch_size=args.eval_batch_size,
