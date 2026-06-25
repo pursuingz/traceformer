@@ -1,0 +1,102 @@
+# 单帧自回归臂(新轴:预测粒度)。基于 config_v1_aug6win.yaml(架构=run23 串行 v1 8L)。
+# 相对 run23 改 / 加 4 处:
+#   1. output_dir(独立目录)
+#   2. output_frames: 1 —— 模型每次只预测下一帧(input 仍 5);eval rollout 逐帧滑动(~20 步)。
+#   3. rollout_random_window: true —— 训练窗口起点全轨迹随机抽。这是 output=1 的必要配套:
+#      output=1 时 eval 输入窗起点逐帧走遍 0..19,固定网格 {0,5,10,15} 与之分布错位 → 必须随机覆盖。
+#      与已证伪的 (10) 不同:(10) 在 output=5(eval 只走 4 个 chunk 起点)下随机=稀释 start=0;
+#      这里 output=1 下 eval 不再只奖励 start=0,随机采样是对齐 train/eval,不是稀释。
+#   4. windows_per_model: 20 —— 每 model 每 epoch 采 20 个随机窗口(覆盖 ~20 个起点,而非 stride-5 的 4 个)。
+# 注意:output_frames=1 下 lambda_vel(帧间差分)/ lambda_deform(MPM 多帧时间步进)结构性失效
+#   —— 训练损失 ≈ 位置 MSE + floor。这是 output=1 的内在约束,非选择(train.py 已守卫防 NaN)。
+# 训练范式仍是干净 GT 单步 teacher-forcing(同 run23),不在 Phase 1 rollout-训练族内。
+# 架构 / 数据 / 损失权重 / 步数 / batch / lr / split 冻结 = run23。
+image_size: 128
+output_dir: ./outputs/singleframe_randwin_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1       # output=1 下自动 = 0(DeformLoss 多帧循环为空)
+
+lambda_laplacian: 0
+lambda_collision: 0.1
+lambda_edge: 0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 改 2:单帧输出(input 仍 5)
+rollout_random_window: true     # 改 3:随机窗口起点(output=1 的必要配套)
+windows_per_model: 20           # 改 4:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

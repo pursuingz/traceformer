@@ -118,6 +118,17 @@ class TrainingConfig:
     # already has its own checkpoint to resume (so an interrupted fine-tune resumes correctly).
     # None = off.
     init_from_checkpoint: Optional[str] = None
+    # Prediction granularity (new axis): number of frames the model predicts per forward pass.
+    # Default 5 = run23 (5-frame chunk, eval rolls back every 5 frames). Set to 1 for single-frame
+    # autoregression (eval rolls one frame at a time). INPUT_FRAMES stays 5. With output_frames<5
+    # the multi-frame losses (vel/deform) become structurally inactive (single frame has no intra-
+    # output frame difference); training reduces to position MSE + floor. See plan / 实验记录.md.
+    output_frames: int = 5
+    # Non-curriculum random-window sampling: number of random-start windows to emit per model per
+    # epoch (only used when rollout_random_window=True without a curriculum). None -> stride-5 count
+    # (~4). For output_frames=1, set ~20 so training covers every input-window start the eval rollout
+    # visits (0,1,...,~19), matching the train/eval start distribution.
+    windows_per_model: Optional[int] = None
 
 @dataclass
 class TestingConfig:
@@ -133,3 +144,6 @@ class TestingConfig:
     seed: int
     num_inference_steps: int
     use_diffusion: bool = False
+    # Prediction granularity (mirror of TrainingConfig.output_frames). Must match the value the
+    # checkpoint was trained with so the model is reconstructed with the same frame count. Default 5.
+    output_frames: int = 5

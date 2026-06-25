@@ -1,0 +1,55 @@
+# Eval config for 单帧自回归臂(output_frames=1)。镜像 eval_v1_aug6win.yaml,改 output_frames / resume / vis_dir。
+# 顶层 output_frames: 1 驱动:① create_model 用 1 帧重建模型(匹配 checkpoint);② eval rollout 逐帧滑动
+#   (ROLLOUT_STEPS = 20,覆盖同 ~20 帧 horizon)。eval 不设 rollout_random_window —— test 窗口仍确定可复现。
+# 主判据 = full-rollout(整 24 帧 horizon MSE, 跨粒度可比)+ MSE per abs-frame(f5/f10/f15/f20)。
+#   first-chunk(=1 帧)与 chunk per-step(=1 帧桶)对 run23(5 帧)不可比,台账不用。
+# 对照 run23@45000 full-rollout 4.982e-3 / aug6win 4.457e-3(同 data_test n=14)。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+output_frames: 1          # 单帧输出:驱动模型重建 + eval 逐帧滑动 rollout
+
+resume: 'outputs/singleframe_randwin_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_singleframe_randwin'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test   # n=14 held-out 同口径
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 1

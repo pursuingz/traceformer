@@ -84,6 +84,13 @@ def chamfer_distance(pred, gt):
 
 loss_deform = DeformLoss().to('cuda')
 def main(args):
+    # Prediction granularity (new axis): config-driven output_frames (default 5 = run23). Must be set
+    # before create_model so the model is built with the same frame count as the checkpoint. ROLLOUT_STEPS
+    # is derived from a fixed ~20-frame horizon: output=5 -> 4 (unchanged), output=1 -> 20 (frame-by-frame).
+    global OUTPUT_FRAMES, ROLLOUT_STEPS
+    OUTPUT_FRAMES = args.get('output_frames', 5)
+    ROLLOUT_HORIZON = 20
+    ROLLOUT_STEPS = -(-ROLLOUT_HORIZON // OUTPUT_FRAMES)
     val_dataset = TrajDataset('test', args.train_dataset)   # 单独 eval 只评最后 4 个干净 held-out
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers)
 
@@ -99,7 +106,10 @@ def main(args):
     total_loss_xyz = 0.0          # 首段 MSE(头 5 帧,保留向后兼容)
     total_mse_full = 0.0          # 全 rollout MSE(25 帧)
     total_chamfer = 0.0           # 全 rollout 平均 Chamfer
-    total_mse_step = torch.zeros(ROLLOUT_STEPS)   # 每个 rollout step 的 MSE(误差累积曲线)
+    total_mse_step = torch.zeros(ROLLOUT_STEPS)   # 每个 rollout step 的 MSE(chunk 桶, 跨粒度不可比)
+    ABS_FRAMES = [5, 10, 15, 20]                   # 绝对帧索引(跨预测粒度可比的累积曲线)
+    total_mse_abs = torch.zeros(len(ABS_FRAMES))
+    cnt_mse_abs = torch.zeros(len(ABS_FRAMES))
     total_loss_F = 0.0
     total_loss_F_gt = 0.0
     n_batches = 0
@@ -134,8 +144,12 @@ def main(args):
                     step_start_vel = batch.get('start_vel', None)
                     if step_start_vel is not None:
                         step_start_vel = step_start_vel.to(device)
-                else:
+                elif OUTPUT_FRAMES >= 2:
+                    # original chunked-feedback formula (preserves existing arms exactly)
                     step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
+                else:
+                    # single-frame autoregression: boundary velocity at the tail of the sliding window
+                    step_start_vel = current_input[:, -1, :, :] - current_input[:, -2, :, :]
 
                 pred_chunk = pipeline(
                     current_input,
@@ -158,7 +172,9 @@ def main(args):
                 )
                 rollout_chunks.append(pred_chunk)
                 prev_chunk = current_input
-                current_input = pred_chunk
+                # slide input window: drop oldest, append prediction, keep last INPUT_FRAMES.
+                # output==input -> last INPUT_FRAMES = pred_chunk (== old replace behavior).
+                current_input = torch.cat([current_input, pred_chunk], dim=1)[:, -INPUT_FRAMES:]
 
             first_pred = rollout_chunks[1]
             output = torch.cat(rollout_chunks, dim=1)
@@ -192,6 +208,13 @@ def main(args):
                     lo = (s + 1) * OUTPUT_FRAMES   # 跳过 [0:5] 输入段,只评 4 个预测段
                     hi = lo + OUTPUT_FRAMES
                     total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
+
+                # ---- per-绝对帧 MSE(跨预测粒度可比:不依赖 chunk 大小,直接对 run23)----
+                # output 索引 0..4 = 输入段,5.. = 预测;取绝对帧 {5,10,15,20} 的单帧 MSE 作累积曲线。
+                for ai, af in enumerate(ABS_FRAMES):
+                    if af < out_f.shape[1]:
+                        total_mse_abs[ai] += F.mse_loss(out_f[:, af], gt_f[:, af]).item()
+                        cnt_mse_abs[ai] += 1
 
                 # ---- 速度 / 加速度误差(归一化空间, vs GT) ----
                 v_pred = out_f[:, 1:] - out_f[:, :-1]
@@ -266,6 +289,9 @@ def main(args):
     print(f'  MSE full-rollout: {total_mse_full / nf:.6e}   (仅 {n_full} 全程窗口)')
     print(f'  Chamfer  (mean) : {total_chamfer / nf:.6e}')
     print('  MSE per step    : ' + ', '.join(f'step{k+1}={v:.6e}' for k, v in enumerate(per_step)))
+    # ---- per-绝对帧 MSE(跨预测粒度可比, output=1 vs output=5 用这行对比, 不用上面的 chunk per-step)----
+    per_abs = (total_mse_abs / torch.clamp(cnt_mse_abs, min=1)).tolist()
+    print('  MSE per abs-frame: ' + ', '.join(f'f{ABS_FRAMES[k]}={v:.6e}(n={int(cnt_mse_abs[k])})' for k, v in enumerate(per_abs)))
     # ---- 非0起点 partial-rollout(评测对齐 artifact 判据)----
     safe_step = lambda tot, cnt: (tot / torch.clamp(cnt, min=1)).tolist()
     per_step_all = safe_step(total_mse_step_all, cnt_step_all)

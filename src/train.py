@@ -82,6 +82,7 @@ def setup_file_logging(output_dir):
 INPUT_FRAMES = 5
 OUTPUT_FRAMES = 5
 ROLLOUT_STEPS = 4
+ROLLOUT_HORIZON = 20   # predicted-frame horizon for rollout (ROLLOUT_STEPS = ceil(HORIZON/OUTPUT_FRAMES))
 
 
 def current_stage(global_step, curriculum, default_K):
@@ -282,6 +283,14 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     
+    # Prediction granularity (new axis): output_frames is config-driven (default 5 = run23). Reassign
+    # the module constant so all downstream references (model build, model_input repeat, rollout,
+    # validation) follow it. INPUT_FRAMES stays 5. output_frames=1 -> single-frame autoregression.
+    # ROLLOUT_STEPS (used by the validation-viz rollout) is derived from a fixed ~20-frame horizon so
+    # output=5 stays 4 (=20/5) and output=1 becomes 20; keeps the visualised horizon constant.
+    global OUTPUT_FRAMES, ROLLOUT_STEPS
+    OUTPUT_FRAMES = args.get('output_frames', 5)
+    ROLLOUT_STEPS = -(-ROLLOUT_HORIZON // OUTPUT_FRAMES)
     args.train_dataset.input_frames = INPUT_FRAMES
     args.train_dataset.output_frames = OUTPUT_FRAMES
     # 1b: forward the top-level unroll setting to the dataset so it reserves K output chunks
@@ -300,6 +309,9 @@ def main(args):
         args.train_dataset.windows_per_model = nw0
     else:
         args.train_dataset.rollout_unroll_steps = args.rollout_unroll_steps
+        # Non-curriculum random-window sampling: forward windows-per-model so output_frames=1 can
+        # sample ~20 random starts/model (cover every eval input-window start). None -> stride-5 count.
+        args.train_dataset.windows_per_model = args.get('windows_per_model', None)
     args.model_config.cond_frames = INPUT_FRAMES
     model = MDM_ST(args.pc_size, OUTPUT_FRAMES, n_feats=3, model_config=args.model_config)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -561,7 +573,10 @@ def main(args):
                     loss += args.lambda_mask * loss_mask
                     losses['mask'] = loss_mask.detach().item()
 
-                if args.lambda_vel > 0.:
+                # Velocity loss needs >=2 output frames (intra-output frame difference). With
+                # output_frames=1 the diff is an empty tensor -> mse_loss returns NaN and poisons the
+                # loss; skip it (structurally undefined for single-frame output). output_frames>=5 unaffected.
+                if args.lambda_vel > 0. and pred_sample.shape[1] >= 2:
                     target_vel = latents[:, 1:] - latents[:, :-1]
                     pred_vel = (pred_sample[:, 1:] - pred_sample[:, :-1])
                     loss_vel = F.mse_loss(target_vel.float(), pred_vel.float())
@@ -793,8 +808,13 @@ def main(args):
                                             step_start_vel = batch.get('start_vel', None)
                                             if step_start_vel is not None:
                                                 step_start_vel = step_start_vel.to(accelerator.device)
-                                        else:
+                                        elif OUTPUT_FRAMES >= 2:
+                                            # original chunked-feedback formula (preserves existing arms exactly)
                                             step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
+                                        else:
+                                            # single-frame autoregression: boundary velocity at the tail of
+                                            # the sliding input window (entering the frame being predicted).
+                                            step_start_vel = current_input[:, -1, :, :] - current_input[:, -2, :, :]
 
                                         pred_chunk = pipeline(
                                             current_input,
@@ -818,7 +838,9 @@ def main(args):
                                         rollout_chunks.append(pred_chunk)
 
                                         prev_chunk = current_input
-                                        current_input = pred_chunk
+                                        # slide the input window: drop oldest, append new prediction,
+                                        # keep last INPUT_FRAMES. output==input -> equals the old replace.
+                                        current_input = torch.cat([current_input, pred_chunk], dim=1)[:, -INPUT_FRAMES:]
 
                                     output = torch.cat(rollout_chunks, dim=1).cpu().numpy()
                                     tgt = build_raw_reference(batch, args.train_dataset, output.shape[1]).cpu().numpy()
