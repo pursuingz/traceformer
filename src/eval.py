@@ -178,7 +178,9 @@ def main(args):
 
             first_pred = rollout_chunks[1]
             output = torch.cat(rollout_chunks, dim=1)
-            if 'vol' in batch:
+            # loss_F (DeformLoss) is a multi-frame MPM residual: needs >=3 frames. first_pred has
+            # OUTPUT_FRAMES frames -> N/A for output_frames=1 (would crash). Skip and report 0.
+            if 'vol' in batch and first_pred.shape[1] >= 3:
                 loss_F = loss_deform(x=first_pred.clamp(min=-2.2, max=2.2), vol=batch['vol'].to(device), F=batch['F'].to(device),
                         C=batch['C'].to(device), frame_interval=2, norm_fac=args.train_dataset.norm_fac)
                 loss_F_gt = loss_deform(x=batch['points_tgt'].to(device), vol=batch['vol'].to(device), F=batch['F'].to(device),

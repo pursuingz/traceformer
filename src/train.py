@@ -589,7 +589,10 @@ def main(args):
                     losses['loss_p'] = loss_p.detach().item()
                     loss = loss + args.lambda_momentum * loss_p
                 
-                if 'vol' in batch and args.lambda_deform > 0.:
+                # Deform loss is an MPM time-stepping residual: needs >=3 output frames
+                # (frame_interval=2 -> end_t = frames-2 must be >=1). With output_frames=1 it would
+                # build a tensor with negative dim and crash -> skip (structurally undefined here).
+                if 'vol' in batch and args.lambda_deform > 0. and pred_sample.shape[1] >= 3:
                     pred_sample_mpm = pred_sample
                     vol_data = batch['vol']
                     F_data = batch['F']
