@@ -148,8 +148,11 @@ def main(args):
                     # original chunked-feedback formula (preserves existing arms exactly)
                     step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
                 else:
-                    # single-frame autoregression: boundary velocity at the tail of the sliding window
-                    step_start_vel = current_input[:, -1, :, :] - current_input[:, -2, :, :]
+                    # single-frame autoregression: model adds start_vel to the FIRST window token
+                    # (hidden_states[:,0]) and was trained on the per-frame velocity AT the window's
+                    # first frame. So feed velocity at current_input[:,0] (forward diff; frame -1 has
+                    # slid off the window) -> matches training scale/frame. NOT the tail velocity.
+                    step_start_vel = current_input[:, 1, :, :] - current_input[:, 0, :, :]
 
                 pred_chunk = pipeline(
                     current_input,
