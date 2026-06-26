@@ -229,3 +229,27 @@ loss_F (gt ref) : 8.513588e-03
 地面穿透率      : 0.732%   (预测帧占全部点比例, 全 56 窗口)
 地面穿透深度    : 1.738645e-03   (归一化单位)
 ```
+
+## v9_dual_graph_8L — n=14(@45000,data_test,2026-06-25,代码 commit 9f0edd2 / 台账 9f0edd2)
+基线=aug6win(同用 train_extra_random_windows=2)+ v6(等参 17.677M,唯一差 rest 静止图)。rest 帧 kNN ∥ current 帧 kNN 双图局部残差,共享 MLP zero-gate。
+
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 3.953153e-04   (全 56 窗口, 逐样本对齐)
+MSE full-rollout: 5.040304e-03   (仅 14 全程窗口)
+Chamfer  (mean) : 7.804323e-02
+MSE per step    : step1=1.568224e-04, step2=1.926997e-03, step3=7.371496e-03, step4=1.574621e-02
+per-step(所有起点): step1=3.953153e-04(n=56), step2=2.873836e-03(n=42), step3=8.160165e-03(n=28), step4=1.574621e-02(n=14)
+per-step(仅start>0): step1=4.748130e-04(n=42), step2=3.347255e-03(n=28), step3=8.948832e-03(n=14), step4=0.000000e+00(n=0)
+loss_F (pred)   : 2.686850e-02
+loss_F (gt ref) : 8.513581e-03
+--- 物理合理性 ---
+速度误差 vMSE   : 1.314446e-04   (帧差, vs GT, 14 全程窗口)
+加速度误差 aMSE : 1.990551e-05   (二阶差, vs GT)
+体积相对误差    : 7.324%   (|Vp-Vg|/Vg, 350 帧, 凸包)
+体积自漂移      : 9.272%   (|Vp(t)-Vp(0)|/Vp(0), 近不可压应小)
+地面穿透率      : 0.737%   (预测帧占全部点比例, 全 56 窗口)
+地面穿透深度    : 2.169066e-03   (归一化单位)
+地面穿透率(GT)  : 0.000%   (参考, 应≈0)
+```

@@ -17,6 +17,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | ft-k2 | 低lr K=2 微调(†@30k) | 串行v1 8L | 16.092 | 固定{0,5,10,15} | K=2 恒定喂回(纯DAgger) |
 | velocity | 逐帧速度 cumsum 积分(输出侧) | 串行v1 8L | 16.092 | 固定{0,5,10,15} | K=1 单步 |
 | v8 | Transolver slice 瓶颈(**替换**点级空间注意力) | 串行v1 8L+slice | 16.158 | 固定+2随机(叠加,=aug6win) | K=1 单步 |
+| v9 | dual-graph rest+current kNN 局部残差(+rest 静止拓扑) | 串行v1 8L+双图 | 17.677 | 固定+2随机(叠加,=aug6win) | K=1 单步 |
 
 ## B. 主精度(含 full-rollout vs run23 的 Δ)
 | 臂 | first-chunk | full-rollout | Δvs run23 | Chamfer |
@@ -34,6 +35,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | ft-k2 (†@30k) | 4.918e-04 | 4.977e-03 | -0.1% | 7.522e-02 |
 | velocity | 4.963e-04 | 6.510e-03 | +30.7% | 7.778e-02 |
 | v8 | 5.907e-04 | 5.686e-03 | +14.1% | 7.748e-02 |
+| v9 | 3.953e-04 | 5.040e-03 | +1.2% | 7.804e-02 |
 
 ## C. per-step MSE(所有起点,n=56/42/28/14)
 | 臂 | step1 | step2 | step3 | step4 |
@@ -51,6 +53,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | ft-k2 (†@30k) | 4.918e-04 | 3.124e-03 | 8.639e-03 | 1.549e-02 |
 | velocity | 4.963e-04 | 3.271e-03 | 1.007e-02 | 2.151e-02 |
 | v8 | 5.907e-04 | 3.991e-03 | 1.061e-02 | 1.814e-02 |
+| v9 | 3.953e-04 | 2.874e-03 | 8.160e-03 | 1.575e-02 |
 
 ## D. per-step MSE(仅 start>0,公平起点,n=42/28/14)
 | 臂 | step1 | step2 | step3 |
@@ -68,6 +71,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | ft-k2 (†@30k) | 6.057e-04 | 3.732e-03 | 9.940e-03 |
 | velocity | 6.106e-04 | 3.873e-03 | 1.132e-02 |
 | v8 | 7.426e-04 | 5.018e-03 | 1.300e-02 |
+| v9 | 4.748e-04 | 3.347e-03 | 8.949e-03 |
 
 ## E. 物理合理性
 | 臂 | loss_F(pred) | vMSE | aMSE | 体积相对% | 体积自漂移% | 地面穿透% | 穿透深度 |
@@ -85,6 +89,7 @@ test=14 个同分布 held-out model;full-rollout 主指标(n=14),per-step start>
 | ft-k2 (†@30k) | 2.929e-02 | 1.428e-04 | 2.424e-05 | 6.217 | 8.512 | 0.512 | 1.290e-03 |
 | velocity | 2.833e-02 | 1.757e-04 | 1.873e-05 | 6.090 | 9.057 | 1.045 | 5.850e-03 |
 | v8 | 3.323e-02 | 1.428e-04 | 2.135e-05 | 5.507 | 7.465 | 0.732 | 1.739e-03 |
+| v9 | 2.687e-02 | 1.314e-04 | 1.991e-05 | 7.324 | 9.272 | 0.737 | 2.169e-03 |
 
 ---
 
