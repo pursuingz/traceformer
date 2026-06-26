@@ -30,7 +30,12 @@ class TrajPipeline(DiffusionPipeline):
             # so that PointEmbed produces differentiated per-point embeddings.
             # Add small noise to break uniformity across frames.
             sample = init_pc[:, -1:, :, :].repeat(1, n_frames, 1, 1).to(device)
-            sample = sample + torch.randn_like(sample) * 0.02
+            # generator-controlled noise so eval is reproducible. torch.randn_like ignores
+            # `generator` -> would draw from the uncontrolled global RNG (eval sets no global
+            # seed). Matters more at output_frames=1 (noise drawn ~20x per rollout vs ~4x).
+            # Mirror the scheduler branch above: draw on CPU with the seeded gen, then .to(device).
+            noise = torch.randn(sample.shape, generator=generator, dtype=sample.dtype) * 0.02
+            sample = sample + noise.to(device)
         self.model.to(device)
         init_pc = init_pc.to(device)
         force = force.to(device)
