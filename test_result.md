@@ -253,3 +253,73 @@ loss_F (gt ref) : 8.513581e-03
 地面穿透深度    : 2.169066e-03   (归一化单位)
 地面穿透率(GT)  : 0.000%   (参考, 应≈0)
 ```
+
+## singleframe / run23 / randwin-only — 同口径三臂(@45000,data_test,n=14,2026-06-27,代码 commit 6d7bc04)
+> 三臂均在 `6d7bc04`(eval 噪声走 generator,可复现)后代码重 eval。singleframe = output_frames=1 单帧自回归 + 随机窗口(commit ae5ba07/dd21494/a5d73cc)。first-chunk/per-step 在 out=1 不可比;主判据 = full-rollout + per-abs-frame。
+
+### singleframe (output=1 + 随机窗口)
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 1.160693e-05   (全 56 窗口, 逐样本对齐; out=1 1帧桶不可比)
+MSE full-rollout: 4.532404e-03   (仅 14 全程窗口)
+Chamfer  (mean) : 6.265244e-02
+MSE per abs-frame: f5=2.986225e-06(n=14), f10=4.775387e-04(n=14), f15=4.019383e-03(n=14), f20=1.065516e-02(n=14)
+per-step(所有起点): step1..4=0(对齐 off-by-4), step5=1.160693e-05(=first-chunk) ... step20=1.065516e-02
+loss_F (pred)   : 0.000000e+00   (out=1 DeformLoss 需 >=3 帧, N/A)
+loss_F (gt ref) : 0.000000e+00
+--- 物理合理性 ---
+速度误差 vMSE   : 1.237089e-04
+加速度误差 aMSE : 8.872184e-06
+体积相对误差    : 10.457%
+体积自漂移      : 14.742%
+地面穿透率      : 0.911%
+地面穿透深度    : 4.046942e-03
+地面穿透率(GT)  : 0.000%
+```
+
+### run23 (同口径重 eval)
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 4.363965e-04
+MSE full-rollout: 5.019076e-03
+Chamfer  (mean) : 7.401446e-02
+MSE per step    : step1=1.357289e-04, step2=1.743680e-03, step3=7.171936e-03, step4=1.604404e-02
+MSE per abs-frame: f5=1.142846e-05(n=14), f10=6.341561e-04(n=14), f15=4.250654e-03(n=14), f20=1.182760e-02(n=14)
+per-step(所有起点): step1=4.363966e-04(n=56), step2=2.978254e-03(n=42), step3=8.596060e-03(n=28), step4=1.604404e-02(n=14)
+per-step(仅start>0): step1=5.366190e-04(n=42), step2=3.595541e-03(n=28), step3=1.002018e-02(n=14)
+loss_F (pred)   : 2.901559e-02
+loss_F (gt ref) : 8.513581e-03
+--- 物理合理性 ---
+速度误差 vMSE   : 1.478361e-04
+加速度误差 aMSE : 2.403502e-05
+体积相对误差    : 6.326%
+体积自漂移      : 8.716%
+地面穿透率      : 0.645%
+地面穿透深度    : 1.964012e-03
+地面穿透率(GT)  : 0.000%
+```
+
+### randwin-only (10) (同口径重 eval)
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 5.791268e-04
+MSE full-rollout: 5.677542e-03
+Chamfer  (mean) : 8.091000e-02
+MSE per step    : step1=1.786927e-04, step2=2.115013e-03, step3=7.894638e-03, step4=1.819937e-02
+MSE per abs-frame: f5=2.039766e-05(n=14), f10=7.878247e-04(n=14), f15=4.988688e-03(n=14), f20=1.301424e-02(n=14)
+per-step(所有起点): step1=5.791268e-04(n=56), step2=3.232925e-03(n=42), step3=8.840105e-03(n=28), step4=1.819937e-02(n=14)
+per-step(仅start>0): step1=7.126047e-04(n=42), step2=3.791881e-03(n=28), step3=9.785569e-03(n=14)
+loss_F (pred)   : 3.041286e-02
+loss_F (gt ref) : 8.513588e-03
+--- 物理合理性 ---
+速度误差 vMSE   : 1.477021e-04
+加速度误差 aMSE : 2.458166e-05
+体积相对误差    : 4.640%
+体积自漂移      : 8.180%
+地面穿透率      : 0.742%
+地面穿透深度    : 2.267795e-03
+地面穿透率(GT)  : 0.000%
+```
