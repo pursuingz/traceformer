@@ -278,6 +278,27 @@ loss_F (gt ref) : 0.000000e+00
 地面穿透率(GT)  : 0.000%
 ```
 
+### sfG = singleframe + 几何正则 (laplacian0.5/edge1.0, commit 12bda54, @45000, data_test, n=14, 2026-06-29)
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 1.016152e-05   (out=1 1帧桶不可比)
+MSE full-rollout: 3.503756e-03   (仅 14 全程窗口; −22.7% vs sf 4.532e-3 / −30.2% vs run23 5.019e-3)
+Chamfer  (mean) : 5.861589e-02
+MSE per abs-frame: f5=3.656353e-06(n=14), f10=3.148597e-04(n=14), f15=2.636222e-03(n=14), f20=8.291370e-03(n=14)
+loss_F (pred)   : 0.000000e+00   (out=1, N/A)
+loss_F (gt ref) : 0.000000e+00
+--- 物理合理性 ---
+速度误差 vMSE   : 9.290832e-05
+加速度误差 aMSE : 6.736040e-06
+体积相对误差    : 9.550%
+体积自漂移      : 12.714%   (sf 14.742% → −13.8%, 仍 +45.9% vs run23 8.7%)
+地面穿透率      : 0.944%
+地面穿透深度    : 5.505066e-03   (sf 4.047e-3 → +36%, 变差)
+地面穿透率(GT)  : 0.000%
+```
+> sfG vs sf 单变量(只动 2 lambda):MSE/运动/Chamfer/体积全降,唯穿透深度升。per-abs 晚帧赢最多(f20 −22% vs sf)。**渲染待判**——MSE 非充分质量代理(同 sf 教训)。
+
 ### run23 (同口径重 eval)
 ```
 ===== eval metrics =====
