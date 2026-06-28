@@ -1,0 +1,104 @@
+# sfG lambda 扫描臂(2×)。基于 config_v1_singleframe_geom.yaml(= sfG)。
+# 动机:sfG 的 lambda(edge=1.0/laplacian=0.5)是未校准初值,残留瑕疵=形变量偏大
+#   (体积超额 pred−GT +7.7% = run23 的 2.09×)。形变量偏大 → 几何约束还不够强 → 上调 lambda 应能再压。
+#   代价:几何项太强会压过位置 MSE 主损失。本臂去找「体积超额 ↔ MSE」帕累托前沿的下一个点。
+# 唯一变量(vs sfG):lambda 整体翻倍,保持 edge:laplacian=2:1 比例不变 → 扫描变量是单个标量
+#   「几何正则总强度」(最干净)。其余全冻结 = sfG = run23。
+#   1. output_dir(独立目录)
+#   2. lambda_edge: 1.0 → 2.0
+#   3. lambda_laplacian: 0.5 → 1.0
+# 判据(对照 sfG:full-rollout 3.504e-3 / 体积超额 +7.7%):
+#   ① 体积超额↓ 且 MSE 不退 → 几何正则还有空间,继续往上(4×);残留形变量进一步修。
+#   ② 体积超额↓ 但 MSE 退 → 拐点,sfG(1.0/0.5)已近帕累托前沿 → 论文可写「扫了 lambda」。
+#   ③ 体积超额不降 → 几何正则在 1.0/0.5 已饱和。
+# ⚠️ 训练时盯 tensorboard:加权项(lambda×loss_edge/laplacian)对比 loss_xyz(≈2e-5)。
+#   翻倍后若加权项 ≫ xyz(压过位置主损失,xyz 不降反升)→ 说明已过拐点,即结局②。
+image_size: 128
+output_dir: ./outputs/singleframe_geom_2x_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1       # output=1 下自动跳过(train.py 守卫 pred.shape[1]>=3)
+
+lambda_laplacian: 1.0    # 改 3:sfG 0.5 → 1.0(2×,保持 edge:laplacian=2:1)
+lambda_collision: 0.1
+lambda_edge: 2.0         # 改 2:sfG 1.0 → 2.0(2×,体积/拉伸主杠杆)
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出(input 仍 5)= sfG
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
