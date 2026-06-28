@@ -121,6 +121,9 @@ def main(args):
     n_vol = 0                     # 成功算出体积的帧数(凸包可能退化失败)
     total_vol_drift = 0.0         # 预测体积自漂移 |Vp(t)-Vp(0)|/Vp(0)
     n_vol_drift = 0
+    total_vol_drift_gt = 0.0      # GT 体积自漂移 |Vg(t)-Vg(0)|/Vg(0)(基线)
+    n_vol_drift_gt = 0            # 度量是凸包体积:弹性体(nu=0.4)大形变下 GT 本身凸包体积就漂,
+                                  #   "自漂移≈0" 不成立 → 必须减此 GT 基线才能判预测是否"额外"漂
     total_floor_rate = 0.0        # 地面穿透率(预测帧, 占全部点比例)
     total_floor_depth = 0.0       # 平均穿透深度(归一化单位)
     total_floor_rate_gt = 0.0     # GT 参考(应≈0)
@@ -244,6 +247,12 @@ def main(args):
                             if vp[t] is not None:
                                 total_vol_drift += abs(vp[t] - vp[0]) / vp[0]
                                 n_vol_drift += 1
+                    # GT 自漂移基线(同口径:vg[0] 为参考,逐帧 |Vg(t)-Vg(0)|/Vg(0))
+                    if vg[0] is not None and vg[0] > 1e-9:
+                        for t in range(1, len(vg)):
+                            if vg[t] is not None:
+                                total_vol_drift_gt += abs(vg[t] - vg[0]) / vg[0]
+                                n_vol_drift_gt += 1
 
                 # ---- GT 地面穿透参考(应≈0) ----
                 y_gt = gt_f[:, INPUT_FRAMES:, :, 1]
@@ -307,12 +316,15 @@ def main(args):
     print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
     nv = max(n_vol, 1)
     nvd = max(n_vol_drift, 1)
+    nvd_gt = max(n_vol_drift_gt, 1)
     nfg = max(n_floor_gt, 1)
     print('  --- 物理合理性 ---')
     print(f'  速度误差 vMSE   : {total_vel_mse / nf:.6e}   (帧差, vs GT, {n_full} 全程窗口)')
     print(f'  加速度误差 aMSE : {total_acc_mse / nf:.6e}   (二阶差, vs GT)')
     print(f'  体积相对误差    : {total_vol_err / nv * 100:.3f}%   (|Vp-Vg|/Vg, {n_vol} 帧, {"凸包" if _HAS_HULL else "协方差近似"})')
-    print(f'  体积自漂移      : {total_vol_drift / nvd * 100:.3f}%   (|Vp(t)-Vp(0)|/Vp(0), 近不可压应小)')
+    print(f'  体积自漂移      : {total_vol_drift / nvd * 100:.3f}%   (|Vp(t)-Vp(0)|/Vp(0), pred)')
+    print(f'  体积自漂移(GT)  : {total_vol_drift_gt / nvd_gt * 100:.3f}%   (基线: GT 凸包自漂移, 弹性体大形变下本就>0)')
+    print(f'  超额自漂移      : {(total_vol_drift / nvd - total_vol_drift_gt / nvd_gt) * 100:+.3f}%   (pred-GT; >0=模型额外引入的体积不稳定=病态信号, 这才是该看的)')
     print(f'  地面穿透率      : {total_floor_rate / n * 100:.3f}%   (预测帧占全部点比例, 全 {n_batches} 窗口)')
     print(f'  地面穿透深度    : {total_floor_depth / n:.6e}   (归一化单位)')
     print(f'  地面穿透率(GT)  : {total_floor_rate_gt / nfg * 100:.3f}%   (参考, 应≈0)')
