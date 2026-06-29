@@ -1,0 +1,100 @@
+# sfG + boundary loss_F 校准臂(λ_deform=0.001)。基于 config_v1_singleframe_geom_deform_d001.yaml(= λ=0.01 臂)。
+# 动机:λ=0.01 臂 step-2000 实测校准 → deform 贡献 2.22e-4 = xyz(6.78e-5)的 3.3×、占 total 72%,
+#   仍严重超配(判据要 0.1~0.5× xyz)。且 loss_deform 几乎不降(step-343~2000 恒 ~0.022,有不可约下限),
+#   xyz 会继续往 ~2e-5 掉 → 固定 λ 下 deform/xyz 只会越训越糟。再砍 10×:
+#   λ=0.001 → deform 贡献 = 0.001×0.0222 = 2.22e-5 = xyz 的 0.33×,正中 0.1~0.5× 靶心。
+# 唯一变量(vs λ=0.01 臂):lambda_deform 0.01→0.001。其余全冻结 = λ=0.01 臂 = sfG。
+#   改 2 处:1. output_dir(独立目录,防 resume 污染);2. lambda_deform 0.01→0.001。
+# ⚠️ caveat:xyz 收敛到 ~2e-5 后比例会升到约 ~1×(loss_deform 不降),0.001 是 step-2000 标定中点;
+#   若仍过正则(full-rollout 退过 run23)→ 下一发 0.0005(再开新目录)。
+image_size: 128
+output_dir: ./outputs/singleframe_geom_deform_d0001_8L   # 改 1:独立目录(λ=0.001 臂)
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 改 2:0.01→0.001(λ=0.01 实测 deform=3.3×xyz 仍超配,再砍 10× 落 0.33×xyz 靶心)
+
+single_frame_deform: true   # 冻结 = λ=0.01 臂:开启单帧 boundary loss_F
+
+lambda_laplacian: 0.5    # 冻结 = sfG:曲面平滑正则
+lambda_collision: 0.1
+lambda_edge: 1.0         # 冻结 = sfG:边长保持正则(体积/拉伸杠杆)
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出(input 仍 5)= sfG
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
