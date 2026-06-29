@@ -354,3 +354,25 @@ loss_F (gt ref) : 8.513588e-03
 地面穿透深度    : 2.267795e-03
 地面穿透率(GT)  : 0.000%
 ```
+
+### sfG+loss_F — sfG + 单帧 boundary loss_F(commit `fd9cd14`,λ_deform=0.1 未校准,@45000)
+```
+===== eval metrics =====
+windows: 56 total, 14 full-horizon (rollout 指标分母)
+MSE first-chunk : 1.565120e-05
+MSE full-rollout: 6.092581e-03
+Chamfer  (mean) : 7.576677e-02
+MSE per abs-frame: f5=5.329953e-06(n=14), f10=5.819854e-04(n=14), f15=4.579493e-03(n=14), f20=1.420089e-02(n=14)
+loss_F (pred)   : 0.000000e+00
+loss_F (gt ref) : 0.000000e+00
+--- 物理合理性 ---
+速度误差 vMSE   : 1.438054e-04
+加速度误差 aMSE : 8.688943e-06
+体积相对误差    : 7.121%
+体积自漂移      : 8.939%
+体积自漂移(GT)  : 5.014%
+超额自漂移      : +3.925%
+地面穿透率      : 1.124%
+地面穿透深度    : 6.252796e-03
+地面穿透率(GT)  : 0.000%
+```
