@@ -1,0 +1,53 @@
+# Eval config for sfG + boundary loss_F 校准臂(λ_deform=0.01)。镜像 eval_singleframe_geom_deform.yaml,
+# 只改 resume / vis_dir。判据 vs sfG(full-rollout 3.504e-3 / 体积超额 +7.7%)+ vs λ=0.1 臂:
+#   full-rollout 回到 ≲ sfG(或仍胜 run23 5.019e-3)且体积超额 < sfG → loss_F 在拐点附近有净增量。
+# single_frame_deform 是训练开关,eval 不需要(eval 不算损失)。output=1 不可比指标同 sfG 不用。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+output_frames: 1          # 单帧输出:驱动模型重建 + eval 逐帧滑动 rollout
+
+resume: 'outputs/singleframe_geom_deform_d001_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_singleframe_geom_deform_d001'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test   # n=14 held-out 同口径
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 1
