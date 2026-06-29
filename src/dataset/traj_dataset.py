@@ -309,6 +309,18 @@ class TrajDataset(Dataset):
         else:
             model_data['C'] = model_data['C'][np.clip(output_indices - 1, 0, model_data['C'].shape[0] - 1)]
 
+        # single-frame boundary loss_F(output=1):需 input 末帧的 GT F/C 作推进起点
+        # (batch['F']/['C'] 已是 output/pred 帧 = target/起点对的下一帧)。site 数据 F/C 全帧 →
+        # input_indices[-1] 必有效;仅 output=1 时输出,其它臂 batch 不变。
+        if self.output_frames == 1:
+            F_all = torch.from_numpy(np.array(model_metas['F']))
+            C_all = torch.from_numpy(np.array(model_metas['C']))
+            last_in = int(input_indices[-1])
+            model_data['F_src_last'] = F_all[last_in] if F_all.shape[0] == model_pcls.shape[0] \
+                else F_all[np.clip(last_in - 1, 0, F_all.shape[0] - 1)]
+            model_data['C_src_last'] = C_all[last_in] if C_all.shape[0] == model_pcls.shape[0] \
+                else C_all[np.clip(last_in - 1, 0, C_all.shape[0] - 1)]
+
         mask = torch.from_numpy(np.array(model_metas['drag_mask'])).bool()
 
         if 'gravity' in model_metas:

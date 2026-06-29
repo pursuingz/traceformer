@@ -129,6 +129,11 @@ class TrainingConfig:
     # (~4). For output_frames=1, set ~20 so training covers every input-window start the eval rollout
     # visits (0,1,...,~19), matching the train/eval start distribution.
     windows_per_model: Optional[int] = None
+    # Single-frame boundary loss_F: with output_frames=1 the multi-frame loss_F (DeformLoss.forward,
+    # needs >=3 frames) is structurally inactive. When True, restore it via DeformLoss.forward_single_step
+    # using the input_last->pred forward-difference velocity to advance GT F one MPM step vs GT F_next.
+    # Default False -> all existing configs unchanged (does NOT alter lambda_deform's output=1 semantics).
+    single_frame_deform: bool = False
 
 @dataclass
 class TestingConfig:

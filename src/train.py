@@ -608,6 +608,19 @@ def main(args):
                     losses['loss_deform'] = loss_F.detach().item()
                     loss = loss + args.lambda_deform * loss_F
 
+                # single-frame boundary loss_F: output=1 下原多帧 loss_F(>=3 帧)失效;用 input 末帧→pred
+                # 一步前向差分速度推进 GT F 一步、比 GT F_next。开关 single_frame_deform 显式控制(默认 off,
+                # 不偷改 lambda_deform 在 output=1 的语义)。x_t=input 末帧(常数锚), 梯度只经 x_next=pred。
+                elif args.get('single_frame_deform', False) and 'vol' in batch and args.lambda_deform > 0. \
+                        and pred_sample.shape[1] == 1 and 'F_src_last' in batch:
+                    loss_F = loss_deform.forward_single_step(
+                        x_t=cond_points_src[:, -1].clamp(min=-2.2, max=2.2),
+                        x_next=pred_sample[:, 0].clamp(min=-2.2, max=2.2),
+                        vol=batch['vol'], F_t=batch['F_src_last'], F_next=batch['F'][:, 0],
+                        C_t=batch['C_src_last'], frame_interval=2, norm_fac=args.train_dataset.norm_fac)
+                    losses['loss_deform'] = loss_F.detach().item()
+                    loss = loss + args.lambda_deform * loss_F
+
                 if args.model_config.floor_cond and args.lambda_floor > 0:
                     floor_height = batch['floor_height'].reshape(bsz, 1, 1) # (B, 1, 1)
                     sample_min_height = torch.amin(latents[..., 1], dim=(1, 2)).reshape(bsz, 1, 1)

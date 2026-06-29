@@ -1,0 +1,105 @@
+# sfG + boundary loss_F 臂。基于 config_v1_singleframe_geom.yaml(= sfG)。
+# 动机:sfG(output=1)相对 run23 结构性少了 loss_F(多帧 MPM 残差,需≥3帧,单帧守卫跳过)。
+#   loss_F 正对症 sfG 残留短板(volume drift/形变量,体积超额 +7.7%)。本臂用单帧 boundary 版补回:
+#   DeformLoss.forward_single_step 用「input 末帧→pred」一步前向差分速度推进 GT F 一步、比 GT F_next。
+#   (boundary_vel 已验证退化成 position MSE 故不补;loss_F 进非线性 P2G/G2P 不退化、给位置真物理梯度。)
+# 唯一变量(vs sfG):新开关 single_frame_deform。其余(edge=1.0/laplacian=0.5/架构/数据/步数/lr/split)
+#   全冻结 = sfG。lambda_deform=0.1 沿用(原 output=5 值,初值;step-2000 校准,见下)。
+#   改 / 加 2 处:
+#   1. output_dir(独立目录)
+#   2. single_frame_deform: true(原默认 false → sfG 无 loss_F;本臂开启 → boundary loss_F 生效)
+# ⚠️ caveat:单帧 teacher-forcing 下 boundary loss_F 只约束「input→第一预测帧」一步,
+#   约束不了 eval rollout 后续步(output=1 内在限制,非 bug)。
+# ⚠️ lambda_deform=0.1 是 output=5 量级,单步量级未知:step-2000 看 tensorboard
+#   lambda_deform×loss_deform 对比 loss_xyz(≈2e-5)+ lambda_edge×loss_edge,落 xyz 的 0.1~0.5× 为宜。
+image_size: 128
+output_dir: ./outputs/singleframe_geom_deform_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.1       # 本臂经 single_frame_deform 在 output=1 生效(boundary 单步);初值,待校准
+
+single_frame_deform: true   # 改 2:开启单帧 boundary loss_F(原默认 false)
+
+lambda_laplacian: 0.5    # 冻结 = sfG:曲面平滑正则
+lambda_collision: 0.1
+lambda_edge: 1.0         # 冻结 = sfG:边长保持正则(体积/拉伸杠杆)
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出(input 仍 5)= sfG
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

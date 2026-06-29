@@ -224,7 +224,89 @@ class DeformLoss(torch.nn.Module):
         loss = loss + Fn.l1_loss(F_pred, particle_F_next)
         return loss * (end_t - start_t)
 
-def loss_momentum(x, vol, force, drag_pt_num, start_frame=1, frame_interval=2, 
+    def forward_single_step(self, x_t, x_next, vol, F_t, F_next, C_t, frame_interval=2, norm_fac=5):
+        """单帧 boundary MPM 形变一致性损失(output_frames=1 用)。
+
+        用 input_last(x_t) → pred(x_next) 这一步的**前向差分**速度推进 GT 形变梯度 F_t 一步,
+        比 GT 下一帧 F_next。与多帧 forward 的区别:不切 start/end(M=B,单步),速度用前向差分
+        而非中心差分。x_t 是常数锚(P2G 起点,原版语义 x[t]),梯度只经速度 v 流向 x_next。
+        device 取自输入张量(不依赖 self.device,可 CPU 自检)。P2G/G2P 数学与 forward 同构。
+          x_t / x_next : (B,N,3) 归一化空间(方法内反归一化,同原版)
+          F_t / C_t    : (B,N,9) input_last 帧 GT 形变梯度 / 仿射场
+          F_next       : (B,N,9) pred 帧 GT 形变梯度(= target)
+        """
+        device = x_t.device
+        if norm_fac > 0:
+            x_t = x_t * 2 + norm_fac
+            x_next = x_next * 2 + norm_fac
+        dT = self.dT * frame_interval     # input_last→pred 真实物理 dt = 0.0417*2 = 0.0834
+
+        B = x_t.shape[0]
+        N = self.N
+
+        particle_x = x_t                          # (B,N,3) P2G 起点位置(常数锚)
+        particle_v = (x_next - x_t) / dT          # (B,N,3) 前向差分速度(依赖预测,不退化)
+        particle_F = F_t.reshape(B, N, 3, 3)
+        particle_F_next = F_next.reshape(B, N, 3, 3)
+        particle_C = C_t.reshape(B, N, 3, 3)
+        particle_mass = (self.density * vol).unsqueeze(-1).repeat(1, 1, 3)   # (B,N,3)
+
+        grid_m = torch.zeros((B, self.grid_size, self.grid_size, self.grid_size), device=device)
+        grid_v = torch.zeros((B, self.grid_size, self.grid_size, self.grid_size, 3), device=device)
+
+        grid_pos = particle_x * self.inv_dx
+        base_pos = (grid_pos - 0.5).int()
+        fx = grid_pos - base_pos
+        w = [0.5 * ((1.5 - fx) ** 2), 0.75 - ((fx - 1) ** 2), 0.5 * ((fx - 0.5) ** 2)]
+        w = torch.stack(w, dim=3)
+        dw = [fx - 1.5, -2 * (fx - 1), fx - 0.5]
+        dw = torch.stack(dw, dim=3)
+
+        # P2G(撒 x_t 位置, 用 v + C 仿射) → grid 动量/质量
+        for i in range(3):
+            for j in range(3):
+                for k in range(3):
+                    dpos = torch.tensor([i, j, k], device=device).unsqueeze(0).unsqueeze(0).repeat(B, N, 1)
+                    dpos = (dpos - fx) * self.dx
+                    ix = base_pos[:, :, 0] + i
+                    iy = base_pos[:, :, 1] + j
+                    iz = base_pos[:, :, 2] + k
+                    weight = w[:, :, 0, i] * w[:, :, 1, j] * w[:, :, 2, k]
+                    v_in_add = weight.unsqueeze(-1) * particle_mass * (particle_v + \
+                        (particle_C @ dpos.unsqueeze(-1)).squeeze(-1))
+                    flat_idx = (ix * self.grid_size * self.grid_size + iy * self.grid_size + iz).long()
+                    grid_v = grid_v.view(B, -1, 3)
+                    grid_v = grid_v.scatter_add(1, flat_idx.unsqueeze(-1).repeat(1, 1, 3), v_in_add)
+                    grid_v = grid_v.view(B, self.grid_size, self.grid_size, self.grid_size, 3)
+                    grid_m = grid_m.view(B, -1)
+                    grid_m = grid_m.scatter_add(1, flat_idx, weight * particle_mass[:, :, 0])
+                    grid_m = grid_m.view(B, self.grid_size, self.grid_size, self.grid_size)
+
+        grid_m = torch.where(grid_m > 1e-15, grid_m, torch.ones_like(grid_m))
+        grid_v = grid_v / grid_m.unsqueeze(-1)
+        grid_v = grid_v.view(B, -1, 3)
+
+        # G2P → 速度梯度 ∇v
+        new_F_pred = torch.zeros_like(particle_F)
+        for i in range(3):
+            for j in range(3):
+                for k in range(3):
+                    ix = base_pos[:, :, 0] + i
+                    iy = base_pos[:, :, 1] + j
+                    iz = base_pos[:, :, 2] + k
+                    dweight = [dw[:, :, 0, i] * w[:, :, 1, j] * w[:, :, 2, k],
+                               w[:, :, 0, i] * dw[:, :, 1, j] * w[:, :, 2, k],
+                               w[:, :, 0, i] * w[:, :, 1, j] * dw[:, :, 2, k]]
+                    dweight = torch.stack(dweight, dim=2) * self.inv_dx
+                    flat_idx = (ix * self.grid_size * self.grid_size + iy * self.grid_size + iz).long()
+                    grid_v_local = grid_v.gather(1, flat_idx.unsqueeze(-1).repeat(1, 1, 3))
+                    new_F_pred = new_F_pred + (grid_v_local.unsqueeze(-1) @ dweight.unsqueeze(2))
+
+        I33 = torch.eye(3, device=device).reshape(1, 1, 3, 3)
+        F_pred = (I33 + new_F_pred * dT) @ particle_F          # MLS-MPM 形变梯度更新
+        return Fn.l1_loss(F_pred, particle_F_next)
+
+def loss_momentum(x, vol, force, drag_pt_num, start_frame=1, frame_interval=2,
     norm_fac=5, v=None, density=1000, dt=0.0417):
     
     # Denormalize x & Double dt (since we sample every 2 frames) for training
