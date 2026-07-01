@@ -1,0 +1,102 @@
+# v10 particle-grid 块(neural P2G → grid mix → G2P,中尺度连续性)。
+# 基于 config_v1_singleframe_geom_deform_d0001.yaml(= 当前 SOTA:sfG+loss_F λ=0.001)。
+# 唯一变量 = 架构。改 3 处:
+#   1. output_dir(独立目录)
+#   2. model_config.transformer_block → SpatialTemporalTransformerBlockv10
+#   3. model_config.grid_res: 8(新键;G³=512 粗网格,≈1 粒子/格)
+# 其余全冻结 = sfG+loss_F track:output_frames=1 / rollout_random_window / windows_per_model=20 /
+#   single_frame_deform=true / lambda_deform=0.001 / laplacian0.5 / edge1.0 / dataset=site / 60000 步。
+# 假设:grid 中尺度连续性补 sfG+loss_F 的残留短板(体积超额 +5.63%),压体积漂移而不伤位置精度。
+# init 严格 == 基线(grid_gate zero-init ReZero)→ 最坏打平,单变量纪律硬保证。
+image_size: 128
+output_dir: ./outputs/v10_particlegrid_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 冻结 = 基线:单帧 boundary loss_F 校准值(0.33×xyz 拐点)
+
+single_frame_deform: true   # 冻结 = 基线:开启单帧 boundary loss_F
+
+lambda_laplacian: 0.5    # 冻结 = sfG:曲面平滑正则
+lambda_collision: 0.1
+lambda_edge: 1.0         # 冻结 = sfG:边长保持正则
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlockv10   # 改 2:particle-grid 块
+  grid_res: 8                                              # 改 3:粗网格分辨率(新键)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: site
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

@@ -36,6 +36,7 @@ for name, block, L in [
     ('v7 state-token 8L', 'SpatialTemporalTransformerBlockv7', 8),
     ('v8 physics-slice 8L', 'SpatialTemporalTransformerBlockv8', 8),
     ('v9 dual-graph 8L', 'SpatialTemporalTransformerBlockv9', 8),
+    ('v10 particle-grid 8L', 'SpatialTemporalTransformerBlockv10', 8),
 ]:
     m = build(block, L)
     tot = count(m)
