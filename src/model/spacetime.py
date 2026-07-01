@@ -1324,33 +1324,38 @@ class SpatialTemporalTransformerBlockv10(nn.Module):
             raise ValueError(
                 f"v10 expected grid_assign batch {B} or {B * F}, got {corner_idx.shape[0]}"
             )
+        out_dtype = h.dtype
         corner_idx = corner_idx.to(device=h.device, dtype=torch.long)
-        tri_w = tri_w.to(device=h.device, dtype=h.dtype)
-
-        h_n = self.grid_norm(h)
         idx_flat = corner_idx.reshape(B * F, N * 8)                 # (BF, N*8)
-        w_flat = tri_w.reshape(B * F, N * 8, 1)                     # (BF, N*8, 1)
 
-        # ---- P2G: trilinear scatter particle features onto the grid ----
-        src = (w_flat * h_n.unsqueeze(2).expand(-1, -1, 8, -1).reshape(B * F, N * 8, C))
-        grid = h_n.new_zeros(B * F, G3, C)
-        grid.scatter_add_(1, idx_flat.unsqueeze(-1).expand(-1, -1, C), src)
-        wgrid = h_n.new_zeros(B * F, G3, 1)
-        wgrid.scatter_add_(1, idx_flat.unsqueeze(-1), w_flat)
-        grid = grid / (wgrid + 1e-6)                               # normalize by cell mass
+        # Run the whole particle-grid path in fp32 with autocast disabled: under bf16
+        # training LayerNorm/Conv3d/scatter would otherwise mix dtypes (scatter requires
+        # self.dtype == src.dtype), and trilinear splatting wants fp32 precision anyway.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h_n = self.grid_norm(h.float())                        # (BF, N, C) fp32
+            tw = tri_w.to(device=h.device, dtype=torch.float32)
+            w_flat = tw.reshape(B * F, N * 8, 1)                    # (BF, N*8, 1)
 
-        # ---- mix: neighbour-cell continuity on the dense grid ----
-        G = self.grid_res
-        grid = grid.permute(0, 2, 1).reshape(B * F, C, G, G, G)
-        grid = self.grid_pwconv(self.grid_act(self.grid_dwconv(grid)))
-        grid = grid.reshape(B * F, C, G3).permute(0, 2, 1)         # (BF, G3, C)
+            # ---- P2G: trilinear scatter particle features onto the grid ----
+            src = (w_flat * h_n.unsqueeze(2).expand(-1, -1, 8, -1).reshape(B * F, N * 8, C))
+            grid = h_n.new_zeros(B * F, G3, C)
+            grid.scatter_add_(1, idx_flat.unsqueeze(-1).expand(-1, -1, C), src)
+            wgrid = h_n.new_zeros(B * F, G3, 1)
+            wgrid.scatter_add_(1, idx_flat.unsqueeze(-1), w_flat)
+            grid = grid / (wgrid + 1e-6)                           # normalize by cell mass
 
-        # ---- G2P: trilinear gather back to particles ----
-        gathered = torch.gather(grid, 1, idx_flat.unsqueeze(-1).expand(-1, -1, C))  # (BF, N*8, C)
-        gathered = gathered.reshape(B * F, N, 8, C)
-        delta = (gathered * tri_w.unsqueeze(-1)).sum(dim=2)        # (BF, N, C)
+            # ---- mix: neighbour-cell continuity on the dense grid ----
+            G = self.grid_res
+            grid = grid.permute(0, 2, 1).reshape(B * F, C, G, G, G)
+            grid = self.grid_pwconv(self.grid_act(self.grid_dwconv(grid)))
+            grid = grid.reshape(B * F, C, G3).permute(0, 2, 1)     # (BF, G3, C)
 
-        h = h + self.grid_gate * delta
+            # ---- G2P: trilinear gather back to particles ----
+            gathered = torch.gather(grid, 1, idx_flat.unsqueeze(-1).expand(-1, -1, C))  # (BF, N*8, C)
+            gathered = gathered.reshape(B * F, N, 8, C)
+            delta = (gathered * tw.unsqueeze(-1)).sum(dim=2)       # (BF, N, C) fp32
+
+        h = h + (self.grid_gate * delta).to(out_dtype)            # ReZero gate; gate=0 => h unchanged
         return h.reshape(B, F, N, C)
 
     def forward(
