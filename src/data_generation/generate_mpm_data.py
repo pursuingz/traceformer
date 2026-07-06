@@ -115,12 +115,7 @@ def run_generation(args):
         
         if points.shape[0] != N:
             continue
-        '''
         log_E = np.random.uniform(4, 7)
-        E = np.power(10, log_E)
-        nu = np.random.uniform(0.05, 0.45) 
-        '''
-        log_E = 6
         E = np.power(10, log_E)
         nu = 0.4
 
