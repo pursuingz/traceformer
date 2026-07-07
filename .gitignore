@@ -15,6 +15,10 @@ src/data_generation/data/
 outputs/
 checkpoints/
 *.csv
+# 数据打包不入库(如 diff_E_data.zip,另走 scp/rsync 同步)
+*.zip
+# 多 E 随机数据(含 h5 与 visualization/*.gif),本地生成不入库
+src/diff_E_data/
 
 # 训练产物副本(checkpoint/log/曲线图,不入库)
 23(sota)/
