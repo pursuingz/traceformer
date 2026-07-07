@@ -1,0 +1,102 @@
+# diff_E 数据集上的 sfG + boundary loss_F(λ_deform=0.001)训练。
+# 完全复制 config_v1_singleframe_geom_deform_d0001.yaml(当前 SOTA 方法),唯一变量 = 训练数据:
+#   site(固定 E=1e6 elastic)→ diff_E_data/diff_E_train(210 个 elastic,E~U(4,7) 随机、log10(E) 作为条件输入)。
+# 目的:检验 sfG+loss_F 在 E 多样化数据上是否成立、模型的 log10(E) 条件是否真的起作用(材质泛化)。
+# 改 3 处(相对 SOTA config):
+#   1. output_dir(独立目录,防 resume 污染)
+#   2. train_dataset.dataset_path: site → diff_E_data/diff_E_train
+#   （方法/架构/损失/步数/lr/split 全部冻结 = SOTA;25 帧同 data_test,n_training_frames=24 不越界)
+# ⚠️ 本 run 的 eval 数字与项目历史 SOTA(full-rollout 2.978e-3)不可直接比:评测集从 data_test(固定E)
+#    换成 diff_E_test(随机E),是另一套 held-out。它是「diff_E→diff_E 自洽」的独立数据点。
+# ⚠️ 服务器上须把 diff_E 数据放到相对 src/ 的 diff_E_data/diff_E_train(与本机同路径),否则 listdir 空。
+image_size: 128
+output_dir: ./outputs/diffE_singleframe_geom_deform_d0001_8L   # 改 1:独立目录(diff_E 臂)
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 500
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 冻结 = SOTA:λ=0.001 命中拐点
+
+single_frame_deform: true   # 冻结 = SOTA:开启单帧 boundary loss_F
+
+lambda_laplacian: 0.5    # 冻结 = sfG:曲面平滑正则
+lambda_collision: 0.1
+lambda_edge: 1.0         # 冻结 = sfG:边长保持正则
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 512
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出(input 仍 5)= sfG
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: diff_E_data/diff_E_train   # 改 2:site → diff_E 训练集(210 个 elastic,E 随机)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
