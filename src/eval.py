@@ -113,6 +113,11 @@ def main(args):
     ABS_FRAMES = [5, 10, 15, 20]                   # 绝对帧索引(跨预测粒度可比的累积曲线)
     total_mse_abs = torch.zeros(len(ABS_FRAMES))
     cnt_mse_abs = torch.zeros(len(ABS_FRAMES))
+    # 逐帧体积自漂移的绝对帧(0-indexed;24=末帧,对应口径"第25帧")。不对帧平均,每帧单独出。
+    VOL_DRIFT_FRAMES = [10, 15, 20, 24]
+    vol_drift_abs_p = torch.zeros(len(VOL_DRIFT_FRAMES))   # 逐帧 pred 自漂移 |Vp(af)-Vp(0)|/Vp(0)
+    vol_drift_abs_g = torch.zeros(len(VOL_DRIFT_FRAMES))   # 逐帧 GT  自漂移 |Vg(af)-Vg(0)|/Vg(0)
+    cnt_vol_drift_abs = torch.zeros(len(VOL_DRIFT_FRAMES))
     total_loss_F = 0.0
     total_loss_F_gt = 0.0
     n_batches = 0
@@ -261,12 +266,19 @@ def main(args):
                             if vg[t] is not None:
                                 total_vol_drift_gt += abs(vg[t] - vg[0]) / vg[0]
                                 n_vol_drift_gt += 1
+                    # 逐帧体积自漂移(不平均,核心新指标):VOL_DRIFT_FRAMES 各绝对帧单独累计 pred/GT 自漂移
+                    if vp[0] is not None and vp[0] > 1e-9 and vg[0] is not None and vg[0] > 1e-9:
+                        for fi, af in enumerate(VOL_DRIFT_FRAMES):
+                            if af < len(vp) and vp[af] is not None and vg[af] is not None:
+                                vol_drift_abs_p[fi] += abs(vp[af] - vp[0]) / vp[0]
+                                vol_drift_abs_g[fi] += abs(vg[af] - vg[0]) / vg[0]
+                                cnt_vol_drift_abs[fi] += 1
                     # opt-in 按模型日志(B=1 → 一窗一模型):供 E 分档拆解。additive,不改任何聚合指标。
                     if args.get('per_model_csv', None):
                         vrel = [abs(vp[t]-vg[t])/vg[t] for t in range(len(vp)) if vp[t] and vg[t] and vg[t] > 1e-9]
                         dpr  = [abs(vp[t]-vp[0])/vp[0] for t in range(1, len(vp)) if vp[0] and vp[t] and vp[0] > 1e-9]
                         dgt  = [abs(vg[t]-vg[0])/vg[0] for t in range(1, len(vg)) if vg[0] and vg[t] and vg[0] > 1e-9]
-                        per_model_rows.append({
+                        row = {
                             'model': str(batch['model'][b]),
                             'log10E': float(batch['E'][b].reshape(-1)[0].item()),
                             'nu': float(batch['nu'][b].reshape(-1)[0].item()),
@@ -274,7 +286,13 @@ def main(args):
                             'vol_rel': float(np.mean(vrel)) if vrel else float('nan'),
                             'drift_pred': float(np.mean(dpr)) if dpr else float('nan'),
                             'drift_gt': float(np.mean(dgt)) if dgt else float('nan'),
-                        })
+                        }
+                        p0ok = vp[0] is not None and vp[0] > 1e-9
+                        g0ok = vg[0] is not None and vg[0] > 1e-9
+                        for af in VOL_DRIFT_FRAMES:   # 逐帧 pred/GT 自漂移列(供 E 分档 x 帧)
+                            row[f'dp_f{af}'] = float(abs(vp[af]-vp[0])/vp[0]) if (p0ok and af < len(vp) and vp[af] is not None) else float('nan')
+                            row[f'dg_f{af}'] = float(abs(vg[af]-vg[0])/vg[0]) if (g0ok and af < len(vg) and vg[af] is not None) else float('nan')
+                        per_model_rows.append(row)
 
                 # ---- GT 地面穿透参考(应≈0) ----
                 y_gt = gt_f[:, INPUT_FRAMES:, :, 1]
@@ -355,6 +373,13 @@ def main(args):
     print(f'  体积自漂移      : {total_vol_drift / nvd * 100:.3f}%   (|Vp(t)-Vp(0)|/Vp(0), pred)')
     print(f'  体积自漂移(GT)  : {total_vol_drift_gt / nvd_gt * 100:.3f}%   (基线: GT 凸包自漂移, 弹性体大形变下本就>0)')
     print(f'  超额自漂移      : {(total_vol_drift / nvd - total_vol_drift_gt / nvd_gt) * 100:+.3f}%   (pred-GT; >0=模型额外引入的体积不稳定=病态信号, 这才是该看的)')
+    # 逐帧体积自漂移(不平均):每帧单独出 pred / GT / 超额(=pred-GT)
+    _cvd = cnt_vol_drift_abs.clamp(min=1)
+    _dpf = vol_drift_abs_p / _cvd
+    _dgf = vol_drift_abs_g / _cvd
+    print(f'  --- 逐帧体积自漂移(不平均, 绝对帧; f24=末帧=第25帧) ---')
+    for i, af in enumerate(VOL_DRIFT_FRAMES):
+        print(f'    f{af:<3}: pred={_dpf[i]*100:6.2f}%  gt={_dgf[i]*100:6.2f}%  超额={ (_dpf[i]-_dgf[i])*100:+6.2f}%   (n={int(cnt_vol_drift_abs[i])})')
     print(f'  地面穿透率      : {total_floor_rate / n * 100:.3f}%   (预测帧占全部点比例, 全 {n_batches} 窗口)')
     print(f'  地面穿透深度    : {total_floor_depth / n:.6e}   (归一化单位)')
     print(f'  地面穿透率(GT)  : {total_floor_rate_gt / nfg * 100:.3f}%   (参考, 应≈0)')
