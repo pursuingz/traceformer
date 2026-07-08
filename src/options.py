@@ -124,6 +124,8 @@ class TrainingConfig:
     # the multi-frame losses (vel/deform) become structurally inactive (single frame has no intra-
     # output frame difference); training reduces to position MSE + floor. See plan / 实验记录.md.
     output_frames: int = 5
+    # 时间感受野轴:输入历史帧数。默认 5=所有现有臂(无此键则 5)。1=单帧输入消融(见 plan / 实验记录.md)。
+    input_frames: int = 5
     # Non-curriculum random-window sampling: number of random-start windows to emit per model per
     # epoch (only used when rollout_random_window=True without a curriculum). None -> stride-5 count
     # (~4). For output_frames=1, set ~20 so training covers every input-window start the eval rollout
@@ -152,3 +154,7 @@ class TestingConfig:
     # Prediction granularity (mirror of TrainingConfig.output_frames). Must match the value the
     # checkpoint was trained with so the model is reconstructed with the same frame count. Default 5.
     output_frames: int = 5
+    # 时间感受野轴:mirror TrainingConfig.input_frames,须与 checkpoint 训练值一致。默认 5=现有臂。
+    input_frames: int = 5
+    # opt-in:dump 每模型明细 CSV(log10E/full-rollout/体积),供 E 分档。默认 False=不写、现有 eval 零影响。
+    per_model_csv: bool = False
