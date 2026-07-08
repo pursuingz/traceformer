@@ -16,6 +16,7 @@ output_frames: 1          # 单帧输出:驱动模型重建 + eval 逐帧滑动 
 
 resume: 'outputs/diffE_singleframe_geom_deform_d0001_8L/checkpoint-45000/model.safetensors'
 vis_dir: 'vis_results_diffE_singleframe_geom_deform_d0001'
+per_model_csv: true   # dump 按模型 CSV(供 E 分档拆解;additive,不改聚合指标)
 
 model_config:
   n_layers: 8

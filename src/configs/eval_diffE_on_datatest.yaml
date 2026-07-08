@@ -1,0 +1,54 @@
+# 交叉对照 arm3:随机 E 训的 diff_E 模型 → 评 data_test(固定 E=1e6,14 held-out)。
+# 镜像 eval_diffE_singleframe_geom_deform_d0001.yaml(resume 仍是 diff_E 权重),只改 dataset_path / vis_dir / per_model_csv。
+# 与 SOTA(固定 E→data_test,full-rollout 2.978e-3)同评测集(data_test)→ 可直接比:
+#   arm3 ≈ SOTA = 随机 E 训练不伤固定 E 泛化(甚至覆盖了 1e6);明显更差 = E 多样化稀释了对 1e6 的拟合。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+output_frames: 1
+
+resume: 'outputs/diffE_singleframe_geom_deform_d0001_8L/checkpoint-45000/model.safetensors'   # 随机 E diff_E 权重(不变)
+vis_dir: 'vis_results_diffE_on_datatest'
+per_model_csv: true
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test   # 改:评测集 = data_test(与 SOTA 同口径)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 5
+  output_frames: 1

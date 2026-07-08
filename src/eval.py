@@ -140,6 +140,7 @@ def main(args):
     total_mse_step_nz = torch.zeros(ROLLOUT_STEPS)    # 仅 start>0
     cnt_step_nz = torch.zeros(ROLLOUT_STEPS)
     seen_models = set()
+    per_model_rows = []   # opt-in(per_model_csv):每全程窗口一行(log10E/full-rollout/体积),供 E 分档分析
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             current_input = batch['points_src'].to(device)
@@ -260,6 +261,20 @@ def main(args):
                             if vg[t] is not None:
                                 total_vol_drift_gt += abs(vg[t] - vg[0]) / vg[0]
                                 n_vol_drift_gt += 1
+                    # opt-in 按模型日志(B=1 → 一窗一模型):供 E 分档拆解。additive,不改任何聚合指标。
+                    if args.get('per_model_csv', None):
+                        vrel = [abs(vp[t]-vg[t])/vg[t] for t in range(len(vp)) if vp[t] and vg[t] and vg[t] > 1e-9]
+                        dpr  = [abs(vp[t]-vp[0])/vp[0] for t in range(1, len(vp)) if vp[0] and vp[t] and vp[0] > 1e-9]
+                        dgt  = [abs(vg[t]-vg[0])/vg[0] for t in range(1, len(vg)) if vg[0] and vg[t] and vg[0] > 1e-9]
+                        per_model_rows.append({
+                            'model': str(batch['model'][b]),
+                            'log10E': float(batch['E'][b].reshape(-1)[0].item()),
+                            'nu': float(batch['nu'][b].reshape(-1)[0].item()),
+                            'mse_full': float(F.mse_loss(out_f[b], gt_f[b]).item()),
+                            'vol_rel': float(np.mean(vrel)) if vrel else float('nan'),
+                            'drift_pred': float(np.mean(dpr)) if dpr else float('nan'),
+                            'drift_gt': float(np.mean(dgt)) if dgt else float('nan'),
+                        })
 
                 # ---- GT 地面穿透参考(应≈0) ----
                 y_gt = gt_f[:, INPUT_FRAMES:, :, 1]
@@ -303,6 +318,14 @@ def main(args):
 
     n = max(n_batches, 1)
     nf = max(n_full, 1)
+    # opt-in:dump 按模型明细 CSV(*.csv 已 gitignore)。默认关 → 现有 eval 零影响。
+    if args.get('per_model_csv', None) and per_model_rows:
+        import csv
+        csv_path = f'{args.vis_dir}_per_model.csv'
+        with open(csv_path, 'w', newline='', encoding='utf-8') as _f:
+            w = csv.DictWriter(_f, fieldnames=list(per_model_rows[0].keys()))
+            w.writeheader(); w.writerows(per_model_rows)
+        print(f'  [per-model] {len(per_model_rows)} 行 -> {csv_path}')
     per_step = (total_mse_step / nf).tolist()
     print('===== eval metrics =====')
     print(f'  windows: {n_batches} total, {n_full} full-horizon (rollout 指标分母)')
