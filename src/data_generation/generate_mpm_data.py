@@ -41,7 +41,7 @@ def run_generation(args):
     wp.init()
     ti.init(arch=ti.cuda, device_memory_GB=8.0)
      
-    N = 512
+    N = 2048
     center = [5, 5, 5]
     drag_size = [0.4, 0.4, 0.4]
     material_type_list = ['elastic', 'plasticine', 'sand']
@@ -72,7 +72,7 @@ def run_generation(args):
         os.makedirs(f'{output_dir}/visualization', exist_ok=True)
     
     for i in idx_list:
-        print(2)
+        
         obj_path = obj_list[i]  
         if not os.path.exists(f'{data_dir}/{obj_path}{suffix}'):
             continue    
