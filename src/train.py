@@ -826,6 +826,10 @@ def main(args):
                                             step_start_vel = batch.get('start_vel', None)
                                             if step_start_vel is not None:
                                                 step_start_vel = step_start_vel.to(accelerator.device)
+                                        elif INPUT_FRAMES == 1:
+                                            # input=1 消融:窗口只剩单帧,无法窗口内差分。用跨 rollout step
+                                            # 后向差分(current 帧 − 上一步窗口帧),与训练 causal_start_vel 一致。
+                                            step_start_vel = current_input[:, -1, :, :] - prev_chunk[:, -1, :, :]
                                         elif OUTPUT_FRAMES >= 2:
                                             # original chunked-feedback formula (preserves existing arms exactly)
                                             step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]
