@@ -87,7 +87,10 @@ def main(args):
     # Prediction granularity (new axis): config-driven output_frames (default 5 = run23). Must be set
     # before create_model so the model is built with the same frame count as the checkpoint. ROLLOUT_STEPS
     # is derived from a fixed ~20-frame horizon: output=5 -> 4 (unchanged), output=1 -> 20 (frame-by-frame).
-    global OUTPUT_FRAMES, ROLLOUT_STEPS
+    global OUTPUT_FRAMES, ROLLOUT_STEPS, INPUT_FRAMES
+    # 时间感受野轴:input_frames config 驱动(默认 5 = 所有现有臂,无此键 → 字节不变)。input=1 = 单帧输入消融。
+    INPUT_FRAMES = args.get('input_frames', 5)
+    args.train_dataset.input_frames = INPUT_FRAMES   # 单一真源:top-level 同步给 dataset(须在下方建库前)
     OUTPUT_FRAMES = args.get('output_frames', 5)
     ROLLOUT_HORIZON = 20
     ROLLOUT_STEPS = -(-ROLLOUT_HORIZON // OUTPUT_FRAMES)
@@ -147,6 +150,10 @@ def main(args):
                     step_start_vel = batch.get('start_vel', None)
                     if step_start_vel is not None:
                         step_start_vel = step_start_vel.to(device)
+                elif INPUT_FRAMES == 1:
+                    # input=1 消融:窗口只剩单帧,无法窗口内差分。用跨 rollout step 后向差分
+                    # (current 帧 − 上一步窗口帧),与训练 causal_start_vel 后向差分语义/scale 一致。
+                    step_start_vel = current_input[:, -1, :, :] - prev_chunk[:, -1, :, :]
                 elif OUTPUT_FRAMES >= 2:
                     # original chunked-feedback formula (preserves existing arms exactly)
                     step_start_vel = current_input[:, 1, :, :] - prev_chunk[:, -1, :, :]

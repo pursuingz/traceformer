@@ -37,6 +37,9 @@ class TrajDataset(Dataset):
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
+        # input=1 消融:True → start_vel 用后向差分(只用过去帧),避免中心差分偷看目标帧。
+        # 默认 False = 现有臂中心差分,字节不变。
+        self.causal_start_vel = cfg.get('causal_start_vel', False)
 
         # if os.path.exists(os.path.join(self.dataset_path, cfg.dataset_list)):
         if os.path.exists(cfg.dataset_list):
@@ -272,6 +275,10 @@ class TrajDataset(Dataset):
         # Rule: first frame velocity is zero; otherwise use central difference from neighboring frames.
         if start_idx == 0:
             start_vel = torch.zeros_like(model_pcls[0])
+        elif self.causal_start_vel:
+            # input=1 消融:后向差分,只用过去帧,避免中心差分偷看目标帧 x[start_idx+1]
+            # (input=1 时 output_indices=[start_idx+1] = 目标)。scale = 每帧位移,与 eval 跨步差分一致。
+            start_vel = (model_pcls[start_idx] - model_pcls[max(start_idx - 1, 0)]).float()
         else:
             prev_idx = max(start_idx - 1, 0)
             next_idx = min(start_idx + 1, model_pcls.shape[0] - 1)

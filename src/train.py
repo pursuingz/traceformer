@@ -288,7 +288,9 @@ def main(args):
     # validation) follow it. INPUT_FRAMES stays 5. output_frames=1 -> single-frame autoregression.
     # ROLLOUT_STEPS (used by the validation-viz rollout) is derived from a fixed ~20-frame horizon so
     # output=5 stays 4 (=20/5) and output=1 becomes 20; keeps the visualised horizon constant.
-    global OUTPUT_FRAMES, ROLLOUT_STEPS
+    global OUTPUT_FRAMES, ROLLOUT_STEPS, INPUT_FRAMES
+    # 时间感受野轴:input_frames config 驱动(默认 5 = 所有现有臂,无此键 → 字节不变)。input=1 = 单帧输入消融。
+    INPUT_FRAMES = args.get('input_frames', 5)
     OUTPUT_FRAMES = args.get('output_frames', 5)
     ROLLOUT_STEPS = -(-ROLLOUT_HORIZON // OUTPUT_FRAMES)
     args.train_dataset.input_frames = INPUT_FRAMES
