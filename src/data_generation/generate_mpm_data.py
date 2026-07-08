@@ -61,7 +61,7 @@ def run_generation(args):
         suffix = '.glb'
     else:
         raise ValueError(f"Invalid dataset type: {args.dataset_type}")
-    print(1)    
+        
     start_idx = max(args.start_idx, 0)
     end_idx = min(args.end_idx, len(obj_list))
     idx_list = list(range(start_idx, end_idx)) 
@@ -73,23 +73,18 @@ def run_generation(args):
     
     for i in idx_list:
         print(2)
-        obj_path = obj_list[i] 
-        print(3) 
+        obj_path = obj_list[i]  
         if not os.path.exists(f'{data_dir}/{obj_path}{suffix}'):
-            continue
-        print(3)    
+            continue    
         torch.cuda.empty_cache()
         gc.collect()
         wp.clear_kernel_cache()
-        print(3)
         output_idx = f'{i:05d}_{material_type_index:03d}'
         print(f'Generating {output_idx}...')
         output_path = f'{output_dir}/h5/{output_idx}.h5'
         if os.path.exists(output_path):
             continue
-        print(3)
         seed_everything(output_idx)
-        print(3)
         try:
             mesh = load_mesh(f'{data_dir}/{obj_path}{suffix}')
         except:
@@ -117,7 +112,7 @@ def run_generation(args):
             continue
         log_E = np.random.uniform(4, 7)
         E = np.power(10, log_E)
-        nu = 0.4
+        nu = np.random.uniform(0.05, 0.45)  # 泊松比也随机(nu 是模型条件:nu_cond_encoder),上界 0.45 避不可压缩数值不稳
 
 
         material_params["material"] = args.material 
@@ -146,7 +141,6 @@ def run_generation(args):
         frame_dt = time_params["frame_dt"]
         frame_num = time_params["frame_num"]
         step_per_frame = int(frame_dt / substep_dt)
-        print(3)
         material_params["E"] = E
         material_params["nu"] = nu
         grid_lim = material_params["grid_lim"]
