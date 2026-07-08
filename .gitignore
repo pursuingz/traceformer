@@ -17,11 +17,17 @@ checkpoints/
 *.csv
 # 数据打包不入库(如 diff_E_data.zip,另走 scp/rsync 同步)
 *.zip
-# 多 E 随机数据(含 h5 与 visualization/*.gif),本地生成不入库
-src/diff_E_data/
+# 多 E/nu 随机数据(含 h5 与 visualization/*.gif),本地生成不入库;glob 覆盖 diff_E_data/diff_E_nu_data 等所有变体
+src/diff_E*_data/
 
 # 训练产物副本(checkpoint/log/曲线图,不入库)
 23(sota)/
 
 # 项目级 Claude 规范,本地用,不入库
 CLAUDE.md
+
+# 零散 .md 工作稿本地用,不入库。
+# 注:gitignore 不影响已跟踪文件 → 实验记录.md / all_results_n14.md / phase1-5_roadmap.md /
+#   old_results_appendix.md / test_result.md / README.md 仍继续入库同步。
+#   若要新增一个需入库的 .md,用 git add -f 强制。
+*.md
