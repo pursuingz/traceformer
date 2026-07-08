@@ -1,0 +1,54 @@
+# Eval for input=3 时间感受野消融臂。镜像 eval_singleframe_geom_deform_d0001.yaml,
+# 只改 resume / vis_dir / input_frames。无 causal_start_vel(input>=2 中心差分无泄漏,同 SOTA)。
+# 判据:与 input1 / SOTA(input5, full-rollout 2.978e-3)构成 input ∈ {1,3,5} 扫描,
+#   看「历史帧数-精度」曲线在 3 处是否已饱和(3≈5 → 历史冗余点在 3 以内)。
+pc_size: 512
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: false
+num_inference_steps: 1
+input_frames: 3           # 输入历史 5→3(config 驱动 INPUT_FRAMES → dataset + cond_frames=3)
+output_frames: 1          # 单帧输出:同 SOTA,eval 逐帧滑动 rollout
+
+resume: 'outputs/singleframe_geom_deform_d0001_input3_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_singleframe_geom_deform_d0001_input3'
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: data_test   # n=14 held-out 同口径
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 512
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 3
+  output_frames: 1
