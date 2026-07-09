@@ -242,7 +242,7 @@ class DeformLoss(torch.nn.Module):
         dT = self.dT * frame_interval     # input_last→pred 真实物理 dt = 0.0417*2 = 0.0834
 
         B = x_t.shape[0]
-        N = self.N
+        N = x_t.shape[1]   # 从输入推导(勿用 self.N=512 写死;2048 粒子臂 reshape 会炸,512 臂数值不变)
 
         particle_x = x_t                          # (B,N,3) P2G 起点位置(常数锚)
         particle_v = (x_next - x_t) / dT          # (B,N,3) 前向差分速度(依赖预测,不退化)
