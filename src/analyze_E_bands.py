@@ -23,9 +23,11 @@ def load(path):
     with open(path, newline='', encoding='utf-8') as f:
         for r in csv.DictReader(f):
             d = {'model': r['model'], 'log10E': float(r['log10E']), 'nu': float(r.get('nu', 'nan'))}
-            for k in ('mse_full', 'vol_rel', 'drift_pred', 'drift_gt'):
+            for k in ('mse_full', 'vol_rel', 'drift_pred', 'drift_gt', 'dp_f24', 'dg_f24'):
                 d[k] = float(r[k]) if r.get(k) not in (None, '', 'nan') else float('nan')
             d['excess'] = d['drift_pred'] - d['drift_gt']
+            # 末帧超额(f24=第25帧):逐帧列由 eval.py per_model_csv 落盘;老 CSV 无此列 → nan(列输出为 nan)
+            d['excess_f24'] = d['dp_f24'] - d['dg_f24']
             rows.append(d)
     return rows
 
@@ -41,7 +43,7 @@ def mean(xs):
 
 def summarize(rows, label):
     print(f"\n===== {label}  (n={len(rows)}) =====")
-    print(f"  {'band':<6}{'n':>3}{'full-rollout':>15}{'vol_rel%':>10}{'drift_p%':>10}{'drift_gt%':>11}{'excess%':>10}")
+    print(f"  {'band':<6}{'n':>3}{'full-rollout':>15}{'vol_rel%':>10}{'drift_p%':>10}{'drift_gt%':>11}{'excess%':>10}{'exc_f24%':>10}")
     for name, lo, hi in BANDS:
         b = [r for r in rows if band_of(r['log10E']) == name]
         if not b:
@@ -49,11 +51,13 @@ def summarize(rows, label):
             continue
         print(f"  {name:<6}{len(b):>3}{mean([r['mse_full'] for r in b]):>15.3e}"
               f"{mean([r['vol_rel'] for r in b])*100:>10.2f}{mean([r['drift_pred'] for r in b])*100:>10.2f}"
-              f"{mean([r['drift_gt'] for r in b])*100:>11.2f}{mean([r['excess'] for r in b])*100:>10.2f}")
+              f"{mean([r['drift_gt'] for r in b])*100:>11.2f}{mean([r['excess'] for r in b])*100:>10.2f}"
+              f"{mean([r['excess_f24'] for r in b])*100:>10.2f}")
     allrows = rows
     print(f"  {'ALL':<6}{len(allrows):>3}{mean([r['mse_full'] for r in allrows]):>15.3e}"
           f"{mean([r['vol_rel'] for r in allrows])*100:>10.2f}{mean([r['drift_pred'] for r in allrows])*100:>10.2f}"
-          f"{mean([r['drift_gt'] for r in allrows])*100:>11.2f}{mean([r['excess'] for r in allrows])*100:>10.2f}")
+          f"{mean([r['drift_gt'] for r in allrows])*100:>11.2f}{mean([r['excess'] for r in allrows])*100:>10.2f}"
+          f"{mean([r['excess_f24'] for r in allrows])*100:>10.2f}")
 
 def compare(rowsA, labA, rowsB, labB):
     """双表:同评测集不同训练来源,按档比 full-rollout。"""
