@@ -1,7 +1,8 @@
 # Eval config for diff_E_2048 臂(2048 粒子,sfG + boundary loss_F λ_deform=0.001)。
 # 严格镜像 config_diffE2048_singleframe_geom_deform_d0001.yaml 的 model_config 与 train_dataset,
 # 只差 resume / vis_dir / split(eval.py 强制 'val')。
-# 评测集 = diff_E_2048_data/diff_E_test(_test 结尾 → traj_dataset 取全部当 test split)。
+# 评测集 = diff_E_2048_data/2048_data/2048_test(_test 结尾 → traj_dataset 取全部当 test split,n=13)。
+# ⚠️ 物体集 = uid 39xxx 段,与 diff_E_test(25xxx)零重叠 → 跨臂比 diffE-512 带物体集混淆。
 # 对照臂 = diffE-512(eval_diffE_singleframe_geom_deform_d0001,full-rollout 3.047e-3 @45k)。
 # ⚠️ MSE 逐点均值跨 N 大致可比;Chamfer/凸包体积随采样密度移动,对比时注明口径。
 pc_size: 2048
@@ -37,7 +38,7 @@ model_config:
 
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: diff_E_2048_data/diff_E_test   # 2048 粒子测试集(_test 结尾 → 取全部)
+  dataset_path: diff_E_2048_data/2048_data/2048_test   # 2048 粒子测试集(_test 结尾 → 取全部 13 条)
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: 1

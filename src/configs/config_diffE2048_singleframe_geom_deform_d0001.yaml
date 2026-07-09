@@ -5,8 +5,11 @@
 # 改 3 处(相对 diffE-512 config):
 #   1. output_dir(独立目录,防 resume 污染)
 #   2. pc_size 512 → 2048(train_dataset.pc_size 经 ${pc_size} 自动跟随)
-#   3. train_dataset.dataset_path: diff_E_data/diff_E_train → diff_E_2048_data/diff_E_train
+#   3. train_dataset.dataset_path: diff_E_data/diff_E_train → diff_E_2048_data/2048_data/2048_train
 #   (方法/损失/步数/lr/split/E-nu 随机化全部冻结 = diffE-512 臂)
+# ⚠️ 已知混淆:2048 数据生成用了 uid 索引 30xxx 段(254 train/13 test),与 diffE-512 的 20xxx/25xxx
+#    段物体集零重叠 → 与 diffE-512 跨臂比数字带「物体集不同」混淆(同 site-vs-20xxx caveat)。
+#    干净对照 = 同 30xxx 数据再训一个 pc_size=512 臂(降采样路径),唯一变量才是采样密度。
 # ⚠️ 模型参数量不变(位置嵌入是 sincos buffer,非学习参数),但空间注意力 O(N²) → 计算 ~16×,
 #    显存/单步耗时显著上升;grad ckpt + xformers 已开。若 OOM 先降 dataloader_num_workers。
 # ⚠️ 指标口径:MSE 是逐点均值、量纲可比,但 Chamfer/凸包体积随采样密度移动,跨 N 对比需谨慎。
@@ -86,7 +89,7 @@ model_config:
   transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: diff_E_2048_data/diff_E_train   # 改 3:2048 粒子训练集(E/nu 随机,同 diff_E 分布)
+  dataset_path: diff_E_2048_data/2048_data/2048_train   # 改 3:2048 粒子训练集(E/nu 随机;uid 30xxx 段,254 条)
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true # no gravity
   max_num_forces: ${model_config.max_num_forces}
