@@ -1,0 +1,112 @@
+# 原版 PhysCtrl 范式 baseline(diffusion 版),训在 diff_E_2048 数据(2048 粒子)上。
+# 目的:补论文阻塞项「去扩散 baseline」——原版扩散生成 vs 本项目确定性回归的范式对比。
+# 复现上游 cwchenwang/physctrl 的训练模式(以 physctrl_o 原始 config_dit_base.yaml 为参照):
+#   - use_diffusion: true → train.py 走 DDPM(1000 步, prediction_type='sample',与上游一致)
+#   - input_frames=1 / output_frames=24 → 首帧条件 + 一次生成整段 24 帧(数据共 25 帧)
+#     窗口 = 1+24 = 25 帧 = 整条轨迹 → max_start=0,每 model 每 epoch 恰 1 个 start=0 全长窗口(= 原版)
+#     start_idx=0 → start_vel 自动为零向量(原版无速度通道,信息上等价)
+#   - 原版 loss:xyz MSE + λ_vel=1.0 + λ_deform=0.001(多帧 MPM 残差;均为上游 base 原值),
+#     几何正则(laplacian/collision/edge/floor)与 mask/momentum 全 0
+# ⚠️ 与上游 base 的两处显式偏离(为与本项目 2048 臂可比,条件通道保持一致):
+#   - mask_cond: true / floor_cond: true(上游 base 为 false/false;run23 及所有本项目臂均 true)
+#   - 单卡 5090(上游 8 卡);有效 batch = 1×8 accum = 8(与本项目所有臂一致)
+# 对照臂 = config_diffE2048_singleframe_geom_deform_d0001(同数据、同架构、同 step 取 checkpoint-45000)。
+# ⚠️ 指标口径:本臂 rollout 序列 = 1 GT 帧 + 24 预测帧(现有臂 = 5 GT + 20 预测)→ MSE full 分母不同;
+#   跨臂比优先用 MSE per-abs(帧 5/10/15/20,轨迹帧号对齐,双方 start=0)与逐帧 Chamfer。
+# ⚠️ 依赖 physics.py 多帧 forward 的 N 推导修复(原 self.N=512 写死,2048+24 帧必崩)。
+# ⚠️ 计算量:26 帧 × 2048 点的时空注意力 + M=22 的网格化 loss_F,单步显存/耗时显著高于 sfG 2048 臂;
+#   若 OOM 先降 dataloader_num_workers,仍 OOM 再回报(loss_F 分帧分块计算是备选,但偏离原版口径)。
+image_size: 128
+output_dir: ./outputs/diffE2048_physctrl_orig_8L
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 60000        # 上游 base 原值;对比点 = checkpoint-45000(与 diffE2048 sfG 臂同 step)
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 10   # 60000 步下保留 37500-60000,含 45000 对比点
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 2000       # 验证 = 50 步 DDIM 采样 × 8 model,贵;沿用 2048 臂降频值
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+
+use_diffusion: true      # ★ 范式开关:原版 DDPM 训练(train.py 内 1000 步 / prediction_type='sample')
+input_frames: 1          # ★ 首帧条件(train.py config 驱动,默认 5;cond_frames 随之 = 1)
+output_frames: 24        # ★ 一次生成整段 24 帧(= 上游 n_training_frames)
+
+lambda_vel: 1.0          # 原版 loss:24 帧输出 → 帧差速度项生效(上游原值)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 原版 loss:多帧 MPM 形变残差(上游 base 原值;走 DeformLoss.forward)
+
+single_frame_deform: false   # output=24 下本就不触发;显式关闭防误读
+
+lambda_laplacian: 0.0    # 本项目新增几何正则全关(原版无)
+lambda_collision: 0.0
+lambda_edge: 0.0
+lambda_floor: 0.0
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 2048
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+rollout_random_window: false   # 全长窗口 max_start=0,随机窗口无意义;固定网格 = 每 model 1 窗口
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true          # ⚠️ 偏离上游 base(false):与本项目所有臂一致,保证条件通道可比
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True         # ⚠️ 偏离上游 base(false):同上
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock   # 原版串行块(上游同款)
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: diff_E_2048_data/2048_data/2048_train   # 2048 粒子训练集(E/nu 随机;uid 30xxx 段,254 条)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true # no gravity
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

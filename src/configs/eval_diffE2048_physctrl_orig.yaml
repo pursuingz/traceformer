@@ -1,0 +1,62 @@
+# Eval config for 原版 PhysCtrl 范式 baseline(diffusion,2048 粒子)。
+# 严格镜像 config_diffE2048_physctrl_orig.yaml 的 model_config 与 train_dataset,
+# 只差 resume / vis_dir / split(eval.py 强制 'test' 取全部 13 条)。
+# ★ 本臂例外:use_diffusion=true + num_inference_steps=50(DDIM,pipeline 上游默认值)——
+#   这正是被评测的范式本身,不适用「评测必须 use_diffusion:false」的确定性臂约定。
+# output=24 → ROLLOUT_STEPS = ceil(20/24) = 1:一次 DDIM 采样出整段 24 帧,无自回归喂回。
+# ⚠️ 指标口径:rollout 序列 = 1 GT 帧 + 24 预测帧(现有臂 = 5 GT + 20 预测)→ MSE full 分母不同;
+#   跨臂比优先 MSE per-abs(帧 5/10/15/20,轨迹帧号对齐)与 Chamfer。对照臂 =
+#   eval_diffE2048_singleframe_geom_deform_d0001(同数据同 checkpoint-45000)。
+# ⚠️ 采样有随机性:generator 由 seed=0 固定,单次采样可复现;严格讲 diffusion 指标应多 seed 平均,
+#   首轮先看单 seed,量级接近再补。
+pc_size: 2048
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: true
+num_inference_steps: 50
+input_frames: 1
+output_frames: 24
+
+resume: 'outputs/diffE2048_physctrl_orig_8L/checkpoint-45000/model.safetensors'
+vis_dir: 'vis_results_diffE2048_physctrl_orig'
+per_model_csv: true   # dump 按模型 CSV(供 E 分档拆解)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  coeff_cond: false
+  class_token: false
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: diff_E_2048_data/2048_data/2048_test   # 2048 粒子测试集(_test 结尾 → 取全部 13 条)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 2048
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 1
+  output_frames: 24

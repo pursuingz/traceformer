@@ -11,8 +11,7 @@ class DeformLoss(torch.nn.Module):
         super().__init__()
 
         self.device = "cuda"
-        self.N = 512
-        self.I33 = torch.eye(3, device=self.device).unsqueeze(0).repeat(self.N, 1, 1)
+        # 粒子数 N 一律从输入形状推导(勿在此写死;历史 self.N=512 在 2048 粒子数据上 reshape 崩)
         self.dT = 0.0417
         self.grid_lim = 10
         self.grid_size = 125
@@ -28,9 +27,11 @@ class DeformLoss(torch.nn.Module):
         dT = self.dT * frame_interval
 
         loss = 0
+        N = x.shape[2]   # 从输入推导粒子数(512/2048 通用)
+        I33 = torch.eye(3, device=x.device).reshape(1, 3, 3)
 
         for bs in range(x.shape[0]):
-            
+
             particle_mass = (self.density * vol[bs]).unsqueeze(-1).repeat(1, 3)
 
             start_t = 1 if frame_interval == 1 else 0
@@ -63,7 +64,7 @@ class DeformLoss(torch.nn.Module):
                 for i in range(3):
                     for j in range(3):
                         for k in range(3):
-                            dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).repeat(self.N, 1)
+                            dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).repeat(N, 1)
                             dpos = (dpos - fx) * self.dx
                             ix = base_pos[:, 0] + i
                             iy = base_pos[:, 1] + j
@@ -98,7 +99,7 @@ class DeformLoss(torch.nn.Module):
                 for i in range(3):
                     for j in range(3):
                         for k in range(3):
-                            dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).repeat(self.N, 1).float() - fx
+                            dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).repeat(N, 1).float() - fx
                             ix = base_pos[:, 0] + i
                             iy = base_pos[:, 1] + j
                             iz = base_pos[:, 2] + k
@@ -111,7 +112,7 @@ class DeformLoss(torch.nn.Module):
                             grid_v_local = grid_v[ix, iy, iz]
                             new_F_pred = new_F_pred + (grid_v_local.unsqueeze(-1) @ dweight.unsqueeze(1))
 
-                F_pred = (self.I33 + new_F_pred * dT) @ particle_F
+                F_pred = (I33 + new_F_pred * dT) @ particle_F
                 loss = loss + Fn.l1_loss(F_pred, particle_F_next)
                 # loss = loss + Fn.l1_loss(particle_F, particle_F_next)
 
@@ -127,6 +128,7 @@ class DeformLoss(torch.nn.Module):
         loss = 0
 
         bs = x.shape[0]
+        N = x.shape[2]   # 从输入推导粒子数(原 self.N=512 写死,2048 粒子数据 reshape 崩;512 数值不变)
         start_t = 1 if frame_interval == 1 else 0
         end_t = x.shape[1] - 2
         M = bs * (end_t - start_t)
@@ -135,23 +137,23 @@ class DeformLoss(torch.nn.Module):
         grid_m = torch.zeros((M, self.grid_size, self.grid_size, self.grid_size), device=self.device)
         grid_v = torch.zeros((M, self.grid_size, self.grid_size, self.grid_size, 3), device=self.device)
 
-        particle_x = x[:, start_t:end_t].reshape(M, self.N, 3)
-        # particle_x = x[:, (start_t+1):(end_t+1)].reshape(M, self.N, 3)
+        particle_x = x[:, start_t:end_t].reshape(M, N, 3)
+        # particle_x = x[:, (start_t+1):(end_t+1)].reshape(M, N, 3)
 
         if v is not None:
-            # particle_v = v[:, start_t:end_t].reshape(M, self.N, 3)
-            particle_v = v[:, (start_t+1):(end_t+1)].reshape(M, self.N, 3)
+            # particle_v = v[:, start_t:end_t].reshape(M, N, 3)
+            particle_v = v[:, (start_t+1):(end_t+1)].reshape(M, N, 3)
         else:
             particle_v = (x[:, (start_t+2):(end_t+2)] - x[:, start_t:end_t]) / (2 * dT)
-        particle_v = particle_v.reshape(M, self.N, 3)
+        particle_v = particle_v.reshape(M, N, 3)
 
-        particle_F = F[:, start_t:end_t].reshape(M, self.N, 3, 3)
-        particle_F_next = F[:, (start_t+1):(end_t+1)].reshape(M, self.N, 3, 3)
+        particle_F = F[:, start_t:end_t].reshape(M, N, 3, 3)
+        particle_F_next = F[:, (start_t+1):(end_t+1)].reshape(M, N, 3, 3)
 
-        particle_C = C[:, start_t:end_t].reshape(M, self.N, 3, 3)
-        # particle_C = C[:, (start_t+1):(end_t+1)].reshape(M, self.N, 3, 3)
+        particle_C = C[:, start_t:end_t].reshape(M, N, 3, 3)
+        # particle_C = C[:, (start_t+1):(end_t+1)].reshape(M, N, 3, 3)
 
-        vol = vol.unsqueeze(1).repeat(1, end_t - start_t, 1).reshape(M, self.N)
+        vol = vol.unsqueeze(1).repeat(1, end_t - start_t, 1).reshape(M, N)
         particle_mass = (self.density * vol).unsqueeze(-1).repeat(1, 1, 3)
 
         # P2G
@@ -167,7 +169,7 @@ class DeformLoss(torch.nn.Module):
             for j in range(3):
                 for k in range(3):
 
-                    dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).unsqueeze(0).repeat(M, self.N, 1)
+                    dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).unsqueeze(0).repeat(M, N, 1)
                     dpos = (dpos - fx) * self.dx
                     ix = base_pos[:, :, 0] + i
                     iy = base_pos[:, :, 1] + j
@@ -203,7 +205,7 @@ class DeformLoss(torch.nn.Module):
             for j in range(3):
                 for k in range(3):
 
-                    dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).unsqueeze(0).repeat(M, self.N, 1).float() - fx
+                    dpos = torch.tensor([i, j, k], device=self.device).unsqueeze(0).unsqueeze(0).repeat(M, N, 1).float() - fx
                     ix = base_pos[:, :, 0] + i
                     iy = base_pos[:, :, 1] + j
                     iz = base_pos[:, :, 2] + k
@@ -220,7 +222,7 @@ class DeformLoss(torch.nn.Module):
                     grid_v_local = grid_v.gather(1, flat_idx.unsqueeze(-1).repeat(1, 1, 3))
                     new_F_pred = new_F_pred + (grid_v_local.unsqueeze(-1) @ dweight.unsqueeze(2))
 
-        F_pred = (self.I33 + new_F_pred * dT) @ particle_F
+        F_pred = (torch.eye(3, device=x.device).reshape(1, 1, 3, 3) + new_F_pred * dT) @ particle_F
         loss = loss + Fn.l1_loss(F_pred, particle_F_next)
         return loss * (end_t - start_t)
 
