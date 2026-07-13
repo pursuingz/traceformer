@@ -9,10 +9,12 @@ from pipeline_traj import TrajPipeline
 import torch
 from safetensors.torch import load_file
 import argparse
+import math
 import os
 import numpy as np
 import h5py
 from utils.physics import loss_momentum, DeformLoss
+from utils.eval_metrics import per_window_metrics
 import torch.nn.functional as F
 from tqdm import tqdm
 from utils.visualization import save_pointcloud_video, save_pointcloud_json, save_threejs_html, generate_html_from_exts
@@ -146,6 +148,15 @@ def main(args):
     cnt_step_nz = torch.zeros(ROLLOUT_STEPS)
     seen_models = set()
     per_model_rows = []   # opt-in(per_model_csv):每全程窗口一行(log10E/full-rollout/体积),供 E 分档分析
+    # ---- 度量层扩展(范式对比;utils/eval_metrics.py;仅全程窗口,只算预测帧)----
+    # 全帧 per-frame MSE(→分段 seg-MSE / 几何均值)、FDE、Procrustes 位姿-形状分解、固定边弥散度。
+    PARADIGM_FRAMES = (5, 10, 15, 20, 24)
+    pm_mse_frame_sum, pm_mse_frame_cnt = {}, {}
+    pm_fde_sum, pm_fde_cnt = 0.0, 0
+    pm_proc_sum = {af: [0.0] * 4 for af in PARADIGM_FRAMES}
+    pm_proc_cnt = {af: 0 for af in PARADIGM_FRAMES}
+    pm_edge_sum = {af: [0.0, 0.0] for af in PARADIGM_FRAMES}
+    pm_edge_cnt = {af: 0 for af in PARADIGM_FRAMES}
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             current_input = batch['points_src'].to(device)
@@ -236,6 +247,26 @@ def main(args):
                     if af < out_f.shape[1]:
                         total_mse_abs[ai] += F.mse_loss(out_f[:, af], gt_f[:, af]).item()
                         cnt_mse_abs[ai] += 1
+
+                # ---- 度量层扩展:全帧 per-frame / FDE / Procrustes 分解 / 固定边弥散度 ----
+                # autocast 关闭:SVD / cdist 需全精度;逐窗口(eval_batch_size 实际=1)。
+                with torch.autocast("cuda", enabled=False):
+                    for b in range(out_f.shape[0]):
+                        pm = per_window_metrics(out_f[b].float(), gt_f[b].float(),
+                                                INPUT_FRAMES, PARADIGM_FRAMES)
+                        for af, v in pm['mse_frame'].items():
+                            pm_mse_frame_sum[af] = pm_mse_frame_sum.get(af, 0.0) + v
+                            pm_mse_frame_cnt[af] = pm_mse_frame_cnt.get(af, 0) + 1
+                        pm_fde_sum += pm['fde']
+                        pm_fde_cnt += 1
+                        for af, tup in pm['proc'].items():
+                            for j in range(4):
+                                pm_proc_sum[af][j] += tup[j]
+                            pm_proc_cnt[af] += 1
+                        for af, (rp, rg) in pm['edge'].items():
+                            pm_edge_sum[af][0] += rp
+                            pm_edge_sum[af][1] += rg
+                            pm_edge_cnt[af] += 1
 
                 # ---- 速度 / 加速度误差(归一化空间, vs GT) ----
                 v_pred = out_f[:, 1:] - out_f[:, :-1]
@@ -354,6 +385,36 @@ def main(args):
     # ---- per-绝对帧 MSE(跨预测粒度可比, output=1 vs output=5 用这行对比, 不用上面的 chunk per-step)----
     per_abs = (total_mse_abs / torch.clamp(cnt_mse_abs, min=1)).tolist()
     print('  MSE per abs-frame: ' + ', '.join(f'f{ABS_FRAMES[k]}={v:.6e}(n={int(cnt_mse_abs[k])})' for k, v in enumerate(per_abs)))
+    # ---- 度量层扩展输出(范式对比口径;仅全程窗口。设计动机见 utils/eval_metrics.py 头注)----
+    if pm_mse_frame_cnt:
+        _fs = sorted(pm_mse_frame_cnt.keys())
+        _pf = {af: pm_mse_frame_sum[af] / pm_mse_frame_cnt[af] for af in _fs}
+        print('  --- 全帧 per-frame + 分段/端点(单标量隐含 horizon 权重, 分段呈现) ---')
+        print('  MSE per-frame(仅预测帧): ' + ', '.join(f'f{af}={_pf[af]:.6e}' for af in _fs)
+              + f'   (n={pm_mse_frame_cnt[_fs[0]]})')
+        _seg = lambda lo, hi: (lambda xs: sum(xs) / len(xs) if xs else float('nan'))(
+            [_pf[af] for af in _fs if lo <= af <= hi])
+        _gm_vals = [_pf[af] for af in _fs if 5 <= af <= 24 and _pf[af] > 0]
+        _gm = 10 ** (sum(math.log10(v) for v in _gm_vals) / len(_gm_vals)) if _gm_vals else float('nan')
+        print(f'  seg-MSE: short(f5-10)={_seg(5, 10):.6e}  mid(f11-17)={_seg(11, 17):.6e}  '
+              f'long(f18-24)={_seg(18, 24):.6e}   (段内算术均值, 段间勿再平均)')
+        print(f'  GM-MSE (f5-24)  : {_gm:.6e}   (几何均值, 各帧相对误差等权)')
+        print(f'  FDE (末帧逐点L2): {pm_fde_sum / max(pm_fde_cnt, 1):.6e}   '
+              f'MSE@f24={_pf.get(24, float("nan")):.6e}')
+        print('  --- Procrustes 位姿/形状分解(pred→GT 相似对齐; MSE=位置敏感, 残余=纯形状) ---')
+        for af in PARADIGM_FRAMES:
+            if pm_proc_cnt[af]:
+                _c = pm_proc_cnt[af]
+                _t, _r, _s, _res = (x / _c for x in pm_proc_sum[af])
+                print(f'    f{af:<3}: 质心偏移={_t:.4e}  旋转={_r:6.2f}°  尺度s={_s:.4f}'
+                      f'(s<1=pred偏大)  残余形状MSE={_res:.6e}   (n={_c})')
+        print('  --- 固定边弥散度(首帧kNN k=8 边长膨胀率, 相对首帧;⚠️与 lambda_edge 同族, 仅诊断) ---')
+        for af in PARADIGM_FRAMES:
+            if pm_edge_cnt[af]:
+                _c = pm_edge_cnt[af]
+                _rp, _rg = pm_edge_sum[af][0] / _c, pm_edge_sum[af][1] / _c
+                print(f'    f{af:<3}: pred={(_rp - 1) * 100:+6.2f}%  gt={(_rg - 1) * 100:+6.2f}%  '
+                      f'超额={(_rp - _rg) * 100:+6.2f}%   (n={_c})')
     # ---- 非0起点 partial-rollout(评测对齐 artifact 判据)----
     safe_step = lambda tot, cnt: (tot / torch.clamp(cnt, min=1)).tolist()
     per_step_all = safe_step(total_mse_step_all, cnt_step_all)
