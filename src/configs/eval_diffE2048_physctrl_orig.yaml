@@ -7,8 +7,8 @@
 # ⚠️ 指标口径:rollout 序列 = 1 GT 帧 + 24 预测帧(现有臂 = 5 GT + 20 预测)→ MSE full 分母不同;
 #   跨臂比优先 MSE per-abs(帧 5/10/15/20,轨迹帧号对齐)与 Chamfer。对照臂 =
 #   eval_diffE2048_singleframe_geom_deform_d0001(同数据同 checkpoint-45000)。
-# ⚠️ 采样有随机性:generator 由 seed=0 固定,单次采样可复现;严格讲 diffusion 指标应多 seed 平均,
-#   首轮先看单 seed,量级接近再补。
+# ⚠️ 采样有随机性:generator 由 seed=0 固定,单次采样可复现;多 seed 平均用 CLI 覆盖:
+#   python eval.py --config ... --seed N(N=0..4),结果各自落盘 eval_results/*_seedN.md,不改本文件。
 pc_size: 2048
 eval_batch_size: 1
 dataloader_num_workers: 4
@@ -21,7 +21,7 @@ num_inference_steps: 50
 input_frames: 1
 output_frames: 24
 
-resume: 'outputs/diffE2048_physctrl_orig_8L/checkpoint-45000/model.safetensors'
+resume: 'outputs/diffE2048_physctrl_orig_8L/checkpoint-90000/model.safetensors'   # 范式对比锚点 @90000(与确定性臂同 step)
 vis_dir: 'vis_results_diffE2048_physctrl_orig'
 per_model_csv: true   # dump 按模型 CSV(供 E 分档拆解)
 

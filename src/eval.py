@@ -9,8 +9,11 @@ from pipeline_traj import TrajPipeline
 import torch
 from safetensors.torch import load_file
 import argparse
+import io
 import math
 import os
+import re
+import time
 import numpy as np
 import h5py
 from utils.physics import loss_momentum, DeformLoss
@@ -42,6 +45,20 @@ def cloud_volume(pc):
 INPUT_FRAMES = 5
 OUTPUT_FRAMES = 5
 ROLLOUT_STEPS = 4
+
+
+class _Tee:
+    """把 print 同时写到终端和缓冲——eval 指标块原样落盘,不改动任何现有 print 行。"""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
 
 def create_model(args):
     args.train_dataset.input_frames = INPUT_FRAMES
@@ -85,7 +102,7 @@ def chamfer_distance(pred, gt):
     return cd.mean()
 
 loss_deform = DeformLoss().to('cuda')
-def main(args):
+def main(args, config_path=None):
     # Prediction granularity (new axis): config-driven output_frames (default 5 = run23). Must be set
     # before create_model so the model is built with the same frame count as the checkpoint. ROLLOUT_STEPS
     # is derived from a fixed ~20-frame horizon: output=5 -> 4 (unchanged), output=1 -> 20 (frame-by-frame).
@@ -148,6 +165,7 @@ def main(args):
     cnt_step_nz = torch.zeros(ROLLOUT_STEPS)
     seen_models = set()
     per_model_rows = []   # opt-in(per_model_csv):每全程窗口一行(log10E/full-rollout/体积),供 E 分档分析
+    gen_times = []        # 每窗口生成段 wall-clock(仅 rollout 循环,cuda synchronize 包裹;首窗含 compile warmup)
     # ---- 度量层扩展(范式对比;utils/eval_metrics.py;仅全程窗口,只算预测帧)----
     # 全帧 per-frame MSE(→分段 seg-MSE / 几何均值)、FDE、Procrustes 位姿-形状分解、固定边弥散度。
     PARADIGM_FRAMES = (5, 10, 15, 20, 24)
@@ -162,6 +180,8 @@ def main(args):
             current_input = batch['points_src'].to(device)
             rollout_chunks = [current_input]
             prev_chunk = current_input
+            torch.cuda.synchronize()
+            _gen_t0 = time.perf_counter()
             for step_idx in range(ROLLOUT_STEPS):
                 if step_idx == 0:
                     step_start_vel = batch.get('start_vel', None)
@@ -205,6 +225,8 @@ def main(args):
                 # slide input window: drop oldest, append prediction, keep last INPUT_FRAMES.
                 # output==input -> last INPUT_FRAMES = pred_chunk (== old replace behavior).
                 current_input = torch.cat([current_input, pred_chunk], dim=1)[:, -INPUT_FRAMES:]
+            torch.cuda.synchronize()
+            gen_times.append(time.perf_counter() - _gen_t0)
 
             first_pred = rollout_chunks[1]
             output = torch.cat(rollout_chunks, dim=1)
@@ -251,9 +273,11 @@ def main(args):
                 # ---- 度量层扩展:全帧 per-frame / FDE / Procrustes 分解 / 固定边弥散度 ----
                 # autocast 关闭:SVD / cdist 需全精度;逐窗口(eval_batch_size 实际=1)。
                 with torch.autocast("cuda", enabled=False):
+                    _pm_win = {}   # 本 batch 逐窗口 metrics,供下方 per-model CSV 长尾列引用
                     for b in range(out_f.shape[0]):
                         pm = per_window_metrics(out_f[b].float(), gt_f[b].float(),
                                                 INPUT_FRAMES, PARADIGM_FRAMES)
+                        _pm_win[b] = pm
                         for af, v in pm['mse_frame'].items():
                             pm_mse_frame_sum[af] = pm_mse_frame_sum.get(af, 0.0) + v
                             pm_mse_frame_cnt[af] = pm_mse_frame_cnt.get(af, 0) + 1
@@ -314,6 +338,11 @@ def main(args):
                             'log10E': float(batch['E'][b].reshape(-1)[0].item()),
                             'nu': float(batch['nu'][b].reshape(-1)[0].item()),
                             'mse_full': float(F.mse_loss(out_f[b], gt_f[b]).item()),
+                            # 长尾定位列(范式对比):fde vs mse_f24 分离"末帧长尾 vs 均方",
+                            # resid_f24 = Procrustes 残余(形状轴)→ 坏窗口是位姿飘还是形状糊
+                            'fde': float(_pm_win[b]['fde']),
+                            'mse_f24': float(_pm_win[b]['mse_frame'].get(24, float('nan'))),
+                            'resid_f24': float(_pm_win[b]['proc'].get(24, (float('nan'),) * 4)[3]),
                             'vol_rel': float(np.mean(vrel)) if vrel else float('nan'),
                             'drift_pred': float(np.mean(dpr)) if dpr else float('nan'),
                             'drift_gt': float(np.mean(dgt)) if dgt else float('nan'),
@@ -370,14 +399,29 @@ def main(args):
     # opt-in:dump 按模型明细 CSV(*.csv 已 gitignore)。默认关 → 现有 eval 零影响。
     if args.get('per_model_csv', None) and per_model_rows:
         import csv
-        csv_path = f'{args.vis_dir}_per_model.csv'
+        # seed=0 保持旧文件名(兼容既有分析脚本);多 seed 评测时各 seed 单独落盘不互相覆盖
+        csv_path = f'{args.vis_dir}_per_model.csv' if args.seed == 0 else f'{args.vis_dir}_per_model_seed{args.seed}.csv'
         with open(csv_path, 'w', newline='', encoding='utf-8') as _f:
             w = csv.DictWriter(_f, fieldnames=list(per_model_rows[0].keys()))
             w.writeheader(); w.writerows(per_model_rows)
         print(f'  [per-model] {len(per_model_rows)} 行 -> {csv_path}')
     per_step = (total_mse_step / nf).tolist()
+    # ---- 指标块整体捕获落盘(_Tee):终端输出照旧,同时写入 results md;现有 print 行零改动 ----
+    _res_buf = io.StringIO()
+    _stdout0 = sys.stdout
+    sys.stdout = _Tee(_stdout0, _res_buf)
     print('===== eval metrics =====')
     print(f'  windows: {n_batches} total, {n_full} full-horizon (rollout 指标分母)')
+    print(f'  seed            : {args.seed}   (扩散采样 generator;确定性臂无影响)')
+    # ---- 推理耗时(仅 rollout 生成段;首窗含 torch.compile warmup,单列剔除)----
+    if gen_times:
+        _ex = gen_times[1:] if len(gen_times) > 1 else gen_times
+        _mean_ex = sum(_ex) / len(_ex)
+        _pf = ROLLOUT_STEPS * OUTPUT_FRAMES   # 每窗生成的预测帧数
+        print(f'  推理耗时(生成段): 总 {sum(gen_times):.1f}s / {len(gen_times)} 窗;'
+              f' 均值 {sum(gen_times) / len(gen_times):.3f}s/窗,'
+              f' 去首窗 {_mean_ex:.3f}s/窗(剔 compile warmup),'
+              f' {_mean_ex / _pf * 1000:.1f}ms/预测帧({_pf} 帧/窗)')
     print(f'  MSE first-chunk : {total_loss_xyz / n:.6e}   (全 {n_batches} 窗口, 逐样本对齐)')
     print(f'  MSE full-rollout: {total_mse_full / nf:.6e}   (仅 {n_full} 全程窗口)')
     print(f'  Chamfer  (mean) : {total_chamfer / nf:.6e}')
@@ -444,12 +488,33 @@ def main(args):
     print(f'  地面穿透率      : {total_floor_rate / n * 100:.3f}%   (预测帧占全部点比例, 全 {n_batches} 窗口)')
     print(f'  地面穿透深度    : {total_floor_depth / n:.6e}   (归一化单位)')
     print(f'  地面穿透率(GT)  : {total_floor_rate_gt / nfg * 100:.3f}%   (参考, 应≈0)')
+    sys.stdout = _stdout0
+    # ---- 结果落盘:eval 指标原样写 markdown(*.md 已 gitignore 不入库;文件名 config/step/seed 可追溯)----
+    _res_dir = args.get('results_dir', 'eval_results')
+    os.makedirs(_res_dir, exist_ok=True)
+    _stem = os.path.splitext(os.path.basename(config_path))[0] if config_path else os.path.basename(str(args.vis_dir))
+    _m = re.search(r'checkpoint-(\d+)', str(args.resume))
+    _step_tag = _m.group(1) if _m else 'na'
+    _res_path = os.path.join(_res_dir, f'{_stem}_step{_step_tag}_seed{args.seed}.md')
+    with open(_res_path, 'w', encoding='utf-8') as _f:
+        _f.write(f'# eval results: {_stem} @checkpoint-{_step_tag} seed={args.seed}\n\n')
+        _f.write(f'- time: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        _f.write(f'- config: {config_path}\n')
+        _f.write(f'- resume: {args.resume}\n')
+        _f.write(f'- use_diffusion: {args.use_diffusion}  num_inference_steps: {args.num_inference_steps}  '
+                 f'input_frames: {INPUT_FRAMES}  output_frames: {OUTPUT_FRAMES}\n\n')
+        _f.write('```\n' + _res_buf.getvalue() + '```\n')
+    print(f'  [results] eval 指标已写入 {_res_path}')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--seed', type=int, default=None,
+                        help='覆盖 config 的 seed(多 seed DDIM 评测用;确定性臂无影响)')
     args = parser.parse_args()
     schema = OmegaConf.structured(TestingConfig)
     cfg = OmegaConf.load(args.config)
     cfg = OmegaConf.merge(schema, cfg)
-    main(cfg)
+    if args.seed is not None:
+        cfg.seed = args.seed
+    main(cfg, config_path=args.config)
