@@ -1,0 +1,107 @@
+# 多材质(mm3 = elastic/plasticine/sand)臂 B:原论文方法(diffusion,DDPM 训练 + DDIM 采样)。
+# 完全复制 config_diffE2048_physctrl_orig.yaml(elastic 扩散臂),改 4 处:
+#   1. output_dir(独立目录)
+#   2. train_dataset.dataset_path → mm3_data/mm3_train(与臂 A 同一批 762 h5)
+#   3. model_config.num_mat: 4 + class_token: true —— 材质类别 token(与臂 A 相同,两臂条件通道一致;
+#      这正是原论文 config_dit_large 的用法)
+#   4. model_config.gravity_emb: true —— 混合重力数据必需(与臂 A 相同)
+#   另:max_train_steps 显式写 90000(elastic 对比时服务器手改过,这里直接入档)。
+# 损失保持原版(vel 1.0 + deform 0.001,is_mpm 门控):不加 geom_elastic_only —— B 忠实复现原论文
+# 对全 MPM 材质施加 deform loss 的做法(config_dit_large 原值),这是「原论文方法」的一部分。
+# 对照臂 = config_mm3_singleframe_geom_deform_d0001.yaml,@checkpoint-90000 对比。
+image_size: 128
+output_dir: ./outputs/mm3_physctrl_orig_8L   # 改 1:独立目录
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 90000        # 与臂 A 同步数(elastic 对比同锚点)
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 19
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 2000
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+
+use_diffusion: true      # ★ 范式开关:原版 DDPM 训练(1000 步 / prediction_type='sample')
+input_frames: 1          # ★ 首帧条件
+output_frames: 24        # ★ 一次生成整段 24 帧
+
+lambda_vel: 1.0          # 原版 loss(上游原值)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 原版 loss:多帧 MPM 残差,全 MPM 材质(原论文做法,不做 elastic gating)
+
+single_frame_deform: false
+
+lambda_laplacian: 0.0    # 本项目新增几何正则全关(原版无)
+lambda_collision: 0.0
+lambda_edge: 0.0
+lambda_floor: 0.0
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 2048
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+rollout_random_window: false   # 全长窗口 max_start=0,每 model 1 窗口(= 原版)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true          # ⚠️ 沿袭 elastic 对比的偏离:与本项目所有臂一致
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True         # ⚠️ 同上
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  gravity_emb: true        # 改 4:混合重力数据必需(与臂 A 相同)
+  coeff_cond: false
+  num_mat: 4               # 改 3:材质类别 token(与臂 A 相同;原论文 config_dit_large 同款)
+  class_token: true        # 改 3
+  transformer_block: SpatialTemporalTransformerBlock   # 原版串行块
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(与臂 A 同一批 762 h5)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

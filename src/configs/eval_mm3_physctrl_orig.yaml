@@ -1,0 +1,59 @@
+# Eval config for 多材质臂 B(mm3,原版 PhysCtrl 扩散范式)。
+# 严格镜像 config_mm3_physctrl_orig.yaml 的 model_config 与 train_dataset,
+# 只差 resume / vis_dir / split(_test 结尾 → 全部 39 h5 = 13 uid × 3 材质)。
+# ★ 本臂例外:use_diffusion=true + num_inference_steps=50(DDIM)——被评测的范式本身。
+# output=24 → 一次采样出整段,窗口 = 1 GT 帧 + 24 预测帧;跨臂比用 per-abs / per-material 分组。
+# 采样随机性由 seed 固定;多 seed 用 CLI:python eval.py --config ... --seed N。
+pc_size: 2048
+eval_batch_size: 1
+dataloader_num_workers: 4
+seed: 0
+pred_offset: true
+model_type: 'dit_st'
+
+use_diffusion: true
+num_inference_steps: 50
+input_frames: 1
+output_frames: 24
+
+resume: 'outputs/mm3_physctrl_orig_8L/checkpoint-90000/model.safetensors'
+vis_dir: 'vis_results_mm3_physctrl_orig'
+per_model_csv: true   # 按模型 CSV(含 mat_type/fde/mse_f24/resid_f24 列)
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  gravity_emb: true        # 镜像训练 config
+  coeff_cond: false
+  num_mat: 4               # 镜像训练 config
+  class_token: true        # 镜像训练 config
+  transformer_block: SpatialTemporalTransformerBlock
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: mm3_data/mm3_test   # 多材质测试集(13 uid × 3 材质 = 39 h5,held-out 物体)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: 1
+  norm_fac: 5
+  stage: deform
+  mode: diff
+  pc_size: 2048
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
+  input_frames: 1
+  output_frames: 24

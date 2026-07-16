@@ -175,6 +175,24 @@ def main(args, config_path=None):
     pm_proc_cnt = {af: 0 for af in PARADIGM_FRAMES}
     pm_edge_sum = {af: [0.0, 0.0] for af in PARADIGM_FRAMES}
     pm_edge_cnt = {af: 0 for af in PARADIGM_FRAMES}
+    # ---- per-material 分桶(多材质数据集;单材质数据只有 1 个桶,打印时跳过)----
+    # 与上面全局累加器并行累加,现有聚合输出不动;仅全程窗口、仅预测帧,口径与全局一致。
+    MAT_NAMES = {0: 'elastic', 1: 'plasticine', 2: 'sand', 3: 'rigid'}
+    mm_buckets = {}
+
+    def _mm_bucket(m):
+        if m not in mm_buckets:
+            mm_buckets[m] = {
+                'mse_frame_sum': {}, 'mse_frame_cnt': {}, 'fde_sum': 0.0, 'fde_cnt': 0,
+                'proc_sum': {af: [0.0] * 4 for af in PARADIGM_FRAMES},
+                'proc_cnt': {af: 0 for af in PARADIGM_FRAMES},
+                'edge_sum': {af: [0.0, 0.0] for af in PARADIGM_FRAMES},
+                'edge_cnt': {af: 0 for af in PARADIGM_FRAMES},
+                'vol_p': torch.zeros(len(VOL_DRIFT_FRAMES)),
+                'vol_g': torch.zeros(len(VOL_DRIFT_FRAMES)),
+                'vol_cnt': torch.zeros(len(VOL_DRIFT_FRAMES)),
+            }
+        return mm_buckets[m]
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             current_input = batch['points_src'].to(device)
@@ -278,19 +296,31 @@ def main(args, config_path=None):
                         pm = per_window_metrics(out_f[b].float(), gt_f[b].float(),
                                                 INPUT_FRAMES, PARADIGM_FRAMES)
                         _pm_win[b] = pm
+                        # 材质桶(数据无 mat_type 时按 elastic=0 兜底,与 traj_dataset 一致)
+                        _mt = int(batch['mat_type'][b].item()) if 'mat_type' in batch else 0
+                        mb = _mm_bucket(_mt)
                         for af, v in pm['mse_frame'].items():
                             pm_mse_frame_sum[af] = pm_mse_frame_sum.get(af, 0.0) + v
                             pm_mse_frame_cnt[af] = pm_mse_frame_cnt.get(af, 0) + 1
+                            mb['mse_frame_sum'][af] = mb['mse_frame_sum'].get(af, 0.0) + v
+                            mb['mse_frame_cnt'][af] = mb['mse_frame_cnt'].get(af, 0) + 1
                         pm_fde_sum += pm['fde']
                         pm_fde_cnt += 1
+                        mb['fde_sum'] += pm['fde']
+                        mb['fde_cnt'] += 1
                         for af, tup in pm['proc'].items():
                             for j in range(4):
                                 pm_proc_sum[af][j] += tup[j]
+                                mb['proc_sum'][af][j] += tup[j]
                             pm_proc_cnt[af] += 1
+                            mb['proc_cnt'][af] += 1
                         for af, (rp, rg) in pm['edge'].items():
                             pm_edge_sum[af][0] += rp
                             pm_edge_sum[af][1] += rg
                             pm_edge_cnt[af] += 1
+                            mb['edge_sum'][af][0] += rp
+                            mb['edge_sum'][af][1] += rg
+                            mb['edge_cnt'][af] += 1
 
                 # ---- 速度 / 加速度误差(归一化空间, vs GT) ----
                 v_pred = out_f[:, 1:] - out_f[:, :-1]
@@ -323,11 +353,16 @@ def main(args, config_path=None):
                                 n_vol_drift_gt += 1
                     # 逐帧体积自漂移(不平均,核心新指标):VOL_DRIFT_FRAMES 各绝对帧单独累计 pred/GT 自漂移
                     if vp[0] is not None and vp[0] > 1e-9 and vg[0] is not None and vg[0] > 1e-9:
+                        _mt_v = int(batch['mat_type'][b].item()) if 'mat_type' in batch else 0
+                        mb_v = _mm_bucket(_mt_v)
                         for fi, af in enumerate(VOL_DRIFT_FRAMES):
                             if af < len(vp) and vp[af] is not None and vg[af] is not None:
                                 vol_drift_abs_p[fi] += abs(vp[af] - vp[0]) / vp[0]
                                 vol_drift_abs_g[fi] += abs(vg[af] - vg[0]) / vg[0]
                                 cnt_vol_drift_abs[fi] += 1
+                                mb_v['vol_p'][fi] += abs(vp[af] - vp[0]) / vp[0]
+                                mb_v['vol_g'][fi] += abs(vg[af] - vg[0]) / vg[0]
+                                mb_v['vol_cnt'][fi] += 1
                     # opt-in 按模型日志(B=1 → 一窗一模型):供 E 分档拆解。additive,不改任何聚合指标。
                     if args.get('per_model_csv', None):
                         vrel = [abs(vp[t]-vg[t])/vg[t] for t in range(len(vp)) if vp[t] and vg[t] and vg[t] > 1e-9]
@@ -335,6 +370,7 @@ def main(args, config_path=None):
                         dgt  = [abs(vg[t]-vg[0])/vg[0] for t in range(1, len(vg)) if vg[0] and vg[t] and vg[0] > 1e-9]
                         row = {
                             'model': str(batch['model'][b]),
+                            'mat_type': int(batch['mat_type'][b].item()) if 'mat_type' in batch else 0,
                             'log10E': float(batch['E'][b].reshape(-1)[0].item()),
                             'nu': float(batch['nu'][b].reshape(-1)[0].item()),
                             'mse_full': float(F.mse_loss(out_f[b], gt_f[b]).item()),
@@ -459,6 +495,44 @@ def main(args, config_path=None):
                 _rp, _rg = pm_edge_sum[af][0] / _c, pm_edge_sum[af][1] / _c
                 print(f'    f{af:<3}: pred={(_rp - 1) * 100:+6.2f}%  gt={(_rg - 1) * 100:+6.2f}%  '
                       f'超额={(_rp - _rg) * 100:+6.2f}%   (n={_c})')
+        # ---- per-material 分组(仅多材质数据集打印;口径与上方全局块逐项一致,仅全程窗口)----
+        if len(mm_buckets) > 1:
+            print('  --- per-material 分组(多材质;段间勿再平均,跨材质单标量禁止) ---')
+            for _mt in sorted(mm_buckets):
+                mb = mm_buckets[_mt]
+                _mfs = sorted(mb['mse_frame_cnt'].keys())
+                if not _mfs:
+                    continue
+                _mpf = {af: mb['mse_frame_sum'][af] / mb['mse_frame_cnt'][af] for af in _mfs}
+                _mseg = lambda lo, hi: (lambda xs: sum(xs) / len(xs) if xs else float('nan'))(
+                    [_mpf[af] for af in _mfs if lo <= af <= hi])
+                _mgm_vals = [_mpf[af] for af in _mfs if 5 <= af <= 24 and _mpf[af] > 0]
+                _mgm = 10 ** (sum(math.log10(v) for v in _mgm_vals) / len(_mgm_vals)) if _mgm_vals else float('nan')
+                _name = MAT_NAMES.get(_mt, f'mat{_mt}')
+                print(f'  === {_name}(mat_type={_mt}, n={mb["fde_cnt"]} 全程窗口)===')
+                print('    MSE per-frame: ' + ', '.join(f'f{af}={_mpf[af]:.6e}' for af in _mfs))
+                print(f'    seg-MSE: short(f5-10)={_mseg(5, 10):.6e}  mid(f11-17)={_mseg(11, 17):.6e}  '
+                      f'long(f18-24)={_mseg(18, 24):.6e}')
+                print(f'    GM-MSE(f5-24)={_mgm:.6e}   FDE={mb["fde_sum"] / max(mb["fde_cnt"], 1):.6e}   '
+                      f'MSE@f24={_mpf.get(24, float("nan")):.6e}')
+                for af in PARADIGM_FRAMES:
+                    if mb['proc_cnt'][af]:
+                        _c = mb['proc_cnt'][af]
+                        _t2, _r2, _s2, _res2 = (x / _c for x in mb['proc_sum'][af])
+                        print(f'    Procrustes f{af:<3}: 质心偏移={_t2:.4e}  旋转={_r2:6.2f}°  '
+                              f'尺度s={_s2:.4f}  残余形状MSE={_res2:.6e}')
+                for af in PARADIGM_FRAMES:
+                    if mb['edge_cnt'][af]:
+                        _c = mb['edge_cnt'][af]
+                        _rp2, _rg2 = mb['edge_sum'][af][0] / _c, mb['edge_sum'][af][1] / _c
+                        print(f'    固定边   f{af:<3}: pred={(_rp2 - 1) * 100:+6.2f}%  gt={(_rg2 - 1) * 100:+6.2f}%  '
+                              f'超额={(_rp2 - _rg2) * 100:+6.2f}%')
+                _mvc = mb['vol_cnt'].clamp(min=1)
+                _mvp, _mvg = mb['vol_p'] / _mvc, mb['vol_g'] / _mvc
+                for fi, af in enumerate(VOL_DRIFT_FRAMES):
+                    if mb['vol_cnt'][fi] > 0:
+                        print(f'    体积自漂移 f{af:<3}: pred={_mvp[fi] * 100:6.2f}%  gt={_mvg[fi] * 100:6.2f}%  '
+                              f'超额={(_mvp[fi] - _mvg[fi]) * 100:+6.2f}%')
     # ---- 非0起点 partial-rollout(评测对齐 artifact 判据)----
     safe_step = lambda tot, cnt: (tot / torch.clamp(cnt, min=1)).tolist()
     per_step_all = safe_step(total_mse_step_all, cnt_step_all)

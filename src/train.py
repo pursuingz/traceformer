@@ -591,6 +591,13 @@ def main(args):
                     losses['loss_p'] = loss_p.detach().item()
                     loss = loss + args.lambda_momentum * loss_p
                 
+                # geom_elastic_only(多材质数据):弹性先验损失(deform/laplacian/edge)只作用
+                # elastic(mat_type==0)样本——edge/laplacian 假设邻边保持(sand 颗粒流动、塑性屈服
+                # 均破坏该假设),DeformLoss 按弹性本构写。默认 False → 现有单材质臂逐字节不变。
+                geom_mask = None
+                if args.get('geom_elastic_only', False) and 'mat_type' in batch:
+                    geom_mask = batch['mat_type'].reshape(-1) == 0   # (B,) bool
+
                 # Deform loss is an MPM time-stepping residual: needs >=3 output frames
                 # (frame_interval=2 -> end_t = frames-2 must be >=1). With output_frames=1 it would
                 # build a tensor with negative dim and crash -> skip (structurally undefined here).
@@ -605,6 +612,13 @@ def main(args):
                         vol_data = vol_data[is_mpm_mask]
                         F_data = F_data[is_mpm_mask]
                         C_data = C_data[is_mpm_mask]
+                    if geom_mask is not None:
+                        # 与 is_mpm 子集对齐后再按 elastic 过滤(空子集由下方 shape[0]>0 防护兜住)
+                        gm = geom_mask[batch['is_mpm'].reshape(-1)] if 'is_mpm' in batch else geom_mask
+                        pred_sample_mpm = pred_sample_mpm[gm]
+                        vol_data = vol_data[gm]
+                        F_data = F_data[gm]
+                        C_data = C_data[gm]
                     loss_F = loss_deform(x=pred_sample_mpm.clamp(min=-2.2, max=2.2), vol=vol_data, F=F_data,
                         C=C_data, frame_interval=2, norm_fac=args.train_dataset.norm_fac) if vol_data.shape[0] > 0 else torch.tensor(0.0, device=pred_sample.device)
                     losses['loss_deform'] = loss_F.detach().item()
@@ -615,11 +629,19 @@ def main(args):
                 # 不偷改 lambda_deform 在 output=1 的语义)。x_t=input 末帧(常数锚), 梯度只经 x_next=pred。
                 elif args.get('single_frame_deform', False) and 'vol' in batch and args.lambda_deform > 0. \
                         and pred_sample.shape[1] == 1 and 'F_src_last' in batch:
+                    _sfd_xt, _sfd_xn = cond_points_src[:, -1], pred_sample[:, 0]
+                    _sfd_vol, _sfd_Ft = batch['vol'], batch['F_src_last']
+                    _sfd_Fn, _sfd_Ct = batch['F'][:, 0], batch['C_src_last']
+                    if geom_mask is not None:   # elastic-only 子集(多材质 gating)
+                        _sfd_xt, _sfd_xn = _sfd_xt[geom_mask], _sfd_xn[geom_mask]
+                        _sfd_vol, _sfd_Ft = _sfd_vol[geom_mask], _sfd_Ft[geom_mask]
+                        _sfd_Fn, _sfd_Ct = _sfd_Fn[geom_mask], _sfd_Ct[geom_mask]
                     loss_F = loss_deform.forward_single_step(
-                        x_t=cond_points_src[:, -1].clamp(min=-2.2, max=2.2),
-                        x_next=pred_sample[:, 0].clamp(min=-2.2, max=2.2),
-                        vol=batch['vol'], F_t=batch['F_src_last'], F_next=batch['F'][:, 0],
-                        C_t=batch['C_src_last'], frame_interval=2, norm_fac=args.train_dataset.norm_fac)
+                        x_t=_sfd_xt.clamp(min=-2.2, max=2.2),
+                        x_next=_sfd_xn.clamp(min=-2.2, max=2.2),
+                        vol=_sfd_vol, F_t=_sfd_Ft, F_next=_sfd_Fn,
+                        C_t=_sfd_Ct, frame_interval=2, norm_fac=args.train_dataset.norm_fac) \
+                        if _sfd_vol.shape[0] > 0 else torch.tensor(0.0, device=pred_sample.device)
                     losses['loss_deform'] = loss_F.detach().item()
                     loss = loss + args.lambda_deform * loss_F
 
@@ -636,7 +658,13 @@ def main(args):
                     knn_idx = build_knn_indices(batch['points_src'], args.laplacian_k)
 
                 if args.lambda_laplacian > 0.0:
-                    loss_laplacian = laplacian_deformation_loss(pred_sample, batch['points_tgt'], knn_idx)
+                    if geom_mask is None:
+                        loss_laplacian = laplacian_deformation_loss(pred_sample, batch['points_tgt'], knn_idx)
+                    elif geom_mask.any() and knn_idx is not None:   # elastic-only 子集(多材质 gating)
+                        loss_laplacian = laplacian_deformation_loss(
+                            pred_sample[geom_mask], batch['points_tgt'][geom_mask], knn_idx[geom_mask])
+                    else:
+                        loss_laplacian = pred_sample.new_tensor(0.0)
                     losses['loss_laplacian'] = loss_laplacian.detach().item()
                     loss = loss + args.lambda_laplacian * loss_laplacian
 
@@ -647,7 +675,13 @@ def main(args):
                     loss = loss + args.lambda_collision * loss_collision
 
                 if args.lambda_edge > 0.0:
-                    loss_edge = edge_length_regularization(pred_sample, batch['points_tgt'], knn_idx)
+                    if geom_mask is None:
+                        loss_edge = edge_length_regularization(pred_sample, batch['points_tgt'], knn_idx)
+                    elif geom_mask.any() and knn_idx is not None:   # elastic-only 子集(多材质 gating)
+                        loss_edge = edge_length_regularization(
+                            pred_sample[geom_mask], batch['points_tgt'][geom_mask], knn_idx[geom_mask])
+                    else:
+                        loss_edge = pred_sample.new_tensor(0.0)
                     losses['loss_edge'] = loss_edge.detach().item()
                     loss = loss + args.lambda_edge * loss_edge
 
