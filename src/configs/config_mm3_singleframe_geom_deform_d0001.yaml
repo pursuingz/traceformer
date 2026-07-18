@@ -1,8 +1,9 @@
 # 多材质(mm3 = elastic/plasticine/sand)臂 A:我们的方法(sfG + boundary loss_F,单帧 AR)。
 # 完全复制 config_diffE2048_singleframe_geom_deform_d0001.yaml(elastic 单材质 SOTA 臂),改 5 处:
 #   1. output_dir(独立目录,防 resume 污染)
-#   2. train_dataset.dataset_path: 2048_train → mm3_data/mm3_train(762 h5 = 254 uid × 3 材质;
-#      elastic 子集 = 原 2048_train 同一批文件 → elastic 分档可与旧臂直接比 = 泛化税测量)
+#   2. train_dataset.dataset_path: 2048_train → mm3_data/mm3_train(782 h5 = elastic 254(30xxx 段)
+#      + plasticine 263(40xxx 段)+ sand 265(45xxx-49xxx 段);三材质 uid 段不同,split 见
+#      configs/mm3_test_split.json;elastic 子集 = 原 2048_train 同一批文件 → 泛化税测量)
 #   3. geom_elastic_only: true —— 弹性先验损失(laplacian/edge/deform)只作用 mat_type==0 样本:
 #      edge/laplacian 假设邻边保持(sand 颗粒流动、塑性屈服破坏之),DeformLoss 按弹性本构写
 #   4. model_config.num_mat: 4 + class_token: true —— 材质类别 token(原论文槽位,index 3=rigid 空置)
@@ -91,7 +92,7 @@ model_config:
   transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(762 h5;elastic 子集 = 原 2048_train)
+  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(782 h5;elastic 子集 = 原 2048_train)
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: ${model_config.max_num_forces}

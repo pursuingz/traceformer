@@ -1,7 +1,7 @@
 # 多材质(mm3 = elastic/plasticine/sand)臂 B:原论文方法(diffusion,DDPM 训练 + DDIM 采样)。
 # 完全复制 config_diffE2048_physctrl_orig.yaml(elastic 扩散臂),改 4 处:
 #   1. output_dir(独立目录)
-#   2. train_dataset.dataset_path → mm3_data/mm3_train(与臂 A 同一批 762 h5)
+#   2. train_dataset.dataset_path → mm3_data/mm3_train(与臂 A 同一批 782 h5,构成见臂 A config 注释)
 #   3. model_config.num_mat: 4 + class_token: true —— 材质类别 token(与臂 A 相同,两臂条件通道一致;
 #      这正是原论文 config_dit_large 的用法)
 #   4. model_config.gravity_emb: true —— 混合重力数据必需(与臂 A 相同)
@@ -90,7 +90,7 @@ model_config:
   transformer_block: SpatialTemporalTransformerBlock   # 原版串行块
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(与臂 A 同一批 762 h5)
+  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(与臂 A 同一批 782 h5)
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: ${model_config.max_num_forces}

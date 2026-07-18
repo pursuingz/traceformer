@@ -1,6 +1,6 @@
 # Eval config for 多材质臂 A(mm3,sfG + loss_F 单帧 AR)。
 # 严格镜像 config_mm3_singleframe_geom_deform_d0001.yaml 的 model_config 与 train_dataset,
-# 只差 resume / vis_dir / split(_test 结尾 → traj_dataset 取全部当 test split,39 h5 = 13 uid × 3 材质)。
+# 只差 resume / vis_dir / split(_test 结尾 → traj_dataset 取全部当 test split,41 h5 = elastic 13 + plasticine 14 + sand 14,split 见 configs/mm3_test_split.json)。
 # eval.py 自动输出 per-material 分组(elastic/plasticine/sand 各一段;跨材质单标量禁止)。
 # 对照臂 = eval_mm3_physctrl_orig.yaml(同 checkpoint-90000)。
 pc_size: 2048
@@ -38,7 +38,7 @@ model_config:
 
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: mm3_data/mm3_test   # 多材质测试集(13 uid × 3 材质 = 39 h5,held-out 物体)
+  dataset_path: mm3_data/mm3_test   # 多材质测试集(41 h5 = 13+14+14,held-out 物体,各材质 uid 不同段)
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: 1
