@@ -136,6 +136,10 @@ class TrainingConfig:
     # using the input_last->pred forward-difference velocity to advance GT F one MPM step vs GT F_next.
     # Default False -> all existing configs unchanged (does NOT alter lambda_deform's output=1 semantics).
     single_frame_deform: bool = False
+    # mm3 多材质:弹性先验损失(laplacian/edge/deform)仅作用 mat_type==0(elastic)样本。
+    # sand 颗粒流动/塑性屈服破坏邻边保持假设,DeformLoss 按弹性本构写,对非弹性样本强加=错误先验。
+    # Default False -> 单材质臂字节不变(train.py 按 args.get 读取)。
+    geom_elastic_only: bool = False
 
 @dataclass
 class TestingConfig:
