@@ -15,8 +15,13 @@ import torch.nn as nn
 def count(m):
     return sum(p.numel() for p in m.parameters())
 
-def build(block, n_layers):
-    mc = OmegaConf.create(dict(base_mc, transformer_block=block, n_layers=n_layers))
+def build(block, n_layers, **overrides):
+    mc = OmegaConf.create(dict(
+        base_mc,
+        transformer_block=block,
+        n_layers=n_layers,
+        **overrides,
+    ))
     return MDM_ST(512, 5, n_feats=3, model_config=mc)
 
 def find_blocks(m):
@@ -43,6 +48,19 @@ for name, block, L in [
     blocks = find_blocks(m)
     blk = count(blocks)
     print(f'{name}: total={tot/1e6:.3f}M  blocks={blk/1e6:.3f}M  per-block={blk/L/1e6:.4f}M')
+
+baseline_contact_ref = build('SpatialTemporalTransformerBlock', 8)
+contact_model = build(
+    'SpatialTemporalTransformerBlock',
+    8,
+    contact_particle_cond=True,
+    contact_feature_sigma=0.04,
+)
+contact_delta = count(contact_model) - count(baseline_contact_ref)
+print(
+    'v1 serial + contact cond 8L: '
+    f'total={count(contact_model)/1e6:.3f}M  delta={contact_delta} params'
+)
 
 # per-submodule breakdown of one v3 block
 m3 = build('SpatialTemporalTransformerBlockv3', 8)

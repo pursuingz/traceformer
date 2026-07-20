@@ -7,6 +7,8 @@ from torch_cluster import fps
 import json
 import random
 
+from utils.contact import find_contact_window_starts
+
 class TrajDataset(Dataset):
     def __init__(self, split, cfg):
         
@@ -34,6 +36,17 @@ class TrajDataset(Dataset):
         self.windows_per_model = cfg.get('windows_per_model', None)
         # single-step aug: extra random-start windows appended on top of the fixed stride-5 grid.
         self.train_extra_random_windows = cfg.get('train_extra_random_windows', 0)
+        self.contact_window_ratio = float(cfg.get('contact_window_ratio', 0.0))
+        self.contact_margin = float(cfg.get('contact_margin', 0.04))
+        self.contact_frame_radius = int(cfg.get('contact_frame_radius', 2))
+        if not 0.0 <= self.contact_window_ratio <= 1.0:
+            raise ValueError(
+                f"contact_window_ratio must be in [0, 1]; got {self.contact_window_ratio}"
+            )
+        if self.contact_frame_radius < 0:
+            raise ValueError(
+                f"contact_frame_radius must be non-negative; got {self.contact_frame_radius}"
+            )
         self.batch_size = cfg.batch_size
         self.has_gravity = cfg.get('has_gravity', False)
         self.max_num_forces = cfg.get('max_num_forces', 1)
@@ -129,8 +142,33 @@ class TrajDataset(Dataset):
                             # one fixed start=0 window per model per epoch; rest stay random.
                             self.models.append({"model": model_name, "start_idx": 0})
                             n_win -= 1
-                        for _ in range(n_win):
+                        contact_starts = []
+                        if self.split == 'train' and self.contact_window_ratio > 0 and n_win > 0:
+                            with h5py.File(os.path.join(self.dataset_path, model_name), 'r') as model_metas:
+                                if 'floor_height' in model_metas:
+                                    min_y = np.asarray(model_metas['x'][:, :, 1]).min(axis=1)
+                                    floor_height = float(
+                                        np.asarray(model_metas['floor_height']).reshape(-1)[0]
+                                    )
+                                    contact_starts = find_contact_window_starts(
+                                        min_y,
+                                        floor_height=floor_height,
+                                        max_start=max_start,
+                                        input_frames=self.input_frames,
+                                        output_frames=self.output_frames * self.rollout_unroll_steps,
+                                        frame_interval=self.n_frames_interval,
+                                        margin=self.contact_margin,
+                                        frame_radius=self.contact_frame_radius,
+                                    )
+                        n_contact = round(n_win * self.contact_window_ratio) if contact_starts else 0
+                        for _ in range(n_win - n_contact):
                             self.models.append({"model": model_name, "start_idx": -1, "max_start": max_start})
+                        for _ in range(n_contact):
+                            self.models.append({
+                                "model": model_name,
+                                "start_idx": -2,
+                                "contact_starts": contact_starts,
+                            })
                     else:
                         for start_idx in range(0, max_start + 1, 5):
                             self.models.append({"model": model_name, "start_idx": start_idx})
@@ -220,7 +258,10 @@ class TrajDataset(Dataset):
         model = self.models[index]
         model_name = model["model"]
         start_idx = model["start_idx"]
-        if start_idx < 0:   # random-window mode: draw a start over [0, max_start]
+        if start_idx == -2:  # contact-aware random window
+            candidates = model["contact_starts"]
+            start_idx = int(candidates[np.random.randint(0, len(candidates))])
+        elif start_idx < 0:   # random-window mode: draw a start over [0, max_start]
             start_idx = int(np.random.randint(0, model["max_start"] + 1))
 
         input_indices = np.arange(start_idx, start_idx + self.input_frames * self.n_frames_interval, self.n_frames_interval)

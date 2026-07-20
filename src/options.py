@@ -140,6 +140,17 @@ class TrainingConfig:
     # sand 颗粒流动/塑性屈服破坏邻边保持假设,DeformLoss 按弹性本构写,对非弹性样本强加=错误先验。
     # Default False -> 单材质臂字节不变(train.py 按 args.get 读取)。
     geom_elastic_only: bool = False
+    # Contact-aware supervision. All distances are in normalized model coordinates.
+    # Zero weights preserve every existing training arm exactly.
+    lambda_contact_pos: float = 0.0
+    lambda_contact_vel: float = 0.0
+    contact_margin: float = 0.04
+    contact_temperature: float = 0.01
+    # Fraction of random training windows reserved around the first floor-contact
+    # transition. 0.0 keeps the existing uniform random-window distribution.
+    contact_window_ratio: float = 0.0
+    # Contact-window target band around the first contact frame, in simulator frames.
+    contact_frame_radius: int = 2
 
 @dataclass
 class TestingConfig:

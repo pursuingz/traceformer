@@ -53,6 +53,7 @@ from dataset.traj_dataset import TrajDataset
 from utils.visualization import save_pointcloud_video, save_pointcloud_json, save_threejs_html
 from utils.physics import loss_momentum
 from utils.physics import DeformLoss
+from utils.contact import contact_weighted_losses
 
 logger = get_logger(__name__)
 
@@ -305,6 +306,9 @@ def main(args):
     args.train_dataset.rollout_random_window = args.get('rollout_random_window', False)
     args.train_dataset.rollout_force_start0 = args.get('rollout_force_start0', False)
     args.train_dataset.train_extra_random_windows = args.get('train_extra_random_windows', 0)
+    args.train_dataset.contact_window_ratio = args.get('contact_window_ratio', 0.0)
+    args.train_dataset.contact_margin = args.get('contact_margin', 0.04)
+    args.train_dataset.contact_frame_radius = args.get('contact_frame_radius', 2)
     if curriculum:
         K0, nw0 = current_stage(0, curriculum, args.rollout_unroll_steps)
         args.train_dataset.rollout_unroll_steps = K0
@@ -584,6 +588,23 @@ def main(args):
                     loss_vel = F.mse_loss(target_vel.float(), pred_vel.float())
                     losses['loss_vel'] = loss_vel.detach().item()
                     loss = loss + args.lambda_vel * loss_vel
+
+                if args.lambda_contact_pos > 0. or args.lambda_contact_vel > 0.:
+                    loss_contact_pos, loss_contact_vel, contact_fraction = contact_weighted_losses(
+                        pred_sample.float(),
+                        latents.float(),
+                        cond_points_src.float(),
+                        batch['floor_height'].float(),
+                        margin=args.contact_margin,
+                        temperature=args.contact_temperature,
+                    )
+                    losses['contact_fraction'] = contact_fraction.detach().item()
+                    if args.lambda_contact_pos > 0.:
+                        losses['loss_contact_pos'] = loss_contact_pos.detach().item()
+                        loss = loss + args.lambda_contact_pos * loss_contact_pos
+                    if args.lambda_contact_vel > 0.:
+                        losses['loss_contact_vel'] = loss_contact_vel.detach().item()
+                        loss = loss + args.lambda_contact_vel * loss_contact_vel
 
                 if 'vol' in batch and args.lambda_momentum > 0.:
                     loss_p = loss_momentum(x=pred_sample, vol=batch['vol'], force=batch['weighted_force'],

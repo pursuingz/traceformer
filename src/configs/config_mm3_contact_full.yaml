@@ -1,0 +1,118 @@
+# 多材质(mm3 = elastic/plasticine/sand)臂 A:我们的方法(sfG + boundary loss_F,单帧 AR)。
+# 完全复制 config_diffE2048_singleframe_geom_deform_d0001.yaml(elastic 单材质 SOTA 臂),改 5 处:
+#   1. output_dir(独立目录,防 resume 污染)
+#   2. train_dataset.dataset_path: 2048_train → mm3_data/mm3_train(782 h5 = elastic 254(30xxx 段)
+#      + plasticine 263(40xxx 段)+ sand 265(45xxx-49xxx 段);三材质 uid 段不同,split 见
+#      configs/mm3_test_split.json;elastic 子集 = 原 2048_train 同一批文件 → 泛化税测量)
+#   3. geom_elastic_only: true —— 弹性先验损失(laplacian/edge/deform)只作用 mat_type==0 样本:
+#      edge/laplacian 假设邻边保持(sand 颗粒流动、塑性屈服破坏之),DeformLoss 按弹性本构写
+#   4. model_config.num_mat: 4 + class_token: true —— 材质类别 token(原论文槽位,index 3=rigid 空置)
+#   5. model_config.gravity_emb: true —— 必须:plasticine/sand 带重力、elastic 不带,混合数据里
+#      模型必须看到 gravity 标志(spacetime.py 仅 gravity_emb=true 时注入)
+# 其余(损失权重/步数/lr/batch/架构/split)全部冻结 = diffE2048 elastic 臂。
+# 对照臂 = config_mm3_physctrl_orig.yaml(同数据同架构同 90000 步,@checkpoint-90000 对比)。
+# ⚠️ step-2000 检查 loss_deform/xyz 比值仍落 0.1~0.5×(gating 后 loss_F 只作用 ~1/3 样本);漂出即重校 λ。
+# C3: C1 contact supervision/sampling + C2 particle-level contact conditioning.
+image_size: 128
+output_dir: ./outputs/mm3_contact_full_8L
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 90000        # 冻结 = elastic 对比锚点(数据 ×3 而步数不变 → 每物体见次 1/3,两臂同等,内部公平)
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 19
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 2000
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0          # output=1 下自动失效(train.py 守卫 pred.shape[1]>=2)
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001     # 冻结 = SOTA:λ=0.001;经 geom_elastic_only 只作用 elastic 样本
+
+single_frame_deform: true   # 冻结 = SOTA:单帧 boundary loss_F
+
+geom_elastic_only: true  # 改 3:多材质 gating —— laplacian/edge/deform 仅 elastic(mat_type==0)样本
+
+lambda_laplacian: 0.5    # 冻结 = sfG(经 gating 仅 elastic)
+lambda_collision: 0.1
+lambda_edge: 1.0         # 冻结 = sfG(经 gating 仅 elastic)
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 2048
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+
+output_frames: 1                # 冻结:单帧输出(input 仍 5)= sfG
+rollout_random_window: true     # 冻结:随机窗口起点
+windows_per_model: 20           # 冻结:每 model 20 个随机窗口/epoch
+lambda_contact_pos: 1.0
+lambda_contact_vel: 1.0
+contact_margin: 0.04
+contact_temperature: 0.01
+contact_window_ratio: 0.25
+contact_frame_radius: 2
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: True
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  gravity_emb: true        # 改 5:混合重力数据必需(elastic 无重力 / plasticine·sand 有重力)
+  coeff_cond: false
+  num_mat: 4               # 改 4:材质类别 token(elastic=0/plasticine=1/sand=2;3=rigid 空置)
+  class_token: true        # 改 4
+  transformer_block: SpatialTemporalTransformerBlock   # 冻结:与 run23 同架构(串行)
+  contact_particle_cond: true
+  contact_feature_sigma: 0.04
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(782 h5;elastic 子集 = 原 2048_train)
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false

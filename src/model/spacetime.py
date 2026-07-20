@@ -9,6 +9,7 @@ sys.path.append('./')
 from einops import rearrange, repeat
 from model.dit import *
 from diffusers.models.embeddings import LabelEmbedding 
+from utils.contact import build_contact_features
 
 class PointEmbed(nn.Module):
     def __init__(self, hidden_dim=96, dim=512):
@@ -2502,6 +2503,12 @@ class MDM_ST(nn.Module):
 
         self.class_dropout_prob = model_config.get('class_dropout_prob', 0.0)
         self.start_vel_encoder = nn.Linear(3, self.latent_dim)
+        self.contact_particle_cond = model_config.get('contact_particle_cond', False)
+        self.contact_feature_sigma = model_config.get('contact_feature_sigma', 0.04)
+        if self.contact_particle_cond:
+            self.contact_encoder = nn.Linear(3, self.latent_dim)
+            nn.init.zeros_(self.contact_encoder.weight)
+            nn.init.zeros_(self.contact_encoder.bias)
         if model_config.transformer_block == "SpatialTemporalTransformerNoDiffusion":
             self.dit = SpatialTemporalTransformerNoDiffusion(
                 sample_points=n_points,
@@ -2652,6 +2659,21 @@ class MDM_ST(nn.Module):
             n_feats = x.shape[-1]
         hidden_states = self.input_encoder(x.reshape(-1, n_points,
             n_feats)).reshape(bs, -1, n_points, self.latent_dim)
+        if self.contact_particle_cond:
+            if floor_height is None:
+                raise ValueError("contact_particle_cond requires floor_height")
+            contact_features = build_contact_features(
+                init_pc_cond,
+                floor_height,
+                start_velocity=start_vel,
+                sigma=self.contact_feature_sigma,
+            ).to(dtype=self.contact_encoder.weight.dtype)
+            contact_hidden = self.contact_encoder(contact_features).to(hidden_states.dtype)
+            n_contact_frames = contact_hidden.shape[1]
+            hidden_states = torch.cat([
+                hidden_states[:, :n_contact_frames] + contact_hidden,
+                hidden_states[:, n_contact_frames:],
+            ], dim=1)
         if start_vel is not None:
             start_vel = start_vel[:, 0] if start_vel.ndim == 4 else start_vel
             start_vel = start_vel.to(dtype=hidden_states.dtype)
