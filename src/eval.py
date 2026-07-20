@@ -198,6 +198,8 @@ def main(args, config_path=None):
             current_input = batch['points_src'].to(device)
             rollout_chunks = [current_input]
             prev_chunk = current_input
+            # (B,1,1) 归一化空间地板高度,轨迹内不随时间变,rollout 每步复用同一个值
+            floor_h_step = batch['floor_height'].to(device).view(-1, 1, 1)
             torch.cuda.synchronize()
             _gen_t0 = time.perf_counter()
             for step_idx in range(ROLLOUT_STEPS):
@@ -238,6 +240,11 @@ def main(args, config_path=None):
                     n_frames=OUTPUT_FRAMES,
                     num_inference_steps=args.num_inference_steps,
                 )
+                if args.get('floor_projection', False):
+                    # 推理时硬约束:预测里穿地板的点直接夹回地板高度,不接触训练/loss,只在
+                    # rollout 反馈路径生效。诊断/缓解 sf 族地板穿透痼疾(见实验记录.md)。
+                    pred_chunk = pred_chunk.clone()
+                    pred_chunk[..., 1] = torch.maximum(pred_chunk[..., 1], floor_h_step)
                 rollout_chunks.append(pred_chunk)
                 prev_chunk = current_input
                 # slide input window: drop oldest, append prediction, keep last INPUT_FRAMES.

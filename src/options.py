@@ -162,3 +162,8 @@ class TestingConfig:
     input_frames: int = 5
     # opt-in:dump 每模型明细 CSV(log10E/full-rollout/体积),供 E 分档。默认 False=不写、现有 eval 零影响。
     per_model_csv: bool = False
+    # 推理时地板投影(诊断/缓解穿透用):rollout 每步预测出来后,把 y < floor_height 的点直接
+    # 夹到 floor_height(不改训练、不改 loss,只在 eval 的 rollout 反馈路径生效)。用于验证/缓解
+    # sf/sfG 单帧自回归的地板穿透痼疾(见 实验记录.md / physctrl2-mm3-experiment memory)。
+    # 默认 False -> 现有所有 eval 结果零影响。
+    floor_projection: bool = False
