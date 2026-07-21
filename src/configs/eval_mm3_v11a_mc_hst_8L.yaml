@@ -4,7 +4,7 @@
 # resume / vis_dir 指向对应 v11a checkpoint 与可视化目录;mm3_test split 保持 baseline 不变
 # (41 h5 = elastic 13 + plasticine 14 + sand 14,见 configs/mm3_test_split.json)。
 # eval.py 自动输出 per-material 分组(elastic/plasticine/sand 各一段;跨材质单标量禁止)。
-# 对照臂 = eval_mm3_physctrl_orig.yaml(同 checkpoint-90000)。
+# 对照组 = eval_mm3_singleframe_geom_deform_d0001.yaml(checkpoint-90000)。
 pc_size: 2048
 eval_batch_size: 1
 dataloader_num_workers: 4

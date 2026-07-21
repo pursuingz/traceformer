@@ -4,6 +4,7 @@
 # n_layers=8 保持 8 个原串行 block 不变;v11a 另加每 2 层交互一次的共享 hybrid-state exchange,
 # 因此不是 run23 的同一架构。数据、采样、损失权重、步数、batch、lr、seed 与 split 均冻结。
 # 对照 checkpoint 固定为双方 checkpoint-90000。
+# 若服务器显存不足,不得仅为 v11a 启用 gradient checkpointing;须同时重训 baseline 形成新配对实验。
 # ⚠️ step-2000 检查 loss_deform/xyz 比值仍落 0.1~0.5×(gating 后 loss_F 只作用 ~1/3 样本);漂出即重校 λ。
 image_size: 128
 output_dir: ./outputs/mm3_v11a_mc_hst_8L   # 改 1:独立目录(多材质臂)
@@ -13,7 +14,7 @@ eval_batch_size: 1
 num_train_epochs: 50
 max_train_steps: 90000        # 冻结 = elastic 对比锚点(数据 ×3 而步数不变 → 每物体见次 1/3,两臂同等,内部公平)
 gradient_accumulation_steps: 8
-gradient_checkpointing: true
+gradient_checkpointing: true  # 冻结/继承 mm3 baseline;train.py enable 调用已注释,双方实际均走 non-checkpoint 路径
 learning_rate: 1e-4
 scale_lr: false
 lr_scheduler: "costant_with_warmup"
