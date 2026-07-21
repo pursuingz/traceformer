@@ -1,12 +1,16 @@
+import sys
 import unittest
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from options import TestingConfig, TrainingConfig
 
 
-SRC_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = SRC_DIR / "configs"
 TRAIN_BASELINE = CONFIG_DIR / "config_mm3_singleframe_geom_deform_d0001.yaml"
 TRAIN_CANDIDATE = CONFIG_DIR / "config_mm3_v11a_mc_hst_8L.yaml"
