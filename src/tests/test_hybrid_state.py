@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from model.hybrid_state import compute_explicit_frame_state
+from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
 
 
 class HybridFrameStateTests(unittest.TestCase):
@@ -124,6 +124,193 @@ class HybridFrameStateTests(unittest.TestCase):
         self.assertIsNotNone(points.grad)
         self.assertTrue(torch.isfinite(points.grad).all())
         self.assertGreater(torch.count_nonzero(points.grad).item(), 0)
+
+
+class HybridStateExchangeTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.batch_size = 2
+        self.frames = 7
+        self.particles = 4
+        self.particle_dim = 8
+        self.state_dim = 4
+        self.history_start = 1
+        self.prediction_index = 6
+        self.exchange = HybridStateExchange(
+            particle_dim=self.particle_dim,
+            state_dim=self.state_dim,
+            num_heads=2,
+            history_frames=5,
+            num_stages=3,
+        )
+        self.hidden = torch.randn(
+            self.batch_size,
+            self.frames,
+            self.particles,
+            self.particle_dim,
+        )
+        self.explicit = torch.randn(self.batch_size, 5, 18)
+        self.material = torch.randn(self.batch_size, 2)
+
+    def _forward(self, **overrides):
+        arguments = {
+            "hidden_states": self.hidden,
+            "state_tokens": None,
+            "explicit_frame_state": self.explicit,
+            "material_values": self.material,
+            "history_start": self.history_start,
+            "prediction_index": self.prediction_index,
+            "stage_index": 0,
+        }
+        arguments.update(overrides)
+        return self.exchange(**arguments)
+
+    def test_constructor_creates_zero_initialized_stage_gates(self):
+        self.assertEqual(self.exchange.feedback_gates.shape, (3,))
+        self.assertTrue(torch.equal(self.exchange.feedback_gates, torch.zeros(3)))
+        self.assertEqual(self.exchange.frame_embeddings.shape, (5, self.state_dim))
+        self.assertEqual(self.exchange.stage_embeddings.shape, (3, self.state_dim))
+
+    def test_constructor_rejects_invalid_dimensions(self):
+        invalid_arguments = (
+            ({"particle_dim": 8, "state_dim": 5, "num_heads": 2}, "state_dim"),
+            ({"particle_dim": 8, "history_frames": 4}, "history_frames"),
+            ({"particle_dim": 8, "num_stages": 0}, "num_stages"),
+        )
+
+        for arguments, message in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(ValueError, message):
+                    HybridStateExchange(**arguments)
+
+    def test_zero_gate_preserves_hidden_states_exactly(self):
+        state_tokens, updated_hidden = self._forward()
+
+        self.assertEqual(state_tokens.shape, (self.batch_size, 5, self.state_dim))
+        self.assertTrue(torch.equal(updated_hidden, self.hidden))
+
+    def test_mask_and_prediction_frames_do_not_affect_state_tokens(self):
+        baseline_state, _ = self._forward()
+        changed_hidden = self.hidden.clone()
+        changed_hidden[:, 0] = torch.randn_like(changed_hidden[:, 0]) * 1000
+        changed_hidden[:, self.prediction_index] = (
+            torch.randn_like(changed_hidden[:, self.prediction_index]) * 1000
+        )
+
+        changed_state, _ = self._forward(hidden_states=changed_hidden)
+
+        torch.testing.assert_close(changed_state, baseline_state, rtol=0, atol=0)
+
+    def test_open_gate_changes_only_prediction_frame(self):
+        with torch.no_grad():
+            self.exchange.feedback_gates[0] = 1
+
+        _, updated_hidden = self._forward()
+
+        self.assertTrue(
+            torch.equal(
+                updated_hidden[:, : self.prediction_index],
+                self.hidden[:, : self.prediction_index],
+            )
+        )
+        self.assertFalse(
+            torch.equal(
+                updated_hidden[:, self.prediction_index],
+                self.hidden[:, self.prediction_index],
+            )
+        )
+
+    def test_state_is_retained_and_refined_across_stages(self):
+        stage_one, _ = self._forward(stage_index=0)
+        stage_two, _ = self._forward(state_tokens=stage_one, stage_index=1)
+
+        self.assertEqual(stage_one.shape, (self.batch_size, 5, self.state_dim))
+        self.assertEqual(stage_two.shape, stage_one.shape)
+        self.assertFalse(torch.equal(stage_two, stage_one))
+
+    def test_material_values_condition_state_and_feedback(self):
+        zero_material = torch.zeros_like(self.material)
+        other_material = torch.full_like(self.material, 2.0)
+        zero_state, _ = self._forward(material_values=zero_material)
+        other_state, _ = self._forward(material_values=other_material)
+
+        self.assertFalse(torch.equal(zero_state, other_state))
+
+        with torch.no_grad():
+            self.exchange.feedback_gates[0] = 1
+        _, zero_hidden = self._forward(material_values=zero_material)
+        _, other_hidden = self._forward(material_values=other_material)
+        self.assertFalse(
+            torch.equal(
+                zero_hidden[:, self.prediction_index],
+                other_hidden[:, self.prediction_index],
+            )
+        )
+
+    def test_rejects_invalid_forward_shapes(self):
+        invalid_cases = (
+            ({"hidden_states": self.hidden[:, 0]}, "hidden_states.*\(B, F, N, C\)"),
+            ({"hidden_states": self.hidden[..., :-1]}, "particle_dim"),
+            ({"explicit_frame_state": self.explicit[:, :4]}, "explicit_frame_state"),
+            ({"material_values": self.material[:, :1]}, "material_values"),
+            (
+                {"state_tokens": torch.zeros(self.batch_size, 4, self.state_dim)},
+                "state_tokens",
+            ),
+        )
+
+        for overrides, message in invalid_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._forward(**overrides)
+
+    def test_rejects_invalid_history_prediction_and_stage_layout(self):
+        invalid_cases = (
+            ({"history_start": -1}, "history_start"),
+            ({"prediction_index": 5}, "immediately follow"),
+            (
+                {
+                    "hidden_states": torch.cat(
+                        (self.hidden, torch.zeros_like(self.hidden[:, :1])), dim=1
+                    )
+                },
+                "exactly one prediction frame",
+            ),
+            ({"stage_index": -1}, "stage_index"),
+            ({"stage_index": 3}, "stage_index"),
+        )
+
+        for overrides, message in invalid_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._forward(**overrides)
+
+    def test_mixed_dtype_forward_and_autograd(self):
+        hidden = self.hidden.double().requires_grad_(True)
+        explicit = self.explicit.double().requires_grad_(True)
+        material = self.material.double().requires_grad_(True)
+        with torch.no_grad():
+            self.exchange.feedback_gates[0] = 1
+
+        state_tokens, updated_hidden = self._forward(
+            hidden_states=hidden,
+            explicit_frame_state=explicit,
+            material_values=material,
+        )
+        (state_tokens.square().mean() + updated_hidden.square().mean()).backward()
+
+        self.assertEqual(state_tokens.dtype, self.exchange.frame_embeddings.dtype)
+        self.assertEqual(updated_hidden.dtype, hidden.dtype)
+        for value in (hidden, explicit, material):
+            self.assertIsNotNone(value.grad)
+            self.assertTrue(torch.isfinite(value.grad).all())
+        parameter_grads = [
+            parameter.grad
+            for parameter in self.exchange.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        self.assertTrue(parameter_grads)
+        self.assertTrue(all(torch.isfinite(grad).all() for grad in parameter_grads))
 
 
 if __name__ == "__main__":
