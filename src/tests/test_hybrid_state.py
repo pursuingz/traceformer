@@ -1,8 +1,10 @@
 import unittest
 
 import torch
+from omegaconf import OmegaConf
 
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
+from model.spacetime import MDM_ST, SpatialTemporalTransformerBlock
 
 
 class HybridFrameStateTests(unittest.TestCase):
@@ -360,6 +362,187 @@ class HybridStateExchangeTests(unittest.TestCase):
         ]
         self.assertTrue(parameter_grads)
         self.assertTrue(all(torch.isfinite(grad).all() for grad in parameter_grads))
+
+
+class V11aIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _model_config(transformer_block, n_layers=2):
+        return OmegaConf.create(
+            {
+                "n_layers": n_layers,
+                "latent_dim": 64,
+                "frame_cond": True,
+                "cond_frames": 5,
+                "point_embed": False,
+                "mask_cond": True,
+                "pred_offset": False,
+                "num_neighbors": -1,
+                "floor_cond": False,
+                "max_num_forces": 1,
+                "force_as_token": False,
+                "force_as_latent": False,
+                "gravity_emb": False,
+                "coeff_cond": False,
+                "num_mat": 0,
+                "class_token": False,
+                "class_dropout_prob": 0.0,
+                "transformer_block": transformer_block,
+            }
+        )
+
+    @staticmethod
+    def _inputs(batch_size=1, point_count=2):
+        return (
+            torch.randn(batch_size, 1, point_count, 3),
+            torch.zeros(batch_size, dtype=torch.long),
+            torch.randn(batch_size, 5, point_count, 3),
+            torch.randn(batch_size, 3),
+            torch.tensor([[2.0]]).repeat(batch_size, 1),
+            torch.tensor([[0.3]]).repeat(batch_size, 1),
+            torch.zeros(batch_size, 1, point_count, 1),
+            torch.zeros(batch_size, 4),
+            None,
+        )
+
+    def _model(self, transformer_block, n_layers=2, output_frames=1):
+        return MDM_ST(
+            n_points=2,
+            n_frame=output_frames,
+            n_feats=3,
+            model_config=self._model_config(transformer_block, n_layers),
+        )
+
+    def test_eight_layer_v11a_uses_one_exchange_four_times(self):
+        model = self._model("SpatialTemporalTransformerBlockv11a", n_layers=8).eval()
+
+        self.assertEqual(len(model.dit.transformer_blocks), 8)
+        self.assertTrue(
+            all(
+                type(block) is SpatialTemporalTransformerBlock
+                for block in model.dit.transformer_blocks
+            )
+        )
+        exchanges = [
+            module
+            for module in model.modules()
+            if isinstance(module, HybridStateExchange)
+        ]
+        self.assertEqual(exchanges, [model.dit.hybrid_state_exchange])
+        self.assertEqual(model.dit.hybrid_state_exchange.num_stages, 4)
+
+        calls = []
+
+        def record_call(module, args, kwargs):
+            calls.append(
+                (
+                    id(module),
+                    kwargs["stage_index"],
+                    kwargs["history_start"],
+                    kwargs["prediction_index"],
+                )
+            )
+
+        handle = model.dit.hybrid_state_exchange.register_forward_pre_hook(
+            record_call,
+            with_kwargs=True,
+        )
+        try:
+            with torch.no_grad():
+                output = model(*self._inputs())
+        finally:
+            handle.remove()
+
+        self.assertEqual(output.shape, (1, 1, 2, 3))
+        self.assertEqual(
+            calls,
+            [(id(exchanges[0]), stage, 1, 6) for stage in range(4)],
+        )
+
+    def test_baseline_state_dict_loads_and_zero_gates_preserve_bits(self):
+        torch.manual_seed(10)
+        baseline = self._model("SpatialTemporalTransformerBlock").eval()
+        torch.manual_seed(20)
+        v11a = self._model("SpatialTemporalTransformerBlockv11a").eval()
+
+        incompatible = v11a.load_state_dict(baseline.state_dict(), strict=False)
+        expected_missing = {
+            key
+            for key in v11a.state_dict()
+            if key.startswith("dit.hybrid_state_exchange.")
+        }
+        self.assertEqual(set(incompatible.missing_keys), expected_missing)
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertTrue(
+            torch.equal(
+                v11a.dit.hybrid_state_exchange.feedback_gates,
+                torch.zeros_like(v11a.dit.hybrid_state_exchange.feedback_gates),
+            )
+        )
+
+        inputs = self._inputs()
+        with torch.no_grad():
+            baseline_output = baseline(*inputs)
+            v11a_output = v11a(*inputs)
+
+        self.assertTrue(torch.equal(v11a_output, baseline_output))
+
+    def test_feedback_gates_receive_finite_gradients_with_and_without_checkpointing(self):
+        for checkpointing in (False, True):
+            with self.subTest(checkpointing=checkpointing):
+                model = self._model("SpatialTemporalTransformerBlockv11a").train()
+                if checkpointing:
+                    model.enable_gradient_checkpointing()
+                inputs = list(self._inputs())
+                inputs[0].requires_grad_(True)
+
+                model(*inputs).square().mean().backward()
+
+                gate_grad = model.dit.hybrid_state_exchange.feedback_gates.grad
+                self.assertIsNotNone(gate_grad)
+                self.assertTrue(torch.isfinite(gate_grad).all())
+
+    def test_explicit_state_depends_only_on_physical_init_frames(self):
+        model = self._model("SpatialTemporalTransformerBlockv11a").eval()
+        inputs = list(self._inputs())
+        captured = []
+
+        def capture_explicit(module, args, kwargs):
+            captured.append(kwargs["explicit_frame_state"].detach().clone())
+
+        handle = model.dit.hybrid_state_exchange.register_forward_pre_hook(
+            capture_explicit,
+            with_kwargs=True,
+        )
+        try:
+            with torch.no_grad():
+                model(*inputs)
+                inputs[0] = torch.randn_like(inputs[0]) * 1000
+                model(*inputs)
+        finally:
+            handle.remove()
+
+        expected = compute_explicit_frame_state(inputs[2])
+        self.assertEqual(len(captured), 2)
+        torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(captured[1], expected, rtol=0, atol=0)
+
+    def test_v11a_rejects_more_than_one_output_frame(self):
+        with self.assertRaisesRegex(ValueError, "exactly one output frame"):
+            self._model(
+                "SpatialTemporalTransformerBlockv11a",
+                output_frames=2,
+            )
+
+    def test_baseline_selector_still_runs_basic_forward(self):
+        model = self._model(
+            "SpatialTemporalTransformerBlock",
+            n_layers=1,
+        ).eval()
+
+        with torch.no_grad():
+            output = model(*self._inputs())
+
+        self.assertEqual(output.shape, (1, 1, 2, 3))
 
 
 if __name__ == "__main__":
