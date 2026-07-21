@@ -173,6 +173,12 @@ class HybridStateExchangeTests(unittest.TestCase):
 
     def test_constructor_rejects_invalid_dimensions(self):
         invalid_arguments = (
+            ({"particle_dim": 0}, "particle_dim"),
+            ({"particle_dim": -1}, "particle_dim"),
+            ({"particle_dim": 8, "state_dim": 0}, "state_dim"),
+            ({"particle_dim": 8, "state_dim": -1}, "state_dim"),
+            ({"particle_dim": 8, "num_heads": 0}, "num_heads"),
+            ({"particle_dim": 8, "num_heads": -1}, "num_heads"),
             ({"particle_dim": 8, "state_dim": 5, "num_heads": 2}, "state_dim"),
             ({"particle_dim": 8, "history_frames": 4}, "history_frames"),
             ({"particle_dim": 8, "num_stages": 0}, "num_stages"),
@@ -223,10 +229,15 @@ class HybridStateExchangeTests(unittest.TestCase):
     def test_state_is_retained_and_refined_across_stages(self):
         stage_one, _ = self._forward(stage_index=0)
         stage_two, _ = self._forward(state_tokens=stage_one, stage_index=1)
+        stage_two_without_retained_state, _ = self._forward(
+            state_tokens=torch.zeros_like(stage_one),
+            stage_index=1,
+        )
 
         self.assertEqual(stage_one.shape, (self.batch_size, 5, self.state_dim))
         self.assertEqual(stage_two.shape, stage_one.shape)
         self.assertFalse(torch.equal(stage_two, stage_one))
+        self.assertFalse(torch.equal(stage_two, stage_two_without_retained_state))
 
     def test_material_values_condition_state_and_feedback(self):
         zero_material = torch.zeros_like(self.material)
