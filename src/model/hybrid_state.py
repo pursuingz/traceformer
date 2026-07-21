@@ -262,6 +262,7 @@ class HybridStateExchange(nn.Module):
             feedback_query,
             encoder_hidden_states=state_tokens,
         )
+        feedback = torch.nan_to_num(feedback, nan=0.0, posinf=0.0, neginf=0.0)
         updated_prediction = prediction + (
             self.feedback_gates[stage_index] * feedback
         ).to(dtype=prediction.dtype)

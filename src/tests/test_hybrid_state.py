@@ -1,3 +1,4 @@
+import time
 import unittest
 
 import torch
@@ -226,6 +227,42 @@ class HybridStateExchangeTests(unittest.TestCase):
         self.assertNotEqual(active_gate_grad.item(), 0.0)
         self.assertEqual(self.exchange.feedback_gates[0].item(), 0.0)
 
+    def test_zero_gate_sanitizes_non_finite_feedback_and_keeps_finite_gradient(self):
+        hidden = self.hidden.clone().requires_grad_(True)
+        explicit = torch.full_like(self.explicit, torch.finfo(self.explicit.dtype).max)
+        with torch.no_grad():
+            explicit_layers = (
+                self.exchange.explicit_encoder[0],
+                self.exchange.explicit_encoder[2],
+            )
+            for layer in explicit_layers:
+                layer.weight.fill_(1)
+                layer.bias.zero_()
+        raw_feedback = []
+
+        def capture_feedback(module, args, output):
+            raw_feedback.append(output.detach())
+
+        handle = self.exchange.feedback_attention.register_forward_hook(capture_feedback)
+        try:
+            _, updated_hidden = self._forward(
+                hidden_states=hidden,
+                explicit_frame_state=explicit,
+                stage_index=0,
+            )
+            updated_hidden.sum().backward()
+        finally:
+            handle.remove()
+
+        self.assertTrue(torch.isfinite(explicit).all())
+        self.assertEqual(len(raw_feedback), 1)
+        self.assertFalse(torch.isfinite(raw_feedback[0]).all())
+        self.assertTrue(torch.isfinite(updated_hidden).all())
+        self.assertTrue(torch.equal(updated_hidden, hidden))
+        self.assertIsNotNone(self.exchange.feedback_gates.grad)
+        active_gate_grad = self.exchange.feedback_gates.grad[0]
+        self.assertTrue(torch.isfinite(active_gate_grad))
+
     def test_mask_and_prediction_frames_do_not_affect_state_tokens(self):
         baseline_state, _ = self._forward()
         changed_hidden = self.hidden.clone()
@@ -366,11 +403,11 @@ class HybridStateExchangeTests(unittest.TestCase):
 
 class V11aIntegrationTests(unittest.TestCase):
     @staticmethod
-    def _model_config(transformer_block, n_layers=2):
+    def _model_config(transformer_block, n_layers=2, latent_dim=64):
         return OmegaConf.create(
             {
                 "n_layers": n_layers,
-                "latent_dim": 64,
+                "latent_dim": latent_dim,
                 "frame_cond": True,
                 "cond_frames": 5,
                 "point_embed": False,
@@ -404,12 +441,23 @@ class V11aIntegrationTests(unittest.TestCase):
             None,
         )
 
-    def _model(self, transformer_block, n_layers=2, output_frames=1):
+    def _model(
+        self,
+        transformer_block,
+        n_layers=2,
+        output_frames=1,
+        point_count=2,
+        latent_dim=64,
+    ):
         return MDM_ST(
-            n_points=2,
+            n_points=point_count,
             n_frame=output_frames,
             n_feats=3,
-            model_config=self._model_config(transformer_block, n_layers),
+            model_config=self._model_config(
+                transformer_block,
+                n_layers,
+                latent_dim,
+            ),
         )
 
     def test_eight_layer_v11a_uses_one_exchange_four_times(self):
@@ -489,7 +537,11 @@ class V11aIntegrationTests(unittest.TestCase):
     def test_feedback_gates_receive_finite_gradients_with_and_without_checkpointing(self):
         for checkpointing in (False, True):
             with self.subTest(checkpointing=checkpointing):
-                model = self._model("SpatialTemporalTransformerBlockv11a").train()
+                torch.manual_seed(30 + int(checkpointing))
+                model = self._model(
+                    "SpatialTemporalTransformerBlockv11a",
+                    n_layers=8,
+                ).train()
                 if checkpointing:
                     model.enable_gradient_checkpointing()
                 inputs = list(self._inputs())
@@ -499,7 +551,53 @@ class V11aIntegrationTests(unittest.TestCase):
 
                 gate_grad = model.dit.hybrid_state_exchange.feedback_gates.grad
                 self.assertIsNotNone(gate_grad)
+                self.assertEqual(gate_grad.shape, (4,))
                 self.assertTrue(torch.isfinite(gate_grad).all())
+                self.assertTrue(torch.all(gate_grad != 0))
+
+    def test_nonzero_gates_train_pooling_state_and_cross_attention_across_stages(self):
+        torch.manual_seed(40)
+        model = self._model(
+            "SpatialTemporalTransformerBlockv11a",
+            n_layers=8,
+        ).train()
+        exchange = model.dit.hybrid_state_exchange
+        with torch.no_grad():
+            exchange.feedback_gates.fill_(1e-3)
+        inputs = list(self._inputs())
+        inputs[0].requires_grad_(True)
+
+        model(*inputs).square().mean().backward()
+
+        representative_parameters = {
+            "pooling": exchange.pool_score.weight,
+            "state_attention": exchange.state_attention.to_q.weight,
+            "cross_attention": exchange.feedback_attention.to_q.weight,
+        }
+        for name, parameter in representative_parameters.items():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+                self.assertGreater(torch.count_nonzero(parameter.grad).item(), 0)
+
+    def test_production_shape_v11a_forward_smoke(self):
+        torch.manual_seed(50)
+        point_count = 2048
+        model = self._model(
+            "SpatialTemporalTransformerBlockv11a",
+            n_layers=8,
+            point_count=point_count,
+            latent_dim=256,
+        ).eval()
+        inputs = self._inputs(point_count=point_count)
+
+        started_at = time.perf_counter()
+        with torch.no_grad():
+            output = model(*inputs)
+        elapsed = time.perf_counter() - started_at
+
+        print(f"v11a production-shape forward: {elapsed:.3f}s")
+        self.assertEqual(output.shape, (1, 1, point_count, 3))
 
     def test_explicit_state_depends_only_on_physical_init_frames(self):
         model = self._model("SpatialTemporalTransformerBlockv11a").eval()
