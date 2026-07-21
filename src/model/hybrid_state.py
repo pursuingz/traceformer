@@ -98,7 +98,11 @@ class HybridStateExchange(nn.Module):
             qk_norm="layer_norm",
         )
         self.state_ff_norm = nn.LayerNorm(state_dim)
-        self.state_ff = FeedForward(state_dim, inner_dim=state_dim * 4)
+        self.state_ff = FeedForward(
+            state_dim,
+            inner_dim=state_dim * 4,
+            activation_fn="gelu",
+        )
         self.state_film = nn.Linear(state_dim, state_dim * 2)
 
         self.feedback_norm = nn.LayerNorm(particle_dim)
@@ -110,7 +114,6 @@ class HybridStateExchange(nn.Module):
             dim_head=attention_head_dim,
             qk_norm="layer_norm",
         )
-        self.feedback_output = nn.Linear(particle_dim, particle_dim)
         self.feedback_gates = nn.Parameter(torch.zeros(num_stages))
 
         nn.init.normal_(self.frame_embeddings, std=0.02)
@@ -136,6 +139,8 @@ class HybridStateExchange(nn.Module):
     ) -> None:
         if hidden_states.ndim != 4:
             raise ValueError("hidden_states must have shape (B, F, N, C)")
+        if not hidden_states.is_floating_point():
+            raise ValueError("hidden_states must use a floating-point dtype")
 
         batch_size, frame_count, particle_count, particle_dim = hidden_states.shape
         if particle_dim != self.particle_dim:
@@ -257,7 +262,6 @@ class HybridStateExchange(nn.Module):
             feedback_query,
             encoder_hidden_states=state_tokens,
         )
-        feedback = self.feedback_output(feedback)
         updated_prediction = prediction + (
             self.feedback_gates[stage_index] * feedback
         ).to(dtype=prediction.dtype)

@@ -171,6 +171,23 @@ class HybridStateExchangeTests(unittest.TestCase):
         self.assertEqual(self.exchange.frame_embeddings.shape, (5, self.state_dim))
         self.assertEqual(self.exchange.stage_embeddings.shape, (3, self.state_dim))
 
+    def test_v11a_configuration_stays_within_parameter_budget(self):
+        exchange = HybridStateExchange(
+            particle_dim=256,
+            state_dim=64,
+            num_heads=4,
+            history_frames=5,
+            num_stages=4,
+        )
+
+        parameter_count = sum(
+            parameter.numel()
+            for parameter in exchange.parameters()
+            if parameter.requires_grad
+        )
+
+        self.assertLessEqual(parameter_count, 161_000)
+
     def test_constructor_rejects_invalid_dimensions(self):
         invalid_arguments = (
             ({"particle_dim": 0}, "particle_dim"),
@@ -194,6 +211,18 @@ class HybridStateExchangeTests(unittest.TestCase):
 
         self.assertEqual(state_tokens.shape, (self.batch_size, 5, self.state_dim))
         self.assertTrue(torch.equal(updated_hidden, self.hidden))
+
+    def test_zero_gate_preserves_output_and_receives_startup_gradient(self):
+        _, updated_hidden = self._forward(stage_index=0)
+
+        self.assertTrue(torch.equal(updated_hidden, self.hidden))
+
+        updated_hidden.square().sum().backward()
+        active_gate_grad = self.exchange.feedback_gates.grad[0]
+
+        self.assertTrue(torch.isfinite(active_gate_grad))
+        self.assertNotEqual(active_gate_grad.item(), 0.0)
+        self.assertEqual(self.exchange.feedback_gates[0].item(), 0.0)
 
     def test_mask_and_prediction_frames_do_not_affect_state_tokens(self):
         baseline_state, _ = self._forward()
@@ -260,7 +289,10 @@ class HybridStateExchangeTests(unittest.TestCase):
 
     def test_rejects_invalid_forward_shapes(self):
         invalid_cases = (
-            ({"hidden_states": self.hidden[:, 0]}, "hidden_states.*\(B, F, N, C\)"),
+            (
+                {"hidden_states": self.hidden[:, 0]},
+                r"hidden_states.*\(B, F, N, C\)",
+            ),
             ({"hidden_states": self.hidden[..., :-1]}, "particle_dim"),
             ({"explicit_frame_state": self.explicit[:, :4]}, "explicit_frame_state"),
             ({"material_values": self.material[:, :1]}, "material_values"),
@@ -274,6 +306,12 @@ class HybridStateExchangeTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     self._forward(**overrides)
+
+    def test_rejects_non_floating_hidden_states(self):
+        integer_hidden = torch.ones_like(self.hidden, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "floating"):
+            self._forward(hidden_states=integer_hidden)
 
     def test_rejects_invalid_history_prediction_and_stage_layout(self):
         invalid_cases = (
