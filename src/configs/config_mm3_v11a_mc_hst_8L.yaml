@@ -49,7 +49,7 @@ lambda_deform: 0.001     # 冻结 = SOTA:λ=0.001;经 geom_elastic_only 只作�
 
 single_frame_deform: true   # 冻结 = SOTA:单帧 boundary loss_F
 
-geom_elastic_only: true  # 改 3:多材质 gating —— laplacian/edge/deform 仅 elastic(mat_type==0)样本
+geom_elastic_only: true  # 冻结/继承 mm3 baseline:多材质 gating,仅作用 elastic(mat_type==0)样本
 
 lambda_laplacian: 0.5    # 冻结 = sfG(经 gating 仅 elastic)
 lambda_collision: 0.1
@@ -78,17 +78,17 @@ model_config:
   max_num_forces: 1
   force_as_token: false
   force_as_latent: false
-  gravity_emb: true        # 改 5:混合重力数据必需(elastic 无重力 / plasticine·sand 有重力)
+  gravity_emb: true        # 冻结/继承 mm3 baseline:混合重力标志
   coeff_cond: false
-  num_mat: 4               # 改 4:材质类别 token(elastic=0/plasticine=1/sand=2;3=rigid 空置)
-  class_token: true        # 改 4
+  num_mat: 4               # 冻结/继承 mm3 baseline:材质类别数
+  class_token: true        # 冻结/继承 mm3 baseline:材质类别 token
   transformer_block: SpatialTemporalTransformerBlockv11a   # 8 个原串行 block 不变;新增共享 exchange
   hybrid_state_dim: 64
   hybrid_state_heads: 4
   hybrid_state_interval: 2
 train_dataset:
   category: hf-objaverse-v1
-  dataset_path: mm3_data/mm3_train   # 改 2:多材质训练集(782 h5;elastic 子集 = 原 2048_train)
+  dataset_path: mm3_data/mm3_train   # 冻结/继承 mm3 baseline:多材质训练集
   dataset_list: DATASET_ITEM_LIST
   has_gravity: true
   max_num_forces: ${model_config.max_num_forces}
