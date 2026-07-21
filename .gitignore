@@ -31,3 +31,6 @@ CLAUDE.md
 #   old_results_appendix.md / test_result.md / README.md 仍继续入库同步。
 #   若要新增一个需入库的 .md,用 git add -f 强制。
 *.md
+
+# Local isolated development worktrees
+.worktrees/
