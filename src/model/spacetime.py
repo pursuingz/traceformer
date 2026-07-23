@@ -8,6 +8,7 @@ sys.path.append('./')
 
 from einops import rearrange, repeat
 from model.dit import *
+from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
 from diffusers.models.embeddings import LabelEmbedding 
 from utils.contact import build_contact_features
 
@@ -2075,6 +2076,10 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         class_dropout_prob: float = 0.0,
         physics_slices: int = 32,
         grid_res: int = 8,
+        history_frames: int = 5,
+        hybrid_state_dim: int = 64,
+        hybrid_state_heads: int = 4,
+        hybrid_state_interval: int = 2,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -2107,6 +2112,8 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         self.transformer_block = transformer_block
         if transformer_block == "SpatialTemporalTransformerBlock":
+            TransformerBlock = SpatialTemporalTransformerBlock
+        elif transformer_block == "SpatialTemporalTransformerBlockv11a":
             TransformerBlock = SpatialTemporalTransformerBlock
         elif transformer_block == "SpatialTemporalTransformerBlockv2":
             TransformerBlock = SpatialTemporalTransformerBlockv2
@@ -2155,6 +2162,29 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 for _ in range(num_layers)
             ]
         )
+        if transformer_block == "SpatialTemporalTransformerBlockv11a":
+            if history_frames != 5:
+                raise ValueError("v11a history_frames must be exactly 5")
+            if not isinstance(hybrid_state_interval, int) or hybrid_state_interval <= 0:
+                raise ValueError("v11a hybrid_state_interval must be a positive integer")
+            if num_layers % hybrid_state_interval != 0:
+                raise ValueError(
+                    "v11a hybrid_state_interval must evenly divide num_layers"
+                )
+            if cond_seq_length_t - history_frames != 1:
+                raise ValueError(
+                    "v11a requires one mask pseudo-frame before five physical history frames"
+                )
+            if sample_frames - cond_seq_length_t != 1:
+                raise ValueError("v11a requires exactly one output frame")
+            self.hybrid_state_interval = hybrid_state_interval
+            self.hybrid_state_exchange = HybridStateExchange(
+                particle_dim=inner_dim,
+                state_dim=hybrid_state_dim,
+                num_heads=hybrid_state_heads,
+                history_frames=history_frames,
+                num_stages=num_layers // hybrid_state_interval,
+            )
         self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
 
         # 4. Output blocks
@@ -2244,6 +2274,8 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         rest_indices: Optional[torch.LongTensor] = None,
         grid_assign=None,
         return_dict: bool = True,
+        explicit_frame_state: Optional[torch.Tensor] = None,
+        material_values: Optional[torch.Tensor] = None,
     ):
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -2283,6 +2315,18 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             emb = emb + ofs_emb
         
         B, F, N, C = hidden_states.shape
+        state_tokens = None
+        if self.transformer_block == "SpatialTemporalTransformerBlockv11a":
+            if explicit_frame_state is None:
+                raise ValueError("v11a requires explicit_frame_state")
+            if material_values is None:
+                raise ValueError("v11a requires material_values")
+            history_start = self.cond_seq_length_t - self.hybrid_state_exchange.history_frames
+            prediction_index = self.cond_seq_length_t
+            if history_start != 1 or F != prediction_index + 1:
+                raise ValueError(
+                    "v11a hidden frame layout must be [mask, five history, one prediction]"
+                )
         full_seq = torch.cat([encoder_hidden_states, hidden_states.reshape(B, F*N, -1)], axis=1)
 
         # 2. Patch embedding
@@ -2294,7 +2338,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states = hidden_states[:, :self.cond_seq_length]
         hidden_states = hidden_states[:, self.cond_seq_length:].reshape(B, F, N, C)
 
-        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+        if self.transformer_block not in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv11a", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
             encoder_hidden_states_time = hidden_states[:, :self.cond_seq_length_t]
             encoder_hidden_states_time = rearrange(encoder_hidden_states_time, 'b f n c -> (b n) f c')
             hidden_states = hidden_states[:, self.cond_seq_length_t:]
@@ -2309,7 +2353,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv11a", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     if self.transformer_block == "SpatialTemporalTransformerBlockv6":
                         hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
@@ -2373,7 +2417,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         **ckpt_kwargs,
                     )
             else:
-                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
+                if self.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv11a", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", 'TemporalOnlyTransformerBlock', 'SpatialOnlyTransformerBlock']:
                     if self.transformer_block == "SpatialTemporalTransformerBlockv6":
                         hidden_states, encoder_hidden_states = block(
                             hidden_states=hidden_states,
@@ -2424,6 +2468,19 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         indices=indices,
                         image_rotary_emb=image_rotary_emb,
                     )
+            if (
+                self.transformer_block == "SpatialTemporalTransformerBlockv11a"
+                and (i + 1) % self.hybrid_state_interval == 0
+            ):
+                state_tokens, hidden_states = self.hybrid_state_exchange(
+                    hidden_states=hidden_states,
+                    state_tokens=state_tokens,
+                    explicit_frame_state=explicit_frame_state,
+                    material_values=material_values,
+                    history_start=history_start,
+                    prediction_index=prediction_index,
+                    stage_index=(i + 1) // self.hybrid_state_interval - 1,
+                )
         hidden_states = rearrange(hidden_states, 'b f n c -> b (f n) c')
         # 4. Final block
         hidden_states = self.norm_final(hidden_states)
@@ -2445,6 +2502,7 @@ class MDM_ST(nn.Module):
         self.n_feats = n_feats
         self.latent_dim = model_config.latent_dim
         self.cond_frame = model_config.get('cond_frames', 1 if model_config.frame_cond else 0)
+        self.physical_history_frames = self.cond_frame
         self.frame_cond = model_config.frame_cond
 
         if model_config.get('point_embed', True):
@@ -2519,8 +2577,25 @@ class MDM_ST(nn.Module):
                 cond_seq_length=self.cond_seq_length,
             )
         else:
-            self.dit = SpaitalTemporalTransformer(sample_points=n_points, sample_frames=n_frame+self.cond_frame, in_channels=n_feats,
-                num_layers=model_config.n_layers, num_attention_heads=self.latent_dim // 64, time_embed_dim=self.latent_dim, cond_seq_length=self.cond_seq_length, cond_seq_length_t=self.cond_frame, transformer_block=model_config.transformer_block, num_classes=self.num_mat, class_dropout_prob=self.class_dropout_prob, physics_slices=model_config.get('physics_slices', 32), grid_res=model_config.get('grid_res', 8))
+            self.dit = SpaitalTemporalTransformer(
+                sample_points=n_points,
+                sample_frames=n_frame + self.cond_frame,
+                in_channels=n_feats,
+                num_layers=model_config.n_layers,
+                num_attention_heads=self.latent_dim // 64,
+                time_embed_dim=self.latent_dim,
+                cond_seq_length=self.cond_seq_length,
+                cond_seq_length_t=self.cond_frame,
+                transformer_block=model_config.transformer_block,
+                num_classes=self.num_mat,
+                class_dropout_prob=self.class_dropout_prob,
+                physics_slices=model_config.get('physics_slices', 32),
+                grid_res=model_config.get('grid_res', 8),
+                history_frames=self.physical_history_frames,
+                hybrid_state_dim=model_config.get('hybrid_state_dim', 64),
+                hybrid_state_heads=model_config.get('hybrid_state_heads', 4),
+                hybrid_state_interval=model_config.get('hybrid_state_interval', 2),
+            )
         
         self._init_weights()
 
@@ -2551,6 +2626,19 @@ class MDM_ST(nn.Module):
         else:
             init_pc_base = init_pc.reshape(bs, n_points, n_feats)
             init_pc_cond = init_pc_base.unsqueeze(1)
+
+        explicit_frame_state = None
+        material_values = None
+        if self.model_config.transformer_block == "SpatialTemporalTransformerBlockv11a":
+            if init_pc_cond.shape[1] != self.physical_history_frames:
+                raise ValueError(
+                    "v11a requires init_pc to provide exactly five physical history frames"
+                )
+            explicit_frame_state = compute_explicit_frame_state(init_pc_cond)
+            material_values = torch.cat(
+                (E.reshape(bs, -1)[:, :1], nu.reshape(bs, -1)[:, :1]),
+                dim=1,
+            )
 
         force = force.unsqueeze(1) if force.ndim == 2 else force
         drag_point = drag_point.unsqueeze(1) if drag_point.ndim == 2 else drag_point
@@ -2683,8 +2771,14 @@ class MDM_ST(nn.Module):
             mask_input = drag_mask[:, :1].to(dtype=self.mask_encoder.weight.dtype)
             mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
-        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
-            output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats, rest_indices=rest_indices, grid_assign=grid_assign).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
+        if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv11a", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
+            v11a_kwargs = {}
+            if self.model_config.transformer_block == "SpatialTemporalTransformerBlockv11a":
+                v11a_kwargs = {
+                    "explicit_frame_state": explicit_frame_state,
+                    "material_values": material_values,
+                }
+            output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats, rest_indices=rest_indices, grid_assign=grid_assign, **v11a_kwargs).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
         if self.pred_velocity:
