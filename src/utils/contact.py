@@ -63,6 +63,49 @@ def build_contact_features(
     return torch.cat([signed_gap, vertical_velocity, proximity], dim=-1)
 
 
+def apply_contact_feature_mask(
+    features: torch.Tensor,
+    feature_mask=(1.0, 1.0, 1.0),
+) -> torch.Tensor:
+    """Apply a shared ``[gap, velocity, proximity]`` ablation mask."""
+    if features.shape[-1] != 3:
+        raise ValueError(
+            f"contact features must have 3 channels; got {features.shape[-1]}"
+        )
+    mask = torch.as_tensor(
+        feature_mask,
+        device=features.device,
+        dtype=features.dtype,
+    )
+    if mask.numel() != 3:
+        raise ValueError(
+            f"contact_feature_mask must contain 3 values; got {mask.numel()}"
+        )
+    return features * mask.reshape(1, 1, 1, 3)
+
+
+def contact_channel_contributions(
+    features: torch.Tensor,
+    encoder_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate each input channel's mean hidden-vector magnitude."""
+    if features.shape[-1] != 3:
+        raise ValueError(
+            f"contact features must have 3 channels; got {features.shape[-1]}"
+        )
+    if encoder_weight.ndim != 2 or encoder_weight.shape[1] != 3:
+        raise ValueError(
+            "contact encoder weight must have shape (hidden_dim, 3); "
+            f"got {tuple(encoder_weight.shape)}"
+        )
+    mean_abs = features.abs().reshape(-1, 3).mean(dim=0)
+    column_norms = torch.linalg.vector_norm(
+        encoder_weight.to(features),
+        dim=0,
+    )
+    return mean_abs * column_norms
+
+
 def contact_weighted_losses(
     pred: torch.Tensor,
     target: torch.Tensor,

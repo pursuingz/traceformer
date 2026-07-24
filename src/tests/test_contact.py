@@ -5,13 +5,16 @@ import tempfile
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from dataset.traj_dataset import TrajDataset
 from model.spacetime import MDM_ST
-from options import TrainingConfig
+from options import TestingConfig, TrainingConfig
 from utils.contact import (
+    apply_contact_feature_mask,
     build_contact_features,
+    contact_channel_contributions,
     contact_weighted_losses,
     find_contact_window_starts,
 )
@@ -96,6 +99,11 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertEqual(fields["contact_window_ratio"].default, 0.0)
         self.assertEqual(fields["contact_frame_radius"].default, 2)
 
+    def test_eval_contact_margin_defaults_to_training_contact_band(self):
+        fields = TestingConfig.__dataclass_fields__
+
+        self.assertEqual(fields["contact_eval_margin"].default, 0.04)
+
     def test_contact_sampling_falls_back_to_uniform_without_floor_metadata(self):
         with tempfile.TemporaryDirectory(suffix="_test") as dataset_path:
             h5_path = os.path.join(dataset_path, "sample_001.h5")
@@ -143,6 +151,88 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertEqual(contact_model.contact_encoder.out_features, 64)
         self.assertEqual(torch.count_nonzero(contact_model.contact_encoder.weight).item(), 0)
         self.assertEqual(torch.count_nonzero(contact_model.contact_encoder.bias).item(), 0)
+        self.assertEqual(contact_model.contact_feature_mask, (1.0, 1.0, 1.0))
+        self.assertEqual(contact_model.contact_bias_scale, 1.0)
+
+    def test_contact_feature_mask_disables_only_selected_channels(self):
+        features = torch.tensor([[[[1.0, 2.0, 3.0]]]])
+
+        masked = apply_contact_feature_mask(features, [1.0, 0.0, 1.0])
+
+        torch.testing.assert_close(
+            masked,
+            torch.tensor([[[[1.0, 0.0, 3.0]]]]),
+        )
+
+    def test_contact_feature_mask_rejects_invalid_length(self):
+        features = torch.zeros(1, 1, 1, 3)
+
+        with self.assertRaisesRegex(ValueError, "must contain 3"):
+            apply_contact_feature_mask(features, [1.0, 0.0])
+
+    def test_contact_channel_contributions_match_linear_column_norms(self):
+        features = torch.tensor(
+            [[[[1.0, -2.0, 3.0], [-3.0, 4.0, -5.0]]]]
+        )
+        weight = torch.tensor(
+            [
+                [3.0, 0.0, 0.0],
+                [4.0, 0.0, 12.0],
+            ]
+        )
+
+        contributions = contact_channel_contributions(features, weight)
+
+        # mean |feature| = [2, 3, 4], column norms = [5, 0, 12].
+        torch.testing.assert_close(
+            contributions,
+            torch.tensor([10.0, 0.0, 48.0]),
+        )
+
+    def test_contact_model_rejects_invalid_feature_mask(self):
+        cfg = _model_config(True)
+        cfg.contact_feature_mask = [1.0, 0.0]
+
+        with self.assertRaisesRegex(ValueError, "must contain 3"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_contact_model_accepts_ablation_controls_without_shape_change(self):
+        cfg = _model_config(True)
+        cfg.contact_feature_mask = [0.0, 1.0, 1.0]
+        cfg.contact_bias_scale = 0.0
+
+        model = MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+        self.assertEqual(model.contact_feature_mask, (0.0, 1.0, 1.0))
+        self.assertEqual(model.contact_bias_scale, 0.0)
+        self.assertEqual(model.contact_encoder.in_features, 3)
+        self.assertEqual(model.contact_encoder.out_features, 64)
+
+    def test_ablation_controls_do_not_change_checkpoint_keys_or_shapes(self):
+        baseline = MDM_ST(8, 1, n_feats=3, model_config=_model_config(True))
+        cfg = _model_config(True)
+        cfg.contact_feature_mask = [1.0, 0.0, 1.0]
+        cfg.contact_bias_scale = 0.0
+        ablation = MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+        baseline_state = baseline.state_dict()
+        ablation_state = ablation.state_dict()
+        self.assertEqual(baseline_state.keys(), ablation_state.keys())
+        self.assertEqual(
+            {key: value.shape for key, value in baseline_state.items()},
+            {key: value.shape for key, value in ablation_state.items()},
+        )
+
+    def test_default_controls_match_linear_layer_exactly(self):
+        torch.manual_seed(0)
+        features = torch.randn(2, 3, 4, 3)
+        encoder = torch.nn.Linear(3, 8)
+
+        expected = encoder(features)
+        masked = apply_contact_feature_mask(features)
+        actual = F.linear(masked, encoder.weight, encoder.bias * 1.0)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_zero_initialized_contact_conditioning_preserves_forward(self):
         torch.manual_seed(0)

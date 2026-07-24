@@ -17,7 +17,11 @@ import time
 import numpy as np
 import h5py
 from utils.physics import loss_momentum, DeformLoss
-from utils.eval_metrics import per_window_metrics
+from utils.eval_metrics import (
+    append_result_tag,
+    contact_region_metrics,
+    per_window_metrics,
+)
 import torch.nn.functional as F
 from tqdm import tqdm
 from utils.visualization import save_pointcloud_video, save_pointcloud_json, save_threejs_html, generate_html_from_exts
@@ -102,7 +106,8 @@ def chamfer_distance(pred, gt):
     return cd.mean()
 
 loss_deform = DeformLoss().to('cuda')
-def main(args, config_path=None):
+def main(args, config_path=None, result_tag=None):
+    effective_vis_dir = append_result_tag(args.vis_dir, result_tag)
     # Prediction granularity (new axis): config-driven output_frames (default 5 = run23). Must be set
     # before create_model so the model is built with the same frame count as the checkpoint. ROLLOUT_STEPS
     # is derived from a fixed ~20-frame horizon: output=5 -> 4 (unchanged), output=1 -> 20 (frame-by-frame).
@@ -155,6 +160,31 @@ def main(args, config_path=None):
     total_floor_depth = 0.0       # 平均穿透深度(归一化单位)
     total_floor_rate_gt = 0.0     # GT 参考(应≈0)
     n_floor_gt = 0
+    CONTACT_METRIC_KEYS = (
+        'contact_mse_sum',
+        'contact_count',
+        'free_mse_sum',
+        'free_count',
+        'normal_velocity_mse_sum',
+        'normal_velocity_count',
+        'true_positive_count',
+        'pred_contact_count',
+        'gt_contact_count',
+    )
+    contact_totals = {key: 0.0 for key in CONTACT_METRIC_KEYS}
+    contact_margin = float(
+        args.get(
+            'contact_eval_margin',
+            args.model_config.get('contact_feature_sigma', 0.04),
+        )
+    )
+
+    def _accumulate_contact(target, metrics):
+        for key in CONTACT_METRIC_KEYS:
+            target[key] += float(metrics[key].item())
+
+    def _safe_ratio(numerator, denominator):
+        return numerator / denominator if denominator > 0 else float('nan')
     # ---- 非0起点 partial-rollout(检验 (01) 固定窗口优势是否只是 start=0 评测对齐 artifact)----
     # full-rollout 只测 start=0;(01) stride-5 网格恰好每 epoch 命中 start=0,(11) 随机起点几乎抽不到。
     # 这里对每个窗口按 GT 实际覆盖的 chunk 数累计 per-step,并单列「仅 start>0」,区分:
@@ -191,6 +221,7 @@ def main(args, config_path=None):
                 'vol_p': torch.zeros(len(VOL_DRIFT_FRAMES)),
                 'vol_g': torch.zeros(len(VOL_DRIFT_FRAMES)),
                 'vol_cnt': torch.zeros(len(VOL_DRIFT_FRAMES)),
+                'contact': {key: 0.0 for key in CONTACT_METRIC_KEYS},
             }
         return mm_buckets[m]
     for i, (batch, _) in enumerate(tqdm(val_dataloader)):
@@ -287,6 +318,24 @@ def main(args, config_path=None):
                     lo = (s + 1) * OUTPUT_FRAMES   # 跳过 [0:5] 输入段,只评 4 个预测段
                     hi = lo + OUTPUT_FRAMES
                     total_mse_step[s] += F.mse_loss(out_f[:, lo:hi], gt_f[:, lo:hi]).item()
+
+                for b in range(out_f.shape[0]):
+                    contact_metrics = contact_region_metrics(
+                        out_f[b:b + 1, INPUT_FRAMES:],
+                        gt_f[b:b + 1, INPUT_FRAMES:],
+                        previous_frame=gt_f[b:b + 1, INPUT_FRAMES - 1],
+                        floor_height=floor_h[b:b + 1],
+                        margin=contact_margin,
+                    )
+                    _accumulate_contact(contact_totals, contact_metrics)
+                    contact_mat = (
+                        int(batch['mat_type'][b].item())
+                        if 'mat_type' in batch else 0
+                    )
+                    _accumulate_contact(
+                        _mm_bucket(contact_mat)['contact'],
+                        contact_metrics,
+                    )
 
                 # ---- per-绝对帧 MSE(跨预测粒度可比:不依赖 chunk 大小,直接对 run23)----
                 # output 索引 0..4 = 输入段,5.. = 预测;取绝对帧 {5,10,15,20} 的单帧 MSE 作累积曲线。
@@ -423,7 +472,7 @@ def main(args, config_path=None):
 
             output = output.cpu().numpy()
             tgt = gt_vis.cpu().numpy()
-            vis_dir = args.vis_dir
+            vis_dir = effective_vis_dir
             save_dir = os.path.join(vis_dir, f'test_100_{args.num_inference_steps}steps_nips_debug')
             os.makedirs(save_dir, exist_ok=True)
             for j in range(output.shape[0]):
@@ -443,7 +492,7 @@ def main(args, config_path=None):
     if args.get('per_model_csv', None) and per_model_rows:
         import csv
         # seed=0 保持旧文件名(兼容既有分析脚本);多 seed 评测时各 seed 单独落盘不互相覆盖
-        csv_path = f'{args.vis_dir}_per_model.csv' if args.seed == 0 else f'{args.vis_dir}_per_model_seed{args.seed}.csv'
+        csv_path = f'{effective_vis_dir}_per_model.csv' if args.seed == 0 else f'{effective_vis_dir}_per_model_seed{args.seed}.csv'
         with open(csv_path, 'w', newline='', encoding='utf-8') as _f:
             w = csv.DictWriter(_f, fieldnames=list(per_model_rows[0].keys()))
             w.writeheader(); w.writerows(per_model_rows)
@@ -522,6 +571,28 @@ def main(args, config_path=None):
                       f'long(f18-24)={_mseg(18, 24):.6e}')
                 print(f'    GM-MSE(f5-24)={_mgm:.6e}   FDE={mb["fde_sum"] / max(mb["fde_cnt"], 1):.6e}   '
                       f'MSE@f24={_mpf.get(24, float("nan")):.6e}')
+                _mc = mb['contact']
+                _mc_mse = _safe_ratio(
+                    _mc['contact_mse_sum'], _mc['contact_count']
+                )
+                _mf_mse = _safe_ratio(
+                    _mc['free_mse_sum'], _mc['free_count']
+                )
+                _mcv_mse = _safe_ratio(
+                    _mc['normal_velocity_mse_sum'],
+                    _mc['normal_velocity_count'],
+                )
+                _mcp = _safe_ratio(
+                    _mc['true_positive_count'], _mc['pred_contact_count']
+                )
+                _mcr = _safe_ratio(
+                    _mc['true_positive_count'], _mc['gt_contact_count']
+                )
+                print(
+                    f'    contact: MSE={_mc_mse:.6e} free-MSE={_mf_mse:.6e} '
+                    f'normal-vMSE={_mcv_mse:.6e} '
+                    f'precision={_mcp * 100:.2f}% recall={_mcr * 100:.2f}%'
+                )
                 for af in PARADIGM_FRAMES:
                     if mb['proc_cnt'][af]:
                         _c = mb['proc_cnt'][af]
@@ -548,6 +619,35 @@ def main(args, config_path=None):
     print('  per-step(仅start>0): ' + ', '.join(f'step{k+1}={v:.6e}(n={int(cnt_step_nz[k])})' for k, v in enumerate(per_step_nz)))
     print(f'  loss_F (pred)   : {total_loss_F / n:.6e}')
     print(f'  loss_F (gt ref) : {total_loss_F_gt / n:.6e}')
+    contact_mse = _safe_ratio(
+        contact_totals['contact_mse_sum'],
+        contact_totals['contact_count'],
+    )
+    free_mse = _safe_ratio(
+        contact_totals['free_mse_sum'],
+        contact_totals['free_count'],
+    )
+    contact_v_mse = _safe_ratio(
+        contact_totals['normal_velocity_mse_sum'],
+        contact_totals['normal_velocity_count'],
+    )
+    contact_precision = _safe_ratio(
+        contact_totals['true_positive_count'],
+        contact_totals['pred_contact_count'],
+    )
+    contact_recall = _safe_ratio(
+        contact_totals['true_positive_count'],
+        contact_totals['gt_contact_count'],
+    )
+    print(
+        '  --- contact-region diagnostics '
+        f'(GT gap <= {contact_margin:g}, full-horizon windows only) ---'
+    )
+    print(f'  contact-region MSE : {contact_mse:.6e}   (GT contact mask)')
+    print(f'  free-space MSE     : {free_mse:.6e}')
+    print(f'  contact normal-vMSE: {contact_v_mse:.6e}')
+    print(f'  contact precision  : {contact_precision * 100:.3f}%')
+    print(f'  contact recall     : {contact_recall * 100:.3f}%')
     nv = max(n_vol, 1)
     nvd = max(n_vol_drift, 1)
     nvd_gt = max(n_vol_drift_gt, 1)
@@ -574,6 +674,7 @@ def main(args, config_path=None):
     _res_dir = args.get('results_dir', 'eval_results')
     os.makedirs(_res_dir, exist_ok=True)
     _stem = os.path.splitext(os.path.basename(config_path))[0] if config_path else os.path.basename(str(args.vis_dir))
+    _stem = append_result_tag(_stem, result_tag)
     _m = re.search(r'checkpoint-(\d+)', str(args.resume))
     _step_tag = _m.group(1) if _m else 'na'
     _res_path = os.path.join(_res_dir, f'{_stem}_step{_step_tag}_seed{args.seed}.md')
@@ -582,8 +683,17 @@ def main(args, config_path=None):
         _f.write(f'- time: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
         _f.write(f'- config: {config_path}\n')
         _f.write(f'- resume: {args.resume}\n')
+        _f.write(f'- vis_dir: {effective_vis_dir}\n')
         _f.write(f'- use_diffusion: {args.use_diffusion}  num_inference_steps: {args.num_inference_steps}  '
                  f'input_frames: {INPUT_FRAMES}  output_frames: {OUTPUT_FRAMES}\n\n')
+        _f.write(
+            f'- contact_feature_mask: '
+            f'{args.model_config.get("contact_feature_mask", [1.0, 1.0, 1.0])}\n'
+        )
+        _f.write(
+            f'- contact_bias_scale: '
+            f'{args.model_config.get("contact_bias_scale", 1.0)}\n\n'
+        )
         _f.write('```\n' + _res_buf.getvalue() + '```\n')
     print(f'  [results] eval 指标已写入 {_res_path}')
 
@@ -592,10 +702,38 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--seed', type=int, default=None,
                         help='覆盖 config 的 seed(多 seed DDIM 评测用;确定性臂无影响)')
-    args = parser.parse_args()
+    parser.add_argument(
+        '--contact-feature-mask',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=('GAP', 'VELOCITY', 'PROXIMITY'),
+        help='Eval-only contact feature mask; training ablations must record it in YAML.',
+    )
+    parser.add_argument(
+        '--contact-bias-scale',
+        type=float,
+        default=None,
+        help='Eval-only multiplier for the learned contact encoder bias.',
+    )
+    parser.add_argument(
+        '--result-tag',
+        type=str,
+        default=None,
+        help='Suffix for diagnostic result filenames.',
+    )
+    cli_args = parser.parse_args()
     schema = OmegaConf.structured(TestingConfig)
-    cfg = OmegaConf.load(args.config)
+    cfg = OmegaConf.load(cli_args.config)
     cfg = OmegaConf.merge(schema, cfg)
-    if args.seed is not None:
-        cfg.seed = args.seed
-    main(cfg, config_path=args.config)
+    if cli_args.seed is not None:
+        cfg.seed = cli_args.seed
+    if cli_args.contact_feature_mask is not None:
+        cfg.model_config.contact_feature_mask = list(cli_args.contact_feature_mask)
+    if cli_args.contact_bias_scale is not None:
+        cfg.model_config.contact_bias_scale = cli_args.contact_bias_scale
+    main(
+        cfg,
+        config_path=cli_args.config,
+        result_tag=cli_args.result_tag,
+    )

@@ -1,6 +1,32 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
+
+def resolve_training_stop_step(
+    max_train_steps: int,
+    stop_after_steps: Optional[int],
+    checkpointing_steps: int,
+) -> int:
+    """Resolve an early stop without changing the optimizer/scheduler horizon."""
+    stop_step = (
+        int(max_train_steps)
+        if stop_after_steps is None
+        else int(stop_after_steps)
+    )
+    if not 0 < stop_step <= int(max_train_steps):
+        raise ValueError(
+            "stop_after_steps must be in (0, max_train_steps]; "
+            f"got {stop_step} with max_train_steps={max_train_steps}"
+        )
+    if stop_step < int(max_train_steps) and stop_step % int(checkpointing_steps):
+        raise ValueError(
+            "stop_after_steps must align with checkpointing_steps so the "
+            f"screening checkpoint is saved; got {stop_step} and "
+            f"{checkpointing_steps}"
+        )
+    return stop_step
+
+
 @dataclass
 class TrainingConfig:
     image_size: int
@@ -77,6 +103,9 @@ class TrainingConfig:
     model_config: Dict
     pc_size: int
     use_diffusion: bool = False
+    # Optional early stop that does not change max_train_steps, which remains the
+    # optimizer/scheduler horizon. Use for matched-step screening experiments.
+    stop_after_steps: Optional[int] = None
     # Rollout-aware training (scheduled sampling): perturb conditioning points_src with
     # noise to mimic autoregressive drift at rollout time; target stays clean. 0.0 = off.
     rollout_input_noise_std: float = 0.0
@@ -173,6 +202,8 @@ class TestingConfig:
     input_frames: int = 5
     # opt-in:dump 每模型明细 CSV(log10E/full-rollout/体积),供 E 分档。默认 False=不写、现有 eval 零影响。
     per_model_csv: bool = False
+    # Normalized signed-gap threshold used by contact-region eval metrics.
+    contact_eval_margin: float = 0.04
     # 推理时地板投影(诊断/缓解穿透用):rollout 每步预测出来后,把 y < floor_height 的点直接
     # 夹到 floor_height(不改训练、不改 loss,只在 eval 的 rollout 反馈路径生效)。用于验证/缓解
     # sf/sfG 单帧自回归的地板穿透痼疾(见 实验记录.md / physctrl2-mm3-experiment memory)。

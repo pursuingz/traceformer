@@ -13,6 +13,72 @@
 import torch
 
 
+def append_result_tag(base, result_tag):
+    """Append a diagnostic tag while preserving legacy paths by default."""
+    return str(base) if not result_tag else f"{base}_{result_tag}"
+
+
+def contact_region_metrics(
+    pred,
+    gt,
+    previous_frame,
+    floor_height,
+    margin=0.04,
+):
+    """Return contact/free-space metric sums and particle-time counts."""
+    if pred.shape != gt.shape or pred.ndim != 4 or pred.shape[-1] != 3:
+        raise ValueError(
+            "pred and gt must share shape (B,T,N,3); "
+            f"got {tuple(pred.shape)} and {tuple(gt.shape)}"
+        )
+    if previous_frame.ndim == 4:
+        if previous_frame.shape[1] != 1:
+            raise ValueError("previous_frame may contain only one frame")
+        previous_frame = previous_frame[:, 0]
+    if (
+        previous_frame.ndim != 3
+        or previous_frame.shape[0] != pred.shape[0]
+        or previous_frame.shape[1:] != pred.shape[2:]
+    ):
+        raise ValueError(
+            "previous_frame must have shape (B,N,3); "
+            f"got {tuple(previous_frame.shape)}"
+        )
+
+    floor = torch.as_tensor(
+        floor_height,
+        device=gt.device,
+        dtype=gt.dtype,
+    ).reshape(pred.shape[0], 1, 1)
+    gt_contact = gt[..., 1] - floor <= float(margin)
+    pred_contact = pred[..., 1] - floor <= float(margin)
+    free = ~gt_contact
+
+    point_mse = (pred - gt).square().mean(dim=-1)
+    pred_y = torch.cat([previous_frame[:, None, :, 1], pred[..., 1]], dim=1)
+    gt_y = torch.cat([previous_frame[:, None, :, 1], gt[..., 1]], dim=1)
+    normal_velocity_mse = (
+        (pred_y[:, 1:] - pred_y[:, :-1])
+        - (gt_y[:, 1:] - gt_y[:, :-1])
+    ).square()
+
+    contact_float = gt_contact.to(point_mse.dtype)
+    free_float = free.to(point_mse.dtype)
+    return {
+        "contact_mse_sum": (point_mse * contact_float).sum(),
+        "contact_count": gt_contact.sum(),
+        "free_mse_sum": (point_mse * free_float).sum(),
+        "free_count": free.sum(),
+        "normal_velocity_mse_sum": (
+            normal_velocity_mse * contact_float
+        ).sum(),
+        "normal_velocity_count": gt_contact.sum(),
+        "true_positive_count": (pred_contact & gt_contact).sum(),
+        "pred_contact_count": pred_contact.sum(),
+        "gt_contact_count": gt_contact.sum(),
+    }
+
+
 def umeyama_decompose(p, g):
     """已知逐点对应下的相似变换对齐(Umeyama 1991):min_{s,R,t} ||s R p + t - g||^2。
     p/g: (N,3),同 dtype/device。返回 (质心偏移L2, 旋转角deg, 尺度s, 对齐后残余MSE):

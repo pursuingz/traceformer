@@ -10,7 +10,7 @@ from einops import rearrange, repeat
 from model.dit import *
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
 from diffusers.models.embeddings import LabelEmbedding 
-from utils.contact import build_contact_features
+from utils.contact import apply_contact_feature_mask, build_contact_features
 
 class PointEmbed(nn.Module):
     def __init__(self, hidden_dim=96, dim=512):
@@ -2563,6 +2563,21 @@ class MDM_ST(nn.Module):
         self.start_vel_encoder = nn.Linear(3, self.latent_dim)
         self.contact_particle_cond = model_config.get('contact_particle_cond', False)
         self.contact_feature_sigma = model_config.get('contact_feature_sigma', 0.04)
+        self.contact_feature_mask = tuple(
+            float(value)
+            for value in model_config.get(
+                'contact_feature_mask',
+                [1.0, 1.0, 1.0],
+            )
+        )
+        if len(self.contact_feature_mask) != 3:
+            raise ValueError(
+                "contact_feature_mask must contain 3 values: "
+                "[gap, velocity, proximity]"
+            )
+        self.contact_bias_scale = float(
+            model_config.get('contact_bias_scale', 1.0)
+        )
         if self.contact_particle_cond:
             self.contact_encoder = nn.Linear(3, self.latent_dim)
             nn.init.zeros_(self.contact_encoder.weight)
@@ -2756,7 +2771,18 @@ class MDM_ST(nn.Module):
                 start_velocity=start_vel,
                 sigma=self.contact_feature_sigma,
             ).to(dtype=self.contact_encoder.weight.dtype)
-            contact_hidden = self.contact_encoder(contact_features).to(hidden_states.dtype)
+            contact_features = apply_contact_feature_mask(
+                contact_features,
+                self.contact_feature_mask,
+            )
+            contact_bias = self.contact_encoder.bias
+            if contact_bias is not None:
+                contact_bias = contact_bias * self.contact_bias_scale
+            contact_hidden = F.linear(
+                contact_features,
+                self.contact_encoder.weight,
+                contact_bias,
+            ).to(hidden_states.dtype)
             n_contact_frames = contact_hidden.shape[1]
             hidden_states = torch.cat([
                 hidden_states[:, :n_contact_frames] + contact_hidden,

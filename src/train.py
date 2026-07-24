@@ -11,7 +11,7 @@ import warnings
 import sys
 from pathlib import Path
 from omegaconf import OmegaConf
-from options import TrainingConfig
+from options import TrainingConfig, resolve_training_stop_step
 
 import numpy as np
 import h5py
@@ -472,6 +472,16 @@ def main(args):
     else:
         initial_global_step = 0
 
+    training_stop_step = resolve_training_stop_step(
+        args.max_train_steps,
+        args.get('stop_after_steps', None),
+        args.checkpointing_steps,
+    )
+    logger.info(
+        f"  Scheduler horizon = {args.max_train_steps}; "
+        f"this run stops at = {training_stop_step}"
+    )
+
     # Weights-only init (fine-tune a converged model at a fresh/lower lr). Only when we did NOT
     # resume this run's own checkpoint, so an interrupted fine-tune resumes from its own latest
     # checkpoint instead of re-initialising from the source every restart. Optimizer/scheduler/
@@ -491,7 +501,7 @@ def main(args):
             )
 
     progress_bar = tqdm(
-        range(0, args.max_train_steps),
+        range(0, training_stop_step),
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -520,7 +530,7 @@ def main(args):
         return accelerator.prepare(dl)
 
     cur_stage = current_stage(0, curriculum, args.rollout_unroll_steps)  # matches the initial loader
-    while global_step < args.max_train_steps:
+    while global_step < training_stop_step:
         model.train()
         train_loss = 0.0
         if curriculum:
@@ -945,7 +955,7 @@ def main(args):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= training_stop_step:
                 break
             if curriculum and current_stage(global_step, curriculum, args.rollout_unroll_steps) != cur_stage:
                 break   # stage changed mid-epoch -> exit inner loop so the loader is rebuilt
