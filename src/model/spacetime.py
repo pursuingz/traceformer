@@ -10,7 +10,11 @@ from einops import rearrange, repeat
 from model.dit import *
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
 from diffusers.models.embeddings import LabelEmbedding 
-from utils.contact import apply_contact_feature_mask, build_contact_features
+from utils.contact import (
+    apply_contact_feature_mask,
+    build_contact_features,
+    contact_feature_names,
+)
 
 class PointEmbed(nn.Module):
     def __init__(self, hidden_dim=96, dim=512):
@@ -2563,23 +2567,36 @@ class MDM_ST(nn.Module):
         self.start_vel_encoder = nn.Linear(3, self.latent_dim)
         self.contact_particle_cond = model_config.get('contact_particle_cond', False)
         self.contact_feature_sigma = model_config.get('contact_feature_sigma', 0.04)
+        self.contact_velocity_mode = model_config.get(
+            'contact_velocity_mode',
+            'vertical',
+        )
+        self.contact_feature_names = contact_feature_names(
+            self.contact_velocity_mode
+        )
+        default_contact_mask = [1.0] * len(self.contact_feature_names)
         self.contact_feature_mask = tuple(
             float(value)
             for value in model_config.get(
                 'contact_feature_mask',
-                [1.0, 1.0, 1.0],
+                default_contact_mask,
             )
         )
-        if len(self.contact_feature_mask) != 3:
+        if len(self.contact_feature_mask) != len(self.contact_feature_names):
             raise ValueError(
-                "contact_feature_mask must contain 3 values: "
-                "[gap, velocity, proximity]"
+                "contact_feature_mask must contain "
+                f"{len(self.contact_feature_names)} values for "
+                f"contact_velocity_mode={self.contact_velocity_mode!r}: "
+                f"{list(self.contact_feature_names)}"
             )
         self.contact_bias_scale = float(
             model_config.get('contact_bias_scale', 1.0)
         )
         if self.contact_particle_cond:
-            self.contact_encoder = nn.Linear(3, self.latent_dim)
+            self.contact_encoder = nn.Linear(
+                len(self.contact_feature_names),
+                self.latent_dim,
+            )
             nn.init.zeros_(self.contact_encoder.weight)
             nn.init.zeros_(self.contact_encoder.bias)
         if model_config.transformer_block == "SpatialTemporalTransformerNoDiffusion":
@@ -2770,6 +2787,7 @@ class MDM_ST(nn.Module):
                 floor_height,
                 start_velocity=start_vel,
                 sigma=self.contact_feature_sigma,
+                velocity_mode=self.contact_velocity_mode,
             ).to(dtype=self.contact_encoder.weight.dtype)
             contact_features = apply_contact_feature_mask(
                 contact_features,

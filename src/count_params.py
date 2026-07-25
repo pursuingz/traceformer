@@ -217,6 +217,19 @@ def main():
         'v1 serial + contact cond 8L: '
         f'total={count(contact_model)/1e6:.3f}M  delta={contact_delta} params'
     )
+    contact_xyz_model = build(
+        'SpatialTemporalTransformerBlock',
+        8,
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_velocity_mode='xyz',
+    )
+    contact_xyz_delta = count(contact_xyz_model) - count(contact_model)
+    print(
+        'v1 serial + contact v_xyz 8L: '
+        f'total={count(contact_xyz_model)/1e6:.3f}M  '
+        f'delta-vs-v_y={contact_xyz_delta} params'
+    )
 
     # Per-submodule breakdown of one v3 block.
     model_v3 = build('SpatialTemporalTransformerBlockv3', 8)

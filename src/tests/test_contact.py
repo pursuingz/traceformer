@@ -154,6 +154,27 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertEqual(contact_model.contact_feature_mask, (1.0, 1.0, 1.0))
         self.assertEqual(contact_model.contact_bias_scale, 1.0)
 
+    def test_xyz_contact_encoder_uses_five_features(self):
+        cfg = _model_config(True)
+        cfg.contact_velocity_mode = "xyz"
+
+        model = MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+        self.assertEqual(model.contact_encoder.in_features, 5)
+        self.assertEqual(model.contact_encoder.out_features, 64)
+        self.assertEqual(model.contact_feature_mask, (1.0,) * 5)
+        self.assertEqual(model.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            model.contact_feature_names,
+            (
+                "signed_gap",
+                "displacement_x",
+                "displacement_y",
+                "displacement_z",
+                "proximity",
+            ),
+        )
+
     def test_contact_feature_mask_disables_only_selected_channels(self):
         features = torch.tensor([[[[1.0, 2.0, 3.0]]]])
 
@@ -162,6 +183,19 @@ class ContactFeatureTests(unittest.TestCase):
         torch.testing.assert_close(
             masked,
             torch.tensor([[[[1.0, 0.0, 3.0]]]]),
+        )
+
+    def test_contact_feature_mask_supports_five_channels(self):
+        features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
+
+        masked = apply_contact_feature_mask(
+            features,
+            [1.0, 0.0, 1.0, 0.0, 1.0],
+        )
+
+        torch.testing.assert_close(
+            masked,
+            torch.tensor([[[[1.0, 0.0, 3.0, 0.0, 5.0]]]]),
         )
 
     def test_contact_feature_mask_rejects_invalid_length(self):
@@ -189,11 +223,27 @@ class ContactFeatureTests(unittest.TestCase):
             torch.tensor([10.0, 0.0, 48.0]),
         )
 
+    def test_contact_channel_contributions_support_five_channels(self):
+        features = torch.ones(1, 1, 2, 5)
+        weight = torch.eye(5)
+
+        contributions = contact_channel_contributions(features, weight)
+
+        torch.testing.assert_close(contributions, torch.ones(5))
+
     def test_contact_model_rejects_invalid_feature_mask(self):
         cfg = _model_config(True)
         cfg.contact_feature_mask = [1.0, 0.0]
 
         with self.assertRaisesRegex(ValueError, "must contain 3"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_xyz_contact_model_rejects_three_channel_feature_mask(self):
+        cfg = _model_config(True)
+        cfg.contact_velocity_mode = "xyz"
+        cfg.contact_feature_mask = [1.0, 1.0, 1.0]
+
+        with self.assertRaisesRegex(ValueError, "must contain 5"):
             MDM_ST(8, 1, n_feats=3, model_config=cfg)
 
     def test_contact_model_accepts_ablation_controls_without_shape_change(self):
@@ -264,6 +314,38 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertEqual(contact_output.shape, (batch_size, 1, 4, 3))
         torch.testing.assert_close(contact_output, baseline_output, rtol=0, atol=0)
 
+    def test_zero_initialized_xyz_contact_conditioning_preserves_forward(self):
+        torch.manual_seed(0)
+        cfg = _model_config(True)
+        cfg.contact_velocity_mode = "xyz"
+        model = MDM_ST(4, 1, n_feats=3, model_config=cfg).eval()
+        batch_size = 1
+        x = torch.randn(batch_size, 1, 4, 3)
+        init_pc = torch.randn(batch_size, 2, 4, 3)
+        timesteps = torch.zeros(batch_size, dtype=torch.long)
+        force = torch.zeros(batch_size, 1, 3)
+        E = torch.ones(batch_size, 1)
+        nu = torch.ones(batch_size, 1)
+        drag_mask = torch.zeros(batch_size, 4, 1)
+        drag_point = torch.zeros(batch_size, 1, 4)
+        floor = torch.zeros(batch_size, 1)
+        gravity = torch.zeros(batch_size, 1, dtype=torch.long)
+        start_vel = torch.randn(batch_size, 4, 3)
+
+        with torch.no_grad():
+            contact_output = model(
+                x, timesteps, init_pc, force, E, nu, drag_mask, drag_point,
+                floor, gravity, start_vel=start_vel,
+            )
+            model.contact_particle_cond = False
+            baseline_output = model(
+                x, timesteps, init_pc, force, E, nu, drag_mask, drag_point,
+                floor, gravity, start_vel=start_vel,
+            )
+
+        self.assertEqual(contact_output.shape, (batch_size, 1, 4, 3))
+        torch.testing.assert_close(contact_output, baseline_output, rtol=0, atol=0)
+
     def test_features_encode_gap_velocity_and_proximity(self):
         points = torch.zeros(1, 3, 2, 3)
         points[0, :, 0, 1] = torch.tensor([0.0, 0.1, 0.15])
@@ -288,6 +370,46 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertAlmostEqual(
             features[0, 0, 1, 2].item(), float(np.exp(-1.0)), places=6
         )
+
+    def test_features_encode_full_xyz_displacement(self):
+        points = torch.tensor(
+            [[
+                [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+                [[0.1, 0.2, 0.3], [0.8, 0.9, 1.4]],
+                [[0.4, 0.1, 0.5], [0.7, 0.5, 1.2]],
+            ]]
+        )
+        floor = torch.tensor([[0.0]])
+        start_velocity = torch.tensor(
+            [[[0.5, -0.2, 0.1], [-0.4, 0.3, 0.2]]]
+        )
+
+        features = build_contact_features(
+            points,
+            floor,
+            start_velocity=start_velocity,
+            sigma=1.0,
+            velocity_mode="xyz",
+        )
+
+        self.assertEqual(features.shape, (1, 3, 2, 5))
+        torch.testing.assert_close(features[..., 0], points[..., 1])
+        torch.testing.assert_close(features[0, 0, :, 1:4], start_velocity[0])
+        torch.testing.assert_close(
+            features[:, 1:, :, 1:4],
+            points[:, 1:, :, :3] - points[:, :-1, :, :3],
+        )
+        torch.testing.assert_close(
+            features[..., 4],
+            torch.exp(-(torch.relu(points[..., 1]) ** 2)),
+        )
+
+    def test_features_reject_unknown_velocity_mode(self):
+        points = torch.zeros(1, 2, 2, 3)
+        floor = torch.tensor([[0.0]])
+
+        with self.assertRaisesRegex(ValueError, "contact_velocity_mode"):
+            build_contact_features(points, floor, velocity_mode="bad")
 
     def test_weighted_losses_focus_on_near_floor_particles(self):
         target = torch.zeros(1, 1, 2, 3)

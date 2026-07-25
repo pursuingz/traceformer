@@ -22,6 +22,7 @@ from utils.eval_metrics import (
     contact_region_metrics,
     per_window_metrics,
 )
+from utils.contact import contact_feature_names
 import torch.nn.functional as F
 from tqdm import tqdm
 from utils.visualization import save_pointcloud_video, save_pointcloud_json, save_threejs_html, generate_html_from_exts
@@ -678,6 +679,13 @@ def main(args, config_path=None, result_tag=None):
     _m = re.search(r'checkpoint-(\d+)', str(args.resume))
     _step_tag = _m.group(1) if _m else 'na'
     _res_path = os.path.join(_res_dir, f'{_stem}_step{_step_tag}_seed{args.seed}.md')
+    _contact_velocity_mode = args.model_config.get(
+        'contact_velocity_mode',
+        'vertical',
+    )
+    _default_contact_mask = [1.0] * len(
+        contact_feature_names(_contact_velocity_mode)
+    )
     with open(_res_path, 'w', encoding='utf-8') as _f:
         _f.write(f'# eval results: {_stem} @checkpoint-{_step_tag} seed={args.seed}\n\n')
         _f.write(f'- time: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
@@ -688,8 +696,9 @@ def main(args, config_path=None, result_tag=None):
                  f'input_frames: {INPUT_FRAMES}  output_frames: {OUTPUT_FRAMES}\n\n')
         _f.write(
             f'- contact_feature_mask: '
-            f'{args.model_config.get("contact_feature_mask", [1.0, 1.0, 1.0])}\n'
+            f'{args.model_config.get("contact_feature_mask", _default_contact_mask)}\n'
         )
+        _f.write(f'- contact_velocity_mode: {_contact_velocity_mode}\n')
         _f.write(
             f'- contact_bias_scale: '
             f'{args.model_config.get("contact_bias_scale", 1.0)}\n\n'
@@ -705,9 +714,9 @@ if __name__ == "__main__":
     parser.add_argument(
         '--contact-feature-mask',
         type=float,
-        nargs=3,
+        nargs='+',
         default=None,
-        metavar=('GAP', 'VELOCITY', 'PROXIMITY'),
+        metavar='FEATURE',
         help='Eval-only contact feature mask; training ablations must record it in YAML.',
     )
     parser.add_argument(

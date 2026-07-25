@@ -8,6 +8,28 @@ import numpy as np
 import torch
 
 
+CONTACT_FEATURE_NAMES = {
+    "vertical": ("signed_gap", "vertical_displacement", "proximity"),
+    "xyz": (
+        "signed_gap",
+        "displacement_x",
+        "displacement_y",
+        "displacement_z",
+        "proximity",
+    ),
+}
+
+
+def contact_feature_names(velocity_mode: str):
+    try:
+        return CONTACT_FEATURE_NAMES[velocity_mode]
+    except KeyError as exc:
+        raise ValueError(
+            "contact_velocity_mode must be one of "
+            f"{tuple(CONTACT_FEATURE_NAMES)}; got {velocity_mode!r}"
+        ) from exc
+
+
 def _floor_for_points(floor_height: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
     floor = torch.as_tensor(floor_height, device=points.device, dtype=points.dtype)
     if floor.numel() != points.shape[0]:
@@ -23,8 +45,9 @@ def build_contact_features(
     floor_height: torch.Tensor,
     start_velocity: Optional[torch.Tensor] = None,
     sigma: float = 0.04,
+    velocity_mode: str = "vertical",
 ) -> torch.Tensor:
-    """Build per-particle ``[signed gap, vertical velocity, proximity]`` features.
+    """Build per-particle boundary-relative position and displacement features.
 
     ``points`` and ``floor_height`` must already be in the same normalized coordinate
     system. Proximity is one for penetrating particles and decays above the floor.
@@ -33,13 +56,14 @@ def build_contact_features(
         raise ValueError(f"points must have shape (B,F,N,3+); got {tuple(points.shape)}")
     if sigma <= 0:
         raise ValueError(f"sigma must be positive; got {sigma}")
+    contact_feature_names(velocity_mode)
 
     floor = _floor_for_points(floor_height, points)
     signed_gap = points[..., 1:2] - floor
 
-    vertical_velocity = torch.zeros_like(signed_gap)
+    displacement = torch.zeros_like(points[..., :3])
     if points.shape[1] > 1:
-        vertical_velocity[:, 1:] = points[:, 1:, :, 1:2] - points[:, :-1, :, 1:2]
+        displacement[:, 1:] = points[:, 1:, :, :3] - points[:, :-1, :, :3]
 
     if start_velocity is not None:
         velocity = start_velocity
@@ -54,34 +78,35 @@ def build_contact_features(
             raise ValueError(
                 f"start_velocity must have shape (B,N,3); got {tuple(velocity.shape)}"
             )
-        vertical_velocity[:, 0] = velocity[..., 1:2].to(vertical_velocity)
+        displacement[:, 0] = velocity[..., :3].to(displacement)
     elif points.shape[1] > 1:
-        vertical_velocity[:, 0] = vertical_velocity[:, 1]
+        displacement[:, 0] = displacement[:, 1]
 
     scaled_gap = torch.relu(signed_gap) / float(sigma)
     proximity = torch.exp(-(scaled_gap * scaled_gap))
-    return torch.cat([signed_gap, vertical_velocity, proximity], dim=-1)
+    motion = displacement if velocity_mode == "xyz" else displacement[..., 1:2]
+    return torch.cat([signed_gap, motion, proximity], dim=-1)
 
 
 def apply_contact_feature_mask(
     features: torch.Tensor,
-    feature_mask=(1.0, 1.0, 1.0),
+    feature_mask=None,
 ) -> torch.Tensor:
-    """Apply a shared ``[gap, velocity, proximity]`` ablation mask."""
-    if features.shape[-1] != 3:
-        raise ValueError(
-            f"contact features must have 3 channels; got {features.shape[-1]}"
-        )
+    """Apply a feature-wise ablation mask shared across frames and particles."""
+    feature_dim = features.shape[-1]
+    if feature_mask is None:
+        feature_mask = [1.0] * feature_dim
     mask = torch.as_tensor(
         feature_mask,
         device=features.device,
         dtype=features.dtype,
     )
-    if mask.numel() != 3:
+    if mask.numel() != feature_dim:
         raise ValueError(
-            f"contact_feature_mask must contain 3 values; got {mask.numel()}"
+            f"contact_feature_mask must contain {feature_dim} values; "
+            f"got {mask.numel()}"
         )
-    return features * mask.reshape(1, 1, 1, 3)
+    return features * mask.reshape(1, 1, 1, feature_dim)
 
 
 def contact_channel_contributions(
@@ -89,16 +114,14 @@ def contact_channel_contributions(
     encoder_weight: torch.Tensor,
 ) -> torch.Tensor:
     """Estimate each input channel's mean hidden-vector magnitude."""
-    if features.shape[-1] != 3:
+    feature_dim = features.shape[-1]
+    if encoder_weight.ndim != 2 or encoder_weight.shape[1] != feature_dim:
         raise ValueError(
-            f"contact features must have 3 channels; got {features.shape[-1]}"
-        )
-    if encoder_weight.ndim != 2 or encoder_weight.shape[1] != 3:
-        raise ValueError(
-            "contact encoder weight must have shape (hidden_dim, 3); "
+            "contact encoder weight must have shape "
+            f"(hidden_dim, {feature_dim}); "
             f"got {tuple(encoder_weight.shape)}"
         )
-    mean_abs = features.abs().reshape(-1, 3).mean(dim=0)
+    mean_abs = features.abs().reshape(-1, feature_dim).mean(dim=0)
     column_norms = torch.linalg.vector_norm(
         encoder_weight.to(features),
         dim=0,

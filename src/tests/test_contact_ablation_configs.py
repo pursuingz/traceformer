@@ -161,6 +161,62 @@ class ContactAblationConfigTests(unittest.TestCase):
             ),
         )
 
+    def test_vxyz_arm_changes_only_velocity_representation_and_screening_fields(self):
+        baseline = _load_structured(
+            "config_mm3_contact_cond.yaml",
+            TrainingConfig,
+        )
+        arm = _load_structured(
+            "config_mm3_contact_vxyz.yaml",
+            TrainingConfig,
+        )
+        ignored = {
+            "output_dir",
+            "stop_after_steps",
+            "model_config.contact_velocity_mode",
+        }
+
+        self.assertEqual(arm.max_train_steps, 90000)
+        self.assertEqual(arm.stop_after_steps, 45000)
+        self.assertEqual(arm.model_config.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            _without_paths(arm, ignored),
+            _without_paths(baseline, ignored),
+        )
+
+        arm.model_config.cond_frames = arm.get("input_frames", 5)
+        model = MDM_ST(
+            8,
+            arm.output_frames,
+            n_feats=3,
+            model_config=arm.model_config,
+        )
+        self.assertEqual(model.contact_encoder.in_features, 5)
+        self.assertEqual(model.contact_encoder.out_features, 256)
+
+    def test_vxyz_eval_mirrors_training_model_and_45k_checkpoint(self):
+        baseline = OmegaConf.load(CONFIG_DIR / "eval_mm3_contact_cond_45k.yaml")
+        cfg = _load_structured(
+            "eval_mm3_contact_vxyz_45k.yaml",
+            TestingConfig,
+        )
+        plain = OmegaConf.load(CONFIG_DIR / "eval_mm3_contact_vxyz_45k.yaml")
+        ignored = {
+            "resume",
+            "vis_dir",
+            "model_config.contact_velocity_mode",
+        }
+
+        self.assertEqual(cfg.model_config.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            cfg.resume,
+            "outputs/mm3_contact_vxyz_8L/checkpoint-45000/model.safetensors",
+        )
+        self.assertEqual(
+            _without_paths(plain, ignored),
+            _without_paths(baseline, ignored),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

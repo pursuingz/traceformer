@@ -12,6 +12,7 @@ from options import TestingConfig
 from utils.contact import (
     build_contact_features,
     contact_channel_contributions,
+    contact_feature_names,
 )
 
 
@@ -21,9 +22,6 @@ MATERIAL_NAMES = {
     2: "sand",
     3: "rigid",
 }
-FEATURE_NAMES = ("signed_gap", "vertical_displacement", "proximity")
-
-
 def _state_tensor_by_suffix(state, suffix):
     matches = [value for key, value in state.items() if key.endswith(suffix)]
     if len(matches) != 1:
@@ -46,8 +44,9 @@ def _quantile_text(values):
     )
 
 
-def collect_grouped_features(loader, sigma):
+def collect_grouped_features(loader, sigma, velocity_mode="vertical"):
     """Collect raw contact features by material from TrajDataset batches."""
+    feature_dim = len(contact_feature_names(velocity_mode))
     grouped_features = defaultdict(list)
     for batch, _ in loader:
         features = build_contact_features(
@@ -55,12 +54,15 @@ def collect_grouped_features(loader, sigma):
             batch["floor_height"].float(),
             start_velocity=batch.get("start_vel"),
             sigma=sigma,
+            velocity_mode=velocity_mode,
         )
         material = batch.get("mat_type")
         if material is None:
             material = torch.zeros(features.shape[0], dtype=torch.long)
         for index, mat_type in enumerate(material.reshape(-1).tolist()):
-            grouped_features[int(mat_type)].append(features[index].reshape(-1, 3))
+            grouped_features[int(mat_type)].append(
+                features[index].reshape(-1, feature_dim)
+            )
     return grouped_features
 
 
@@ -80,9 +82,16 @@ def main(cfg):
     bias = _state_tensor_by_suffix(state, "contact_encoder.bias")
 
     sigma = float(cfg.model_config.get("contact_feature_sigma", 0.04))
-    grouped_features = collect_grouped_features(loader, sigma)
+    velocity_mode = cfg.model_config.get("contact_velocity_mode", "vertical")
+    feature_names = contact_feature_names(velocity_mode)
+    grouped_features = collect_grouped_features(
+        loader,
+        sigma,
+        velocity_mode=velocity_mode,
+    )
     print("===== contact feature diagnostics =====")
     print(f"checkpoint: {cfg.resume}")
+    print(f"contact velocity mode: {velocity_mode}")
     print(f"encoder weight column norms: {torch.linalg.vector_norm(weight, dim=0).tolist()}")
     print(f"encoder bias norm: {torch.linalg.vector_norm(bias).item():.6g}")
 
@@ -90,25 +99,24 @@ def main(cfg):
         features = torch.cat(grouped_features[mat_type], dim=0)
         contributions = contact_channel_contributions(features, weight)
         gap = features[:, 0]
-        velocity = features[:, 1]
-        proximity = features[:, 2]
+        proximity = features[:, -1]
         print(
             f"\n--- {MATERIAL_NAMES.get(mat_type, 'unknown')}"
             f" (mat_type={mat_type}, tokens={features.shape[0]}) ---"
         )
-        print(
-            f"signed_gap: mean={gap.mean().item():.6g} "
-            f"std={gap.std(unbiased=False).item():.6g} {_quantile_text(gap)}"
-        )
-        print(
-            f"vertical_displacement: mean={velocity.mean().item():.6g} "
-            f"std={velocity.std(unbiased=False).item():.6g} "
-            f"{_quantile_text(velocity)}"
-        )
-        print(
-            f"proximity: mean={proximity.mean().item():.6g} "
-            f"nonzero={(proximity > 0).float().mean().item() * 100:.3f}%"
-        )
+        for index, name in enumerate(feature_names):
+            values = features[:, index]
+            if name == "proximity":
+                print(
+                    f"{name}: mean={values.mean().item():.6g} "
+                    f"nonzero={(values > 0).float().mean().item() * 100:.3f}%"
+                )
+            else:
+                print(
+                    f"{name}: mean={values.mean().item():.6g} "
+                    f"std={values.std(unbiased=False).item():.6g} "
+                    f"{_quantile_text(values)}"
+                )
         print(
             f"contact-band fraction(gap <= sigma={sigma:g}): "
             f"{(gap <= sigma).float().mean().item() * 100:.3f}%"
@@ -118,7 +126,7 @@ def main(cfg):
             + ", ".join(
                 f"{name}={value:.6g}"
                 for name, value in zip(
-                    FEATURE_NAMES,
+                    feature_names,
                     contributions.tolist(),
                 )
             )
