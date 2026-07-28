@@ -5,7 +5,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from model.spacetime import MDM_ST
-from options import TrainingConfig
+from options import TestingConfig, TrainingConfig
 
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -96,12 +96,13 @@ class Mm1ContactCondConfigTests(unittest.TestCase):
             "config_mm1_contact_cond.yaml",
             TrainingConfig,
         )
-        eval_cfg = OmegaConf.load(
-            CONFIG_DIR / "eval_mm1_contact_cond_45k.yaml"
+        eval_cfg = _load_structured(
+            "eval_mm1_contact_cond_45k.yaml",
+            TestingConfig,
         )
-        baseline_eval = OmegaConf.load(
-            CONFIG_DIR
-            / "eval_diffE2048_singleframe_geom_deform_d0001.yaml"
+        baseline_eval = _load_structured(
+            "eval_diffE2048_singleframe_geom_deform_d0001.yaml",
+            TestingConfig,
         )
         ignored = {
             "resume",
