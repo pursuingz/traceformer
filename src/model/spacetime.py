@@ -17,12 +17,17 @@ from utils.contact import (
 )
 
 class PointEmbed(nn.Module):
-    def __init__(self, hidden_dim=96, dim=512):
+    def __init__(self, hidden_dim=96, dim=512, extra_feature_dim=0):
         super().__init__()
 
         assert hidden_dim % 6 == 0
+        if extra_feature_dim < 0:
+            raise ValueError(
+                f"extra_feature_dim must be non-negative; got {extra_feature_dim}"
+            )
 
         self.embedding_dim = hidden_dim
+        self.extra_feature_dim = extra_feature_dim
         e = torch.pow(2, torch.arange(self.embedding_dim // 6)).float() * np.pi
         e = torch.stack([
             torch.cat([e, torch.zeros(self.embedding_dim // 6),
@@ -34,7 +39,12 @@ class PointEmbed(nn.Module):
         ])
         self.register_buffer('basis', e)  # 3 x 16
 
-        self.mlp = nn.Linear(self.embedding_dim+3, dim)
+        self.mlp = nn.Linear(
+            self.embedding_dim + 3 + self.extra_feature_dim,
+            dim,
+        )
+        if self.extra_feature_dim > 0:
+            nn.init.zeros_(self.mlp.weight[:, -self.extra_feature_dim:])
 
     @staticmethod
     def embed(input, basis):
@@ -43,9 +53,34 @@ class PointEmbed(nn.Module):
         embeddings = torch.cat([projections.sin(), projections.cos()], dim=2)
         return embeddings
     
-    def forward(self, input):
+    def forward(self, input, extra_features=None):
         # input: B x N x 3
-        embed = self.mlp(torch.cat([self.embed(input, self.basis), input], dim=2)) # B x N x C
+        point_features = [self.embed(input, self.basis), input]
+        if self.extra_feature_dim > 0:
+            if extra_features is None:
+                raise ValueError(
+                    "extra_features are required when extra_feature_dim is positive"
+                )
+            if (
+                extra_features.ndim != input.ndim
+                or extra_features.shape[:-1] != input.shape[:-1]
+            ):
+                raise ValueError(
+                    "extra_features batch/token dimensions must match input; "
+                    f"got {tuple(extra_features.shape)} and {tuple(input.shape)}"
+                )
+            if extra_features.shape[-1] != self.extra_feature_dim:
+                raise ValueError(
+                    "extra_features last dimension must equal "
+                    f"extra_feature_dim={self.extra_feature_dim}; "
+                    f"got {extra_features.shape[-1]}"
+                )
+            point_features.append(extra_features)
+        elif extra_features is not None:
+            raise ValueError(
+                "extra_features must not be provided when extra_feature_dim is zero"
+            )
+        embed = self.mlp(torch.cat(point_features, dim=2)) # B x N x C
         return embed
 
 class AdaLayerNorm(nn.Module):
@@ -2508,9 +2543,57 @@ class MDM_ST(nn.Module):
         self.cond_frame = model_config.get('cond_frames', 1 if model_config.frame_cond else 0)
         self.physical_history_frames = self.cond_frame
         self.frame_cond = model_config.frame_cond
+        self.contact_particle_cond = model_config.get(
+            'contact_particle_cond',
+            False,
+        )
+        self.contact_injection_mode = model_config.get(
+            'contact_injection_mode',
+            'separate',
+        )
+        if self.contact_injection_mode not in ('separate', 'shared'):
+            raise ValueError(
+                "contact_injection_mode must be either 'separate' or 'shared'; "
+                f"got {self.contact_injection_mode!r}"
+            )
+        self.contact_velocity_mode = model_config.get(
+            'contact_velocity_mode',
+            'vertical',
+        )
+        self.contact_feature_names = contact_feature_names(
+            self.contact_velocity_mode
+        )
+        point_embed = model_config.get('point_embed', True)
+        self.force_as_latent = model_config.get('force_as_latent', False)
+        if self.contact_injection_mode == 'shared':
+            if not self.contact_particle_cond:
+                raise ValueError(
+                    "contact_injection_mode='shared' requires "
+                    "contact_particle_cond=true"
+                )
+            if self.contact_velocity_mode != 'vertical':
+                raise ValueError(
+                    "contact_injection_mode='shared' requires "
+                    "contact_velocity_mode='vertical'"
+                )
+            if not point_embed:
+                raise ValueError(
+                    "contact_injection_mode='shared' requires point_embed=true"
+                )
+            if self.force_as_latent:
+                raise ValueError(
+                    "contact_injection_mode='shared' requires "
+                    "force_as_latent=false"
+                )
 
-        if model_config.get('point_embed', True):
-            self.input_encoder = PointEmbed(dim=self.latent_dim)
+        if point_embed:
+            extra_feature_dim = (
+                3 if self.contact_injection_mode == 'shared' else 0
+            )
+            self.input_encoder = PointEmbed(
+                dim=self.latent_dim,
+                extra_feature_dim=extra_feature_dim,
+            )
         else:
             print('not using point embedding')
             self.input_encoder = nn.Linear(n_feats, self.latent_dim)
@@ -2532,7 +2615,6 @@ class MDM_ST(nn.Module):
         self.E_cond_encoder = nn.Linear(1, self.latent_dim)
         self.nu_cond_encoder = nn.Linear(1, self.latent_dim)
         self.force_as_token = model_config.get('force_as_token', True)
-        self.force_as_latent = model_config.get('force_as_latent', False)
 
         if self.force_as_latent:
             self.input_encoder = nn.Linear(n_feats + 4 * self.max_num_forces, self.latent_dim)
@@ -2565,15 +2647,7 @@ class MDM_ST(nn.Module):
 
         self.class_dropout_prob = model_config.get('class_dropout_prob', 0.0)
         self.start_vel_encoder = nn.Linear(3, self.latent_dim)
-        self.contact_particle_cond = model_config.get('contact_particle_cond', False)
         self.contact_feature_sigma = model_config.get('contact_feature_sigma', 0.04)
-        self.contact_velocity_mode = model_config.get(
-            'contact_velocity_mode',
-            'vertical',
-        )
-        self.contact_feature_names = contact_feature_names(
-            self.contact_velocity_mode
-        )
         default_contact_mask = [1.0] * len(self.contact_feature_names)
         self.contact_feature_mask = tuple(
             float(value)
@@ -2592,7 +2666,10 @@ class MDM_ST(nn.Module):
         self.contact_bias_scale = float(
             model_config.get('contact_bias_scale', 1.0)
         )
-        if self.contact_particle_cond:
+        if (
+            self.contact_particle_cond
+            and self.contact_injection_mode == 'separate'
+        ):
             self.contact_encoder = nn.Linear(
                 len(self.contact_feature_names),
                 self.latent_dim,
@@ -2777,9 +2854,64 @@ class MDM_ST(nn.Module):
             all_force = all_force.unsqueeze(1).repeat(1, x.shape[1], 1, 1) # (B, n_frame, n_points, n_forces*4)
             x = torch.cat([x, all_force], dim=-1) # (B, n_frame, n_points, n_feats+n_forces * 4)
             n_feats = x.shape[-1]
-        hidden_states = self.input_encoder(x.reshape(-1, n_points,
-            n_feats)).reshape(bs, -1, n_points, self.latent_dim)
-        if self.contact_particle_cond:
+        shared_contact_features = None
+        if (
+            self.contact_particle_cond
+            and self.contact_injection_mode == 'shared'
+        ):
+            if floor_height is None:
+                raise ValueError("contact_particle_cond requires floor_height")
+            contact_features = build_contact_features(
+                init_pc_cond,
+                floor_height,
+                start_velocity=start_vel,
+                sigma=self.contact_feature_sigma,
+                velocity_mode=self.contact_velocity_mode,
+            )
+            contact_features = apply_contact_feature_mask(
+                contact_features,
+                self.contact_feature_mask,
+            ).to(x)
+            n_contact_frames = (
+                contact_features.shape[1] if self.frame_cond else 0
+            )
+            if n_contact_frames > x.shape[1]:
+                raise ValueError(
+                    "contact condition frames exceed available input frame slots"
+                )
+            zero_features = contact_features.new_zeros(
+                bs,
+                x.shape[1] - n_contact_frames,
+                n_points,
+                contact_features.shape[-1],
+            )
+            shared_contact_features = torch.cat(
+                [contact_features[:, :n_contact_frames], zero_features],
+                dim=1,
+            )
+
+        flat_x = x.reshape(-1, n_points, n_feats)
+        if shared_contact_features is None:
+            hidden_states = self.input_encoder(flat_x)
+        else:
+            hidden_states = self.input_encoder(
+                flat_x,
+                extra_features=shared_contact_features.reshape(
+                    -1,
+                    n_points,
+                    shared_contact_features.shape[-1],
+                ),
+            )
+        hidden_states = hidden_states.reshape(
+            bs,
+            -1,
+            n_points,
+            self.latent_dim,
+        )
+        if (
+            self.contact_particle_cond
+            and self.contact_injection_mode == 'separate'
+        ):
             if floor_height is None:
                 raise ValueError("contact_particle_cond requires floor_height")
             contact_features = build_contact_features(
