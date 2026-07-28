@@ -91,6 +91,46 @@ class Mm1ContactCondConfigTests(unittest.TestCase):
         self.assertEqual(arm_model.contact_encoder.in_features, 3)
         self.assertEqual(arm_model.contact_encoder.out_features, 256)
 
+    def test_eval_mirrors_training_and_uses_diffE2048_test_split(self):
+        train_cfg = _load_structured(
+            "config_mm1_contact_cond.yaml",
+            TrainingConfig,
+        )
+        eval_cfg = OmegaConf.load(
+            CONFIG_DIR / "eval_mm1_contact_cond_45k.yaml"
+        )
+        baseline_eval = OmegaConf.load(
+            CONFIG_DIR
+            / "eval_diffE2048_singleframe_geom_deform_d0001.yaml"
+        )
+        ignored = {
+            "resume",
+            "vis_dir",
+            "model_config.contact_particle_cond",
+            "model_config.contact_injection_mode",
+            "model_config.contact_velocity_mode",
+            "model_config.contact_feature_sigma",
+        }
+
+        self.assertEqual(
+            eval_cfg.resume,
+            "outputs/mm1_contact_cond_8L/"
+            "checkpoint-45000/model.safetensors",
+        )
+        self.assertEqual(
+            eval_cfg.train_dataset.dataset_path,
+            "diff_E_2048_data/2048_data/2048_test",
+        )
+        self.assertEqual(
+            OmegaConf.to_container(eval_cfg.model_config, resolve=True),
+            OmegaConf.to_container(train_cfg.model_config, resolve=True),
+        )
+        self.assertEqual(eval_cfg.output_frames, train_cfg.output_frames)
+        self.assertEqual(
+            _without_paths(eval_cfg, ignored),
+            _without_paths(baseline_eval, ignored),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
