@@ -211,11 +211,72 @@ def main():
         8,
         contact_particle_cond=True,
         contact_feature_sigma=0.04,
+        contact_injection_mode='separate',
     )
-    contact_delta = count(contact_model) - count(baseline_contact_ref)
+    shared_contact_model = build(
+        'SpatialTemporalTransformerBlock',
+        8,
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='shared',
+    )
+    baseline_contact_total = count(baseline_contact_ref)
+    contact_total = count(contact_model)
+    shared_contact_total = count(shared_contact_model)
+    contact_delta = contact_total - baseline_contact_total
+    shared_contact_delta = shared_contact_total - baseline_contact_total
+    shared_vs_separate_delta = shared_contact_total - contact_total
+    contact_encoder = getattr(contact_model, 'contact_encoder', None)
+    condition_frame_bias = getattr(contact_encoder, 'bias', None)
+    if condition_frame_bias is None:
+        raise RuntimeError(
+            'separate contact model must expose contact_encoder.bias for the '
+            'condition-frame-only parameter budget'
+        )
+    condition_frame_bias_params = condition_frame_bias.numel()
+    expected_contact_deltas = {
+        'separate relative to no-contact baseline': 1024,
+        'shared relative to no-contact baseline': 768,
+        'shared relative to separate contact': -256,
+        'separate-only condition-frame bias': 256,
+    }
+    actual_contact_deltas = {
+        'separate relative to no-contact baseline': contact_delta,
+        'shared relative to no-contact baseline': shared_contact_delta,
+        'shared relative to separate contact': shared_vs_separate_delta,
+        'separate-only condition-frame bias': condition_frame_bias_params,
+    }
+    mismatches = [
+        f'{name}: expected {expected:+d}, got {actual_contact_deltas[name]:+d}'
+        for name, expected in expected_contact_deltas.items()
+        if actual_contact_deltas[name] != expected
+    ]
+    if shared_vs_separate_delta != -condition_frame_bias_params:
+        mismatches.append(
+            'shared/separate delta must equal the negative separate-only '
+            'condition-frame bias size: '
+            f'{shared_vs_separate_delta:+d} != {-condition_frame_bias_params:+d}'
+        )
+    if mismatches:
+        raise RuntimeError(
+            'contact parameter budget drifted; '
+            + '; '.join(mismatches)
+        )
     print(
-        'v1 serial + contact cond 8L: '
-        f'total={count(contact_model)/1e6:.3f}M  delta={contact_delta} params'
+        'v1 serial + separate contact 8L: '
+        f'total={contact_total:,} ({contact_total/1e6:.3f}M)  '
+        f'delta-vs-no-contact={contact_delta:+,} params'
+    )
+    print(
+        'v1 serial + shared contact 8L: '
+        f'total={shared_contact_total:,} ({shared_contact_total/1e6:.3f}M)  '
+        f'delta-vs-no-contact={shared_contact_delta:+,} params  '
+        f'delta-vs-separate={shared_vs_separate_delta:+,} params'
+    )
+    print(
+        'separate/shared difference: '
+        f'{condition_frame_bias_params:,}-parameter separate-only '
+        'condition-frame bias'
     )
     contact_xyz_model = build(
         'SpatialTemporalTransformerBlock',
