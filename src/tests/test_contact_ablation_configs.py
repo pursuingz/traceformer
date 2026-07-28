@@ -217,6 +217,95 @@ class ContactAblationConfigTests(unittest.TestCase):
             _without_paths(baseline, ignored),
         )
 
+    def test_shared_training_changes_only_injection_and_screening_fields(self):
+        baseline_plain = OmegaConf.load(
+            CONFIG_DIR / "config_mm3_contact_cond.yaml"
+        )
+        baseline = _load_structured(
+            "config_mm3_contact_cond.yaml",
+            TrainingConfig,
+        )
+        arm = _load_structured(
+            "config_mm3_contact_concat.yaml",
+            TrainingConfig,
+        )
+        ignored = {
+            "output_dir",
+            "stop_after_steps",
+            "model_config.contact_injection_mode",
+        }
+
+        self.assertNotIn(
+            "contact_injection_mode",
+            baseline_plain.model_config,
+        )
+        self.assertEqual(arm.output_dir, "./outputs/mm3_contact_concat_8L")
+        self.assertEqual(arm.max_train_steps, 90000)
+        self.assertEqual(arm.stop_after_steps, 45000)
+        self.assertEqual(arm.model_config.contact_injection_mode, "shared")
+        self.assertEqual(
+            _without_paths(arm, ignored),
+            _without_paths(baseline, ignored),
+        )
+
+        baseline.model_config.cond_frames = baseline.get("input_frames", 5)
+        baseline_model = MDM_ST(
+            8,
+            baseline.output_frames,
+            n_feats=3,
+            model_config=baseline.model_config,
+        )
+        self.assertEqual(baseline_model.contact_injection_mode, "separate")
+        self.assertTrue(hasattr(baseline_model, "contact_encoder"))
+
+        arm.model_config.cond_frames = arm.get("input_frames", 5)
+        model = MDM_ST(
+            8,
+            arm.output_frames,
+            n_feats=3,
+            model_config=arm.model_config,
+        )
+        self.assertEqual(model.contact_injection_mode, "shared")
+        self.assertFalse(hasattr(model, "contact_encoder"))
+        self.assertEqual(model.input_encoder.mlp.in_features, 102)
+
+    def test_shared_eval_mirrors_contact_anchor_except_declared_fields(self):
+        baseline_plain = OmegaConf.load(
+            CONFIG_DIR / "eval_mm3_contact_cond_45k.yaml"
+        )
+        arm_plain = OmegaConf.load(
+            CONFIG_DIR / "eval_mm3_contact_concat_45k.yaml"
+        )
+        baseline = _load_structured(
+            "eval_mm3_contact_cond_45k.yaml",
+            TestingConfig,
+        )
+        arm = _load_structured(
+            "eval_mm3_contact_concat_45k.yaml",
+            TestingConfig,
+        )
+        ignored = {
+            "resume",
+            "vis_dir",
+            "model_config.contact_injection_mode",
+        }
+
+        self.assertEqual(
+            arm.resume,
+            "outputs/mm3_contact_concat_8L/"
+            "checkpoint-45000/model.safetensors",
+        )
+        self.assertEqual(arm.vis_dir, "vis_results_mm3_contact_concat_45k")
+        self.assertEqual(arm.model_config.contact_injection_mode, "shared")
+        self.assertEqual(
+            _without_paths(arm_plain, ignored),
+            _without_paths(baseline_plain, ignored),
+        )
+        self.assertEqual(
+            _without_paths(arm, ignored),
+            _without_paths(baseline, ignored),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
