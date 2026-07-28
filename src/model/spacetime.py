@@ -39,12 +39,21 @@ class PointEmbed(nn.Module):
         ])
         self.register_buffer('basis', e)  # 3 x 16
 
-        self.mlp = nn.Linear(
-            self.embedding_dim + 3 + self.extra_feature_dim,
-            dim,
-        )
-        if self.extra_feature_dim > 0:
-            nn.init.zeros_(self.mlp.weight[:, -self.extra_feature_dim:])
+        base_feature_dim = self.embedding_dim + 3
+        legacy_mlp = nn.Linear(base_feature_dim, dim)
+        if self.extra_feature_dim == 0:
+            self.mlp = legacy_mlp
+        else:
+            # The expanded layer must not consume RNG beyond the legacy layer.
+            with torch.random.fork_rng(devices=[]):
+                self.mlp = nn.Linear(
+                    base_feature_dim + self.extra_feature_dim,
+                    dim,
+                )
+            with torch.no_grad():
+                self.mlp.weight[:, :base_feature_dim].copy_(legacy_mlp.weight)
+                self.mlp.weight[:, base_feature_dim:].zero_()
+                self.mlp.bias.copy_(legacy_mlp.bias)
 
     @staticmethod
     def embed(input, basis):
@@ -2571,6 +2580,10 @@ class MDM_ST(nn.Module):
                     "contact_injection_mode='shared' requires "
                     "contact_particle_cond=true"
                 )
+            if not self.frame_cond:
+                raise ValueError(
+                    "contact_injection_mode='shared' requires frame_cond=true"
+                )
             if self.contact_velocity_mode != 'vertical':
                 raise ValueError(
                     "contact_injection_mode='shared' requires "
@@ -2872,9 +2885,7 @@ class MDM_ST(nn.Module):
                 contact_features,
                 self.contact_feature_mask,
             ).to(x)
-            n_contact_frames = (
-                contact_features.shape[1] if self.frame_cond else 0
-            )
+            n_contact_frames = contact_features.shape[1]
             if n_contact_frames > x.shape[1]:
                 raise ValueError(
                     "contact condition frames exceed available input frame slots"

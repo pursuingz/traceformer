@@ -83,6 +83,56 @@ class PointEmbedTests(unittest.TestCase):
             0,
         )
 
+    def test_extra_features_preserve_legacy_initialization_and_rng(self):
+        seed = 1234
+        torch.manual_seed(seed)
+        legacy_encoder = PointEmbed(
+            hidden_dim=96,
+            dim=64,
+            extra_feature_dim=0,
+        )
+        legacy_rng_state = torch.random.get_rng_state()
+
+        torch.manual_seed(seed)
+        shared_encoder = PointEmbed(
+            hidden_dim=96,
+            dim=64,
+            extra_feature_dim=3,
+        )
+        shared_rng_state = torch.random.get_rng_state()
+
+        torch.testing.assert_close(
+            shared_encoder.mlp.weight[:, :99],
+            legacy_encoder.mlp.weight,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            shared_encoder.mlp.bias,
+            legacy_encoder.mlp.bias,
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(shared_encoder.mlp.weight[:, 99:]).item(),
+            0,
+        )
+        torch.testing.assert_close(
+            shared_rng_state,
+            legacy_rng_state,
+            rtol=0,
+            atol=0,
+        )
+
+        points = torch.linspace(-1.0, 1.0, steps=24).reshape(2, 4, 3)
+        extra_features = torch.zeros(2, 4, 3)
+        torch.testing.assert_close(
+            shared_encoder(points, extra_features=extra_features),
+            legacy_encoder(points),
+            rtol=0,
+            atol=0,
+        )
+
     def test_zero_initialized_extra_features_preserve_output(self):
         torch.manual_seed(0)
         encoder = PointEmbed(hidden_dim=96, dim=64, extra_feature_dim=3)
@@ -360,6 +410,14 @@ class ContactFeatureTests(unittest.TestCase):
         cfg.point_embed = False
 
         with self.assertRaisesRegex(ValueError, "point_embed"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_shared_contact_rejects_disabled_frame_conditioning(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        cfg.frame_cond = False
+
+        with self.assertRaisesRegex(ValueError, "frame_cond"):
             MDM_ST(8, 1, n_feats=3, model_config=cfg)
 
     def test_contact_model_rejects_unknown_injection_mode(self):
