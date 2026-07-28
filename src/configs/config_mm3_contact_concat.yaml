@@ -1,18 +1,9 @@
-# 多材质(mm3 = elastic/plasticine/sand)臂 A:我们的方法(sfG + boundary loss_F,单帧 AR)。
-# 完全复制 config_diffE2048_singleframe_geom_deform_d0001.yaml(elastic 单材质 SOTA 臂),改 5 处:
-#   1. output_dir(独立目录,防 resume 污染)
-#   2. train_dataset.dataset_path: 2048_train → mm3_data/mm3_train(782 h5 = elastic 254(30xxx 段)
-#      + plasticine 263(40xxx 段)+ sand 265(45xxx-49xxx 段);三材质 uid 段不同,split 见
-#      configs/mm3_test_split.json;elastic 子集 = 原 2048_train 同一批文件 → 泛化税测量)
-#   3. geom_elastic_only: true —— 弹性先验损失(laplacian/edge/deform)只作用 mat_type==0 样本:
-#      edge/laplacian 假设邻边保持(sand 颗粒流动、塑性屈服破坏之),DeformLoss 按弹性本构写
-#   4. model_config.num_mat: 4 + class_token: true —— 材质类别 token(原论文槽位,index 3=rigid 空置)
-#   5. model_config.gravity_emb: true —— 必须:plasticine/sand 带重力、elastic 不带,混合数据里
-#      模型必须看到 gravity 标志(spacetime.py 仅 gravity_emb=true 时注入)
-# 其余(损失权重/步数/lr/batch/架构/split)全部冻结 = diffE2048 elastic 臂。
-# 对照臂 = config_mm3_physctrl_orig.yaml(同数据同架构同 90000 步,@checkpoint-90000 对比)。
-# ⚠️ step-2000 检查 loss_deform/xyz 比值仍落 0.1~0.5×(gating 后 loss_F 只作用 ~1/3 样本);漂出即重校 λ。
-# C2: contact particle conditioning only; training distribution/losses stay baseline.
+# Contact Shared Encoder 的 45k screening 训练臂。
+# Anchor = config_mm3_contact_cond.yaml，仅允许三处差异：
+#   1. output_dir 使用独立目录，避免 checkpoint 混用；
+#   2. stop_after_steps=45000，仅提前停止，max_train_steps=90000 保持 scheduler horizon；
+#   3. model_config.contact_injection_mode=shared，比较 contact 特征注入方式。
+# 其余数据、损失、优化器、训练步数和模型结构均与 anchor 冻结一致。
 image_size: 128
 output_dir: ./outputs/mm3_contact_concat_8L  # 独立目录，避免与 separate baseline 的 checkpoint 混用
 seed: 0

@@ -313,6 +313,50 @@ class ContactAblationConfigTests(unittest.TestCase):
             _without_paths(baseline, ignored),
         )
 
+    def test_shared_eval_directly_mirrors_resolved_training_config(self):
+        train = OmegaConf.load(
+            CONFIG_DIR / "config_mm3_contact_concat.yaml"
+        )
+        eval_cfg = OmegaConf.load(
+            CONFIG_DIR / "eval_mm3_contact_concat_45k.yaml"
+        )
+        OmegaConf.resolve(train)
+        OmegaConf.resolve(eval_cfg)
+
+        self.assertEqual(
+            OmegaConf.to_container(eval_cfg.model_config, resolve=True),
+            OmegaConf.to_container(train.model_config, resolve=True),
+        )
+
+        train_dataset_keys = set(train.train_dataset.keys())
+        eval_dataset_keys = set(eval_cfg.train_dataset.keys())
+        self.assertEqual(train_dataset_keys - eval_dataset_keys, set())
+        self.assertEqual(
+            eval_dataset_keys - train_dataset_keys,
+            {"input_frames", "output_frames"},
+        )
+        self.assertEqual(
+            train.train_dataset.dataset_path,
+            "mm3_data/mm3_train",
+        )
+        self.assertEqual(
+            eval_cfg.train_dataset.dataset_path,
+            "mm3_data/mm3_test",
+        )
+        self.assertEqual(
+            eval_cfg.train_dataset.input_frames,
+            train.get("input_frames", 5),
+        )
+        self.assertEqual(
+            eval_cfg.train_dataset.output_frames,
+            train.output_frames,
+        )
+        ignored = {"dataset_path", "input_frames", "output_frames"}
+        self.assertEqual(
+            _without_paths(eval_cfg.train_dataset, ignored),
+            _without_paths(train.train_dataset, ignored),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

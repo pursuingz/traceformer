@@ -1,9 +1,7 @@
-# Matched-step anchor for the full contact-conditioning model.
-# Eval config for 多材质臂 A(mm3,sfG + loss_F 单帧 AR)。
-# 严格镜像 config_mm3_singleframe_geom_deform_d0001.yaml 的 model_config 与 train_dataset,
-# 只差 resume / vis_dir / split(_test 结尾 → traj_dataset 取全部当 test split,41 h5 = elastic 13 + plasticine 14 + sand 14,split 见 configs/mm3_test_split.json)。
-# eval.py 自动输出 per-material 分组(elastic/plasticine/sand 各一段;跨材质单标量禁止)。
-# 对照臂 = eval_mm3_physctrl_orig.yaml(同 checkpoint-90000)。
+# Contact Shared Encoder 的 45k screening 评测配置。
+# 严格镜像 config_mm3_contact_concat.yaml 的 model_config 与 train_dataset。
+# train_dataset 仅切换到 mm3_test，并显式提供 eval runtime 所需的输入/输出帧数；
+# resume 指向 checkpoint-45000，vis_dir 使用独立目录。
 pc_size: 2048
 eval_batch_size: 1
 dataloader_num_workers: 4
