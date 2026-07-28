@@ -28,9 +28,9 @@ def build(block, n_layers, **overrides):
     ))
     return MDM_ST(512, 5, n_feats=3, model_config=mc)
 
-def build_mm3(block):
-    """Build the exact single-output-frame mm3 baseline or v11a model."""
-    mc = OmegaConf.create({
+def build_mm3(block, **overrides):
+    """Build a single-output-frame mm3 model with model-config overrides."""
+    model_config = {
         'n_layers': 8,
         'latent_dim': 256,
         'frame_cond': True,
@@ -48,11 +48,13 @@ def build_mm3(block):
         'num_mat': 4,
         'class_token': True,
         'class_dropout_prob': 0.0,
-        'transformer_block': block,
         'hybrid_state_dim': 64,
         'hybrid_state_heads': 4,
         'hybrid_state_interval': 2,
-    })
+    }
+    model_config.update(overrides)
+    model_config['transformer_block'] = block
+    mc = OmegaConf.create(model_config)
     return MDM_ST(n_points=2048, n_frame=1, n_feats=3, model_config=mc)
 
 def estimate_exchange_compute(exchange_calls, batch_size=1, n_points=2048,
@@ -182,6 +184,198 @@ def validate_v11a_parameter_budget(baseline, v11a):
     }
 
 
+def validate_contact_parameter_budget(baseline, separate, shared):
+    expected_contact_parameter_names = {
+        'contact_encoder.weight',
+        'contact_encoder.bias',
+    }
+    baseline_parameters = dict(baseline.named_parameters())
+    separate_parameters = dict(separate.named_parameters())
+    shared_parameters = dict(shared.named_parameters())
+
+    separate_only_vs_baseline = (
+        set(separate_parameters) - set(baseline_parameters)
+    )
+    baseline_only_vs_separate = (
+        set(baseline_parameters) - set(separate_parameters)
+    )
+    if (
+        separate_only_vs_baseline != expected_contact_parameter_names
+        or baseline_only_vs_separate
+    ):
+        raise RuntimeError(
+            'separate contact parameter names must differ from the no-contact '
+            'baseline only by contact_encoder.weight and contact_encoder.bias; '
+            f'separate-only={sorted(separate_only_vs_baseline)}, '
+            f'baseline-only={sorted(baseline_only_vs_separate)}'
+        )
+
+    separate_only_vs_shared = (
+        set(separate_parameters) - set(shared_parameters)
+    )
+    shared_only_vs_separate = (
+        set(shared_parameters) - set(separate_parameters)
+    )
+    if (
+        separate_only_vs_shared != expected_contact_parameter_names
+        or shared_only_vs_separate
+    ):
+        raise RuntimeError(
+            'separate/shared parameter names must differ only by the separate '
+            'contact_encoder parameters; '
+            f'separate-only={sorted(separate_only_vs_shared)}, '
+            f'shared-only={sorted(shared_only_vs_separate)}'
+        )
+
+    contact_encoder = getattr(separate, 'contact_encoder', None)
+    if not isinstance(contact_encoder, nn.Linear):
+        raise RuntimeError(
+            'separate contact model must contain contact_encoder as nn.Linear'
+        )
+    if getattr(shared, 'contact_encoder', None) is not None:
+        raise RuntimeError(
+            'shared contact model must not contain a contact_encoder module'
+        )
+
+    latent_dim = separate.latent_dim
+    expected_contact_weight_shape = (latent_dim, 3)
+    expected_contact_bias_shape = (latent_dim,)
+    if tuple(contact_encoder.weight.shape) != expected_contact_weight_shape:
+        raise RuntimeError(
+            'separate contact_encoder.weight must have shape '
+            f'{expected_contact_weight_shape}, got '
+            f'{tuple(contact_encoder.weight.shape)}'
+        )
+    if tuple(contact_encoder.bias.shape) != expected_contact_bias_shape:
+        raise RuntimeError(
+            'separate contact_encoder.bias must have shape '
+            f'{expected_contact_bias_shape}, got '
+            f'{tuple(contact_encoder.bias.shape)}'
+        )
+
+    separate_input_encoder = getattr(separate, 'input_encoder', None)
+    shared_input_encoder = getattr(shared, 'input_encoder', None)
+    if getattr(separate_input_encoder, 'extra_feature_dim', None) != 0:
+        raise RuntimeError(
+            'separate input_encoder.extra_feature_dim must be 0'
+        )
+    if getattr(shared_input_encoder, 'extra_feature_dim', None) != 3:
+        raise RuntimeError(
+            'shared input_encoder.extra_feature_dim must be 3'
+        )
+    separate_input_mlp = getattr(separate_input_encoder, 'mlp', None)
+    shared_input_mlp = getattr(shared_input_encoder, 'mlp', None)
+    if not isinstance(separate_input_mlp, nn.Linear):
+        raise RuntimeError(
+            'separate input_encoder.mlp must be nn.Linear'
+        )
+    if not isinstance(shared_input_mlp, nn.Linear):
+        raise RuntimeError(
+            'shared input_encoder.mlp must be nn.Linear'
+        )
+
+    separate_input_shape = tuple(separate_input_mlp.weight.shape)
+    shared_input_shape = tuple(shared_input_mlp.weight.shape)
+    expected_shared_input_shape = (
+        separate_input_shape[0],
+        separate_input_shape[1] + 3,
+    )
+    if shared_input_shape != expected_shared_input_shape:
+        raise RuntimeError(
+            'shared input_encoder.mlp.weight must add exactly 3 input columns; '
+            f'separate={separate_input_shape}, shared={shared_input_shape}'
+        )
+
+    common_shape_differences = {
+        name: (
+            tuple(separate_parameters[name].shape),
+            tuple(shared_parameters[name].shape),
+        )
+        for name in set(separate_parameters) & set(shared_parameters)
+        if separate_parameters[name].shape != shared_parameters[name].shape
+    }
+    expected_shape_difference_name = 'input_encoder.mlp.weight'
+    if set(common_shape_differences) != {expected_shape_difference_name}:
+        raise RuntimeError(
+            'common separate/shared parameter shapes must match except for '
+            'input_encoder.mlp.weight; '
+            f'differences={common_shape_differences}'
+        )
+
+    baseline_total = count(baseline)
+    separate_total = count(separate)
+    shared_total = count(shared)
+    separate_delta = separate_total - baseline_total
+    shared_delta = shared_total - baseline_total
+    shared_vs_separate_delta = shared_total - separate_total
+    contact_weight_params = contact_encoder.weight.numel()
+    condition_frame_bias_params = contact_encoder.bias.numel()
+    shared_input_expansion_params = (
+        shared_input_mlp.weight.numel()
+        - separate_input_mlp.weight.numel()
+    )
+
+    structural_mismatches = []
+    if separate_delta != contact_weight_params + condition_frame_bias_params:
+        structural_mismatches.append(
+            'separate delta must equal contact_encoder weight plus bias: '
+            f'{separate_delta:+d} != '
+            f'{contact_weight_params + condition_frame_bias_params:+d}'
+        )
+    if shared_delta != shared_input_expansion_params:
+        structural_mismatches.append(
+            'shared delta must equal the expanded input columns: '
+            f'{shared_delta:+d} != {shared_input_expansion_params:+d}'
+        )
+    if shared_input_expansion_params != contact_weight_params:
+        structural_mismatches.append(
+            'shared expanded input columns must replace the separate contact '
+            f'weight: {shared_input_expansion_params} != {contact_weight_params}'
+        )
+    if shared_vs_separate_delta != -condition_frame_bias_params:
+        structural_mismatches.append(
+            'shared/separate delta must equal the negative separate-only '
+            'condition-frame bias size: '
+            f'{shared_vs_separate_delta:+d} != '
+            f'{-condition_frame_bias_params:+d}'
+        )
+
+    expected_deltas = {
+        'separate relative to no-contact baseline': 1024,
+        'shared relative to no-contact baseline': 768,
+        'shared relative to separate contact': -256,
+    }
+    actual_deltas = {
+        'separate relative to no-contact baseline': separate_delta,
+        'shared relative to no-contact baseline': shared_delta,
+        'shared relative to separate contact': shared_vs_separate_delta,
+    }
+    budget_mismatches = [
+        f'{name}: expected {expected:+d}, got {actual_deltas[name]:+d}'
+        for name, expected in expected_deltas.items()
+        if actual_deltas[name] != expected
+    ]
+    mismatches = structural_mismatches + budget_mismatches
+    if mismatches:
+        raise RuntimeError(
+            'contact parameter budget drifted; '
+            + '; '.join(mismatches)
+        )
+
+    return {
+        'baseline_total': baseline_total,
+        'separate_total': separate_total,
+        'shared_total': shared_total,
+        'separate_delta': separate_delta,
+        'shared_delta': shared_delta,
+        'shared_vs_separate_delta': shared_vs_separate_delta,
+        'contact_weight_params': contact_weight_params,
+        'condition_frame_bias_params': condition_frame_bias_params,
+        'shared_input_expansion_params': shared_input_expansion_params,
+        'common_shape_differences': common_shape_differences,
+    }
+
+
 def main():
     for name, block, layers in [
         ('v1 serial      8L', 'SpatialTemporalTransformerBlock', 8),
@@ -205,78 +399,54 @@ def main():
             f'per-block={block_total/layers/1e6:.4f}M'
         )
 
-    baseline_contact_ref = build('SpatialTemporalTransformerBlock', 8)
-    contact_model = build(
+    baseline_mm3 = build_mm3('SpatialTemporalTransformerBlock')
+    separate_contact_mm3 = build_mm3(
+        'SpatialTemporalTransformerBlock',
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='separate',
+    )
+    shared_contact_mm3 = build_mm3(
+        'SpatialTemporalTransformerBlock',
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='shared',
+    )
+    contact_report = validate_contact_parameter_budget(
+        baseline_mm3,
+        separate_contact_mm3,
+        shared_contact_mm3,
+    )
+    print('--- mm3 contact exact parameter budget ---')
+    print(
+        'mm3 no-contact v1 serial 8L: '
+        f'total={contact_report["baseline_total"]:,}'
+    )
+    print(
+        'mm3 separate contact v1 serial 8L: '
+        f'total={contact_report["separate_total"]:,}  '
+        f'delta-vs-no-contact={contact_report["separate_delta"]:+,} params'
+    )
+    print(
+        'mm3 shared contact v1 serial 8L: '
+        f'total={contact_report["shared_total"]:,}  '
+        f'delta-vs-no-contact={contact_report["shared_delta"]:+,} params  '
+        'delta-vs-separate='
+        f'{contact_report["shared_vs_separate_delta"]:+,} params'
+    )
+    print(
+        'separate/shared difference: '
+        f'{contact_report["condition_frame_bias_params"]:,}-parameter '
+        'separate-only condition-frame bias'
+    )
+
+    # Preserve the historical five-output-frame v_xyz comparison.
+    generic_contact_model = build(
         'SpatialTemporalTransformerBlock',
         8,
         contact_particle_cond=True,
         contact_feature_sigma=0.04,
         contact_injection_mode='separate',
-    )
-    shared_contact_model = build(
-        'SpatialTemporalTransformerBlock',
-        8,
-        contact_particle_cond=True,
-        contact_feature_sigma=0.04,
-        contact_injection_mode='shared',
-    )
-    baseline_contact_total = count(baseline_contact_ref)
-    contact_total = count(contact_model)
-    shared_contact_total = count(shared_contact_model)
-    contact_delta = contact_total - baseline_contact_total
-    shared_contact_delta = shared_contact_total - baseline_contact_total
-    shared_vs_separate_delta = shared_contact_total - contact_total
-    contact_encoder = getattr(contact_model, 'contact_encoder', None)
-    condition_frame_bias = getattr(contact_encoder, 'bias', None)
-    if condition_frame_bias is None:
-        raise RuntimeError(
-            'separate contact model must expose contact_encoder.bias for the '
-            'condition-frame-only parameter budget'
-        )
-    condition_frame_bias_params = condition_frame_bias.numel()
-    expected_contact_deltas = {
-        'separate relative to no-contact baseline': 1024,
-        'shared relative to no-contact baseline': 768,
-        'shared relative to separate contact': -256,
-        'separate-only condition-frame bias': 256,
-    }
-    actual_contact_deltas = {
-        'separate relative to no-contact baseline': contact_delta,
-        'shared relative to no-contact baseline': shared_contact_delta,
-        'shared relative to separate contact': shared_vs_separate_delta,
-        'separate-only condition-frame bias': condition_frame_bias_params,
-    }
-    mismatches = [
-        f'{name}: expected {expected:+d}, got {actual_contact_deltas[name]:+d}'
-        for name, expected in expected_contact_deltas.items()
-        if actual_contact_deltas[name] != expected
-    ]
-    if shared_vs_separate_delta != -condition_frame_bias_params:
-        mismatches.append(
-            'shared/separate delta must equal the negative separate-only '
-            'condition-frame bias size: '
-            f'{shared_vs_separate_delta:+d} != {-condition_frame_bias_params:+d}'
-        )
-    if mismatches:
-        raise RuntimeError(
-            'contact parameter budget drifted; '
-            + '; '.join(mismatches)
-        )
-    print(
-        'v1 serial + separate contact 8L: '
-        f'total={contact_total:,} ({contact_total/1e6:.3f}M)  '
-        f'delta-vs-no-contact={contact_delta:+,} params'
-    )
-    print(
-        'v1 serial + shared contact 8L: '
-        f'total={shared_contact_total:,} ({shared_contact_total/1e6:.3f}M)  '
-        f'delta-vs-no-contact={shared_contact_delta:+,} params  '
-        f'delta-vs-separate={shared_vs_separate_delta:+,} params'
-    )
-    print(
-        'separate/shared difference: '
-        f'{condition_frame_bias_params:,}-parameter separate-only '
-        'condition-frame bias'
     )
     contact_xyz_model = build(
         'SpatialTemporalTransformerBlock',
@@ -285,7 +455,7 @@ def main():
         contact_feature_sigma=0.04,
         contact_velocity_mode='xyz',
     )
-    contact_xyz_delta = count(contact_xyz_model) - count(contact_model)
+    contact_xyz_delta = count(contact_xyz_model) - count(generic_contact_model)
     print(
         'v1 serial + contact v_xyz 8L: '
         f'total={count(contact_xyz_model)/1e6:.3f}M  '
@@ -306,7 +476,6 @@ def main():
     print(f'  v1 one block  : {count(find_blocks(model_v1)[0])/1e6:.4f}M')
 
     # The generic table builds five output frames; v11a is single-output only.
-    baseline_mm3 = build_mm3('SpatialTemporalTransformerBlock')
     v11a_mm3 = build_mm3('SpatialTemporalTransformerBlockv11a')
     report = validate_v11a_parameter_budget(baseline_mm3, v11a_mm3)
 
