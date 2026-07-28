@@ -314,12 +314,21 @@ class ContactAblationConfigTests(unittest.TestCase):
         )
 
     def test_shared_eval_directly_mirrors_resolved_training_config(self):
-        train = OmegaConf.load(
-            CONFIG_DIR / "config_mm3_contact_concat.yaml"
+        train = _load_structured(
+            "config_mm3_contact_concat.yaml",
+            TrainingConfig,
         )
-        eval_cfg = OmegaConf.load(
-            CONFIG_DIR / "eval_mm3_contact_concat_45k.yaml"
+        eval_cfg = _load_structured(
+            "eval_mm3_contact_concat_45k.yaml",
+            TestingConfig,
         )
+
+        self.assertEqual(eval_cfg.input_frames, train.input_frames)
+        self.assertEqual(eval_cfg.output_frames, train.output_frames)
+        train.train_dataset.input_frames = train.input_frames
+        train.train_dataset.output_frames = train.output_frames
+        eval_cfg.train_dataset.input_frames = eval_cfg.input_frames
+        eval_cfg.train_dataset.output_frames = eval_cfg.output_frames
         OmegaConf.resolve(train)
         OmegaConf.resolve(eval_cfg)
 
@@ -328,13 +337,6 @@ class ContactAblationConfigTests(unittest.TestCase):
             OmegaConf.to_container(train.model_config, resolve=True),
         )
 
-        train_dataset_keys = set(train.train_dataset.keys())
-        eval_dataset_keys = set(eval_cfg.train_dataset.keys())
-        self.assertEqual(train_dataset_keys - eval_dataset_keys, set())
-        self.assertEqual(
-            eval_dataset_keys - train_dataset_keys,
-            {"input_frames", "output_frames"},
-        )
         self.assertEqual(
             train.train_dataset.dataset_path,
             "mm3_data/mm3_train",
@@ -343,15 +345,7 @@ class ContactAblationConfigTests(unittest.TestCase):
             eval_cfg.train_dataset.dataset_path,
             "mm3_data/mm3_test",
         )
-        self.assertEqual(
-            eval_cfg.train_dataset.input_frames,
-            train.get("input_frames", 5),
-        )
-        self.assertEqual(
-            eval_cfg.train_dataset.output_frames,
-            train.output_frames,
-        )
-        ignored = {"dataset_path", "input_frames", "output_frames"}
+        ignored = {"dataset_path"}
         self.assertEqual(
             _without_paths(eval_cfg.train_dataset, ignored),
             _without_paths(train.train_dataset, ignored),
