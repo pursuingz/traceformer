@@ -2,10 +2,56 @@ import unittest
 
 import torch
 
-from contact_feature_diagnostics import collect_grouped_features
+from contact_feature_diagnostics import (
+    collect_grouped_features,
+    load_contact_projection,
+)
 
 
 class ContactFeatureDiagnosticTests(unittest.TestCase):
+    def test_loads_separate_contact_projection_and_bias(self):
+        state = {
+            "model.contact_encoder.weight": torch.arange(
+                12, dtype=torch.float32
+            ).reshape(4, 3),
+            "model.contact_encoder.bias": torch.arange(
+                4, dtype=torch.float32
+            ),
+        }
+
+        weight, bias = load_contact_projection(
+            state,
+            injection_mode="separate",
+            feature_dim=3,
+        )
+
+        torch.testing.assert_close(
+            weight,
+            state["model.contact_encoder.weight"],
+        )
+        torch.testing.assert_close(
+            bias,
+            state["model.contact_encoder.bias"],
+        )
+
+    def test_loads_shared_contact_columns_without_shared_bias(self):
+        full_weight = torch.arange(
+            4 * 102, dtype=torch.float32
+        ).reshape(4, 102)
+        state = {
+            "model.input_encoder.mlp.weight": full_weight,
+            "model.input_encoder.mlp.bias": torch.ones(4),
+        }
+
+        weight, bias = load_contact_projection(
+            state,
+            injection_mode="shared",
+            feature_dim=3,
+        )
+
+        torch.testing.assert_close(weight, full_weight[:, 99:102])
+        self.assertIsNone(bias)
+
     def test_collects_tuple_dataloader_batches_by_material(self):
         points = torch.zeros(2, 2, 1, 3)
         points[0, :, 0, 1] = torch.tensor([0.1, 0.2])

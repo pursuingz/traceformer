@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from dataset.traj_dataset import TrajDataset
-from model.spacetime import MDM_ST
+from model.spacetime import MDM_ST, PointEmbed
 from options import TestingConfig, TrainingConfig
 from utils.contact import (
     apply_contact_feature_mask,
@@ -41,8 +41,124 @@ def _model_config(contact_particle_cond=False):
         "class_dropout_prob": 0.0,
         "transformer_block": "SpatialTemporalTransformerBlock",
         "contact_particle_cond": contact_particle_cond,
+        "contact_injection_mode": "separate",
         "contact_feature_sigma": 0.04,
     })
+
+
+def _small_model_batch(batch_size=1, n_frames=1, n_points=4, cond_frames=2):
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(
+        batch_size,
+        n_frames,
+        n_points,
+        3,
+        generator=generator,
+    )
+    init_pc = torch.zeros(batch_size, cond_frames, n_points, 3)
+    for frame_index in range(cond_frames):
+        init_pc[:, frame_index, :, 1] = 0.01 * (frame_index + 1)
+    return {
+        "x": x,
+        "timesteps": torch.zeros(batch_size, dtype=torch.long),
+        "init_pc": init_pc,
+        "force": torch.zeros(batch_size, 1, 3),
+        "E": torch.ones(batch_size, 1),
+        "nu": torch.ones(batch_size, 1),
+        "drag_mask": torch.zeros(batch_size, n_points, 1),
+        "drag_point": torch.zeros(batch_size, 1, 4),
+        "floor_height": torch.zeros(batch_size, 1),
+        "gravity_label": torch.zeros(batch_size, 1, dtype=torch.long),
+        "start_vel": torch.full((batch_size, n_points, 3), 0.1),
+    }
+
+
+class PointEmbedTests(unittest.TestCase):
+    def test_extra_feature_columns_are_zero_initialized(self):
+        encoder = PointEmbed(hidden_dim=96, dim=64, extra_feature_dim=3)
+
+        self.assertEqual(encoder.mlp.in_features, 102)
+        self.assertEqual(
+            torch.count_nonzero(encoder.mlp.weight[:, -3:]).item(),
+            0,
+        )
+
+    def test_extra_features_preserve_legacy_initialization_and_rng(self):
+        seed = 1234
+        torch.manual_seed(seed)
+        legacy_encoder = PointEmbed(
+            hidden_dim=96,
+            dim=64,
+            extra_feature_dim=0,
+        )
+        legacy_rng_state = torch.random.get_rng_state()
+
+        torch.manual_seed(seed)
+        shared_encoder = PointEmbed(
+            hidden_dim=96,
+            dim=64,
+            extra_feature_dim=3,
+        )
+        shared_rng_state = torch.random.get_rng_state()
+
+        torch.testing.assert_close(
+            shared_encoder.mlp.weight[:, :99],
+            legacy_encoder.mlp.weight,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            shared_encoder.mlp.bias,
+            legacy_encoder.mlp.bias,
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(shared_encoder.mlp.weight[:, 99:]).item(),
+            0,
+        )
+        torch.testing.assert_close(
+            shared_rng_state,
+            legacy_rng_state,
+            rtol=0,
+            atol=0,
+        )
+
+        points = torch.linspace(-1.0, 1.0, steps=24).reshape(2, 4, 3)
+        extra_features = torch.zeros(2, 4, 3)
+        torch.testing.assert_close(
+            shared_encoder(points, extra_features=extra_features),
+            legacy_encoder(points),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_zero_initialized_extra_features_preserve_output(self):
+        torch.manual_seed(0)
+        encoder = PointEmbed(hidden_dim=96, dim=64, extra_feature_dim=3)
+        points = torch.randn(2, 4, 3)
+        contact_a = torch.randn(2, 4, 3)
+        contact_b = torch.randn(2, 4, 3)
+
+        output_a = encoder(points, extra_features=contact_a)
+        output_b = encoder(points, extra_features=contact_b)
+
+        torch.testing.assert_close(output_a, output_b, rtol=0, atol=0)
+
+    def test_configured_extra_features_are_required(self):
+        encoder = PointEmbed(hidden_dim=96, dim=64, extra_feature_dim=3)
+        points = torch.randn(2, 4, 3)
+
+        with self.assertRaisesRegex(ValueError, "extra_features"):
+            encoder(points)
+
+    def test_extra_features_reject_wrong_last_dimension(self):
+        encoder = PointEmbed(hidden_dim=96, dim=64, extra_feature_dim=3)
+        points = torch.randn(2, 4, 3)
+        extra_features = torch.randn(2, 4, 2)
+
+        with self.assertRaisesRegex(ValueError, "last dimension"):
+            encoder(points, extra_features=extra_features)
 
 
 class ContactFeatureTests(unittest.TestCase):
@@ -153,6 +269,163 @@ class ContactFeatureTests(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(contact_model.contact_encoder.bias).item(), 0)
         self.assertEqual(contact_model.contact_feature_mask, (1.0, 1.0, 1.0))
         self.assertEqual(contact_model.contact_bias_scale, 1.0)
+
+    def test_contact_injection_mode_defaults_to_separate(self):
+        default_cfg = _model_config(True)
+        del default_cfg.contact_injection_mode
+        separate_cfg = _model_config(True)
+        default_model = MDM_ST(
+            4,
+            1,
+            n_feats=3,
+            model_config=default_cfg,
+        ).eval()
+        separate_model = MDM_ST(
+            4,
+            1,
+            n_feats=3,
+            model_config=separate_cfg,
+        ).eval()
+
+        default_state = default_model.state_dict()
+        separate_state = separate_model.state_dict()
+        self.assertEqual(default_state.keys(), separate_state.keys())
+        self.assertEqual(
+            {key: value.shape for key, value in default_state.items()},
+            {key: value.shape for key, value in separate_state.items()},
+        )
+
+        reference_state = {
+            key: value.clone()
+            for key, value in separate_state.items()
+        }
+        default_model.load_state_dict(reference_state)
+        separate_model.load_state_dict(reference_state)
+        batch = _small_model_batch()
+
+        with torch.no_grad():
+            default_output = default_model(**batch)
+            separate_output = separate_model(**batch)
+
+        self.assertTrue(hasattr(default_model, "contact_encoder"))
+        self.assertTrue(hasattr(separate_model, "contact_encoder"))
+        torch.testing.assert_close(
+            default_output,
+            separate_output,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_shared_contact_uses_input_encoder_without_contact_encoder(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+
+        model = MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+        self.assertFalse(hasattr(model, "contact_encoder"))
+        self.assertEqual(model.input_encoder.extra_feature_dim, 3)
+        self.assertEqual(model.input_encoder.mlp.in_features, 102)
+
+    def test_shared_contact_forwards_contact_features_only_for_condition_frames(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        model = MDM_ST(4, 1, n_feats=3, model_config=cfg).eval()
+        captured = {}
+        original_forward = model.input_encoder.forward
+
+        def capture_forward(points, extra_features=None):
+            captured["extra_features"] = (
+                None
+                if extra_features is None
+                else extra_features.detach().clone()
+            )
+            if extra_features is None:
+                return original_forward(points)
+            return original_forward(points, extra_features=extra_features)
+
+        model.input_encoder.forward = capture_forward
+        batch = _small_model_batch()
+        batch_size, n_frames, n_points, _ = batch["x"].shape
+
+        with torch.no_grad():
+            output = model(**batch)
+
+        self.assertEqual(output.shape, (batch_size, n_frames, n_points, 3))
+        extra_features = captured["extra_features"]
+        self.assertIsNotNone(extra_features)
+        n_frame_slots = cfg.cond_frames + n_frames
+        self.assertEqual(
+            extra_features.shape,
+            (batch_size * n_frame_slots, n_points, 3),
+        )
+        frame_features = extra_features.reshape(
+            batch_size,
+            n_frame_slots,
+            n_points,
+            3,
+        )
+        expected_contact = build_contact_features(
+            batch["init_pc"],
+            batch["floor_height"],
+            start_velocity=batch["start_vel"],
+            sigma=cfg.contact_feature_sigma,
+            velocity_mode="vertical",
+        )
+        expected_contact = apply_contact_feature_mask(
+            expected_contact,
+            model.contact_feature_mask,
+        )
+        torch.testing.assert_close(
+            frame_features[:, :cfg.cond_frames],
+            expected_contact,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            frame_features[:, -1],
+            torch.zeros_like(frame_features[:, -1]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_shared_contact_rejects_xyz_velocity_mode(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        cfg.contact_velocity_mode = "xyz"
+
+        with self.assertRaisesRegex(ValueError, "vertical"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_shared_contact_rejects_force_as_latent(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        cfg.force_as_latent = True
+
+        with self.assertRaisesRegex(ValueError, "force_as_latent"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_shared_contact_rejects_disabled_point_embedding(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        cfg.point_embed = False
+
+        with self.assertRaisesRegex(ValueError, "point_embed"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_shared_contact_rejects_disabled_frame_conditioning(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "shared"
+        cfg.frame_cond = False
+
+        with self.assertRaisesRegex(ValueError, "frame_cond"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_contact_model_rejects_unknown_injection_mode(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "unknown"
+
+        with self.assertRaisesRegex(ValueError, "contact_injection_mode"):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
 
     def test_xyz_contact_encoder_uses_five_features(self):
         cfg = _model_config(True)

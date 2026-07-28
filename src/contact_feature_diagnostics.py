@@ -32,6 +32,37 @@ def _state_tensor_by_suffix(state, suffix):
     return matches[0].float()
 
 
+def load_contact_projection(state, injection_mode, feature_dim):
+    """Return the learned contact projection and any contact-only bias."""
+    if injection_mode == "separate":
+        weight = _state_tensor_by_suffix(state, "contact_encoder.weight")
+        bias = _state_tensor_by_suffix(state, "contact_encoder.bias")
+    elif injection_mode == "shared":
+        full_weight = _state_tensor_by_suffix(
+            state,
+            "input_encoder.mlp.weight",
+        )
+        if full_weight.ndim != 2 or full_weight.shape[1] < feature_dim:
+            raise ValueError(
+                "shared input projection cannot contain the requested "
+                f"{feature_dim} contact columns: shape={tuple(full_weight.shape)}"
+            )
+        weight = full_weight[:, -feature_dim:]
+        bias = None
+    else:
+        raise ValueError(
+            "contact_injection_mode must be either 'separate' or 'shared'; "
+            f"got {injection_mode!r}"
+        )
+
+    if weight.ndim != 2 or weight.shape[1] != feature_dim:
+        raise ValueError(
+            "contact projection width does not match the configured feature "
+            f"dimension: shape={tuple(weight.shape)}, feature_dim={feature_dim}"
+        )
+    return weight, bias
+
+
 def _quantile_text(values):
     levels = torch.tensor(
         [0.01, 0.05, 0.50, 0.95, 0.99],
@@ -77,13 +108,19 @@ def main(cfg):
         num_workers=cfg.dataloader_num_workers,
     )
 
-    state = load_file(cfg.resume, device="cpu")
-    weight = _state_tensor_by_suffix(state, "contact_encoder.weight")
-    bias = _state_tensor_by_suffix(state, "contact_encoder.bias")
-
     sigma = float(cfg.model_config.get("contact_feature_sigma", 0.04))
     velocity_mode = cfg.model_config.get("contact_velocity_mode", "vertical")
     feature_names = contact_feature_names(velocity_mode)
+    injection_mode = cfg.model_config.get(
+        "contact_injection_mode",
+        "separate",
+    )
+    state = load_file(cfg.resume, device="cpu")
+    weight, bias = load_contact_projection(
+        state,
+        injection_mode=injection_mode,
+        feature_dim=len(feature_names),
+    )
     grouped_features = collect_grouped_features(
         loader,
         sigma,
@@ -91,9 +128,13 @@ def main(cfg):
     )
     print("===== contact feature diagnostics =====")
     print(f"checkpoint: {cfg.resume}")
+    print(f"contact injection mode: {injection_mode}")
     print(f"contact velocity mode: {velocity_mode}")
     print(f"encoder weight column norms: {torch.linalg.vector_norm(weight, dim=0).tolist()}")
-    print(f"encoder bias norm: {torch.linalg.vector_norm(bias).item():.6g}")
+    if bias is None:
+        print("encoder bias: shared point bias (not contact-specific)")
+    else:
+        print(f"encoder bias norm: {torch.linalg.vector_norm(bias).item():.6g}")
 
     for mat_type in sorted(grouped_features):
         features = torch.cat(grouped_features[mat_type], dim=0)
