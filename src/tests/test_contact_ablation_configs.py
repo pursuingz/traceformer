@@ -221,6 +221,9 @@ class ContactAblationConfigTests(unittest.TestCase):
         baseline_plain = OmegaConf.load(
             CONFIG_DIR / "config_mm3_contact_cond.yaml"
         )
+        arm_plain = OmegaConf.load(
+            CONFIG_DIR / "config_mm3_contact_concat.yaml"
+        )
         baseline = _load_structured(
             "config_mm3_contact_cond.yaml",
             TrainingConfig,
@@ -243,6 +246,10 @@ class ContactAblationConfigTests(unittest.TestCase):
         self.assertEqual(arm.max_train_steps, 90000)
         self.assertEqual(arm.stop_after_steps, 45000)
         self.assertEqual(arm.model_config.contact_injection_mode, "shared")
+        self.assertEqual(
+            _without_paths(arm_plain, ignored),
+            _without_paths(baseline_plain, ignored),
+        )
         self.assertEqual(
             _without_paths(arm, ignored),
             _without_paths(baseline, ignored),
