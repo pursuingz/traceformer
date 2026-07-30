@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from dataset.traj_dataset import TrajDataset
+from model.contact_adapter import FactorizedContactAdapter
 from model.spacetime import MDM_ST, PointEmbed
 from options import TestingConfig, TrainingConfig
 from utils.contact import (
@@ -18,6 +19,129 @@ from utils.contact import (
     contact_weighted_losses,
     find_contact_window_starts,
 )
+
+
+class FactorizedContactAdapterTests(unittest.TestCase):
+    def test_fixed_feature_groups_sum_with_gated_tangential_branch(self):
+        adapter = FactorizedContactAdapter(latent_dim=2)
+        features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
+
+        with torch.no_grad():
+            adapter.boundary.weight.copy_(
+                torch.tensor([[1.0, 10.0], [100.0, 1000.0]])
+            )
+            adapter.normal.weight.copy_(torch.tensor([[2.0], [3.0]]))
+            adapter.tangential.weight.copy_(
+                torch.tensor([[4.0, 5.0], [6.0, 7.0]])
+            )
+            adapter.shared_bias.copy_(torch.tensor([8.0, 9.0]))
+            adapter.tangential_gate.copy_(torch.atanh(torch.tensor(0.5)))
+
+        actual = adapter(features)
+        expected = torch.tensor([[[[79.0, 5138.0]]]])
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_bias_scale_applies_only_to_shared_bias(self):
+        adapter = FactorizedContactAdapter(latent_dim=2)
+        features = torch.zeros(1, 1, 1, 5)
+
+        with torch.no_grad():
+            adapter.shared_bias.copy_(torch.tensor([2.0, -4.0]))
+
+        actual = adapter(features, bias_scale=0.25)
+
+        torch.testing.assert_close(
+            actual,
+            torch.tensor([[[[0.5, -1.0]]]]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_latent_256_has_expected_parameterization(self):
+        adapter = FactorizedContactAdapter(latent_dim=256)
+
+        self.assertEqual(adapter.boundary.in_features, 2)
+        self.assertEqual(adapter.boundary.out_features, 256)
+        self.assertIsNone(adapter.boundary.bias)
+        self.assertEqual(adapter.normal.in_features, 1)
+        self.assertEqual(adapter.normal.out_features, 256)
+        self.assertIsNone(adapter.normal.bias)
+        self.assertEqual(adapter.tangential.in_features, 2)
+        self.assertEqual(adapter.tangential.out_features, 256)
+        self.assertIsNone(adapter.tangential.bias)
+        self.assertEqual(
+            sum(parameter.numel() for parameter in adapter.parameters()),
+            1537,
+        )
+
+    def test_initialization_preserves_zero_output_and_tangential_weights(self):
+        torch.manual_seed(0)
+        adapter = FactorizedContactAdapter(latent_dim=16)
+        features = torch.randn(2, 3, 4, 5)
+
+        self.assertEqual(torch.count_nonzero(adapter.boundary.weight).item(), 0)
+        self.assertEqual(torch.count_nonzero(adapter.normal.weight).item(), 0)
+        self.assertEqual(torch.count_nonzero(adapter.shared_bias).item(), 0)
+        self.assertEqual(torch.count_nonzero(adapter.tangential_gate).item(), 0)
+        self.assertGreater(
+            torch.count_nonzero(adapter.tangential.weight).item(),
+            0,
+        )
+        torch.testing.assert_close(
+            adapter(features),
+            torch.zeros(2, 3, 4, 16),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_zero_gate_blocks_tangential_weight_gradient_but_learns_gate(self):
+        adapter = FactorizedContactAdapter(latent_dim=4)
+        features = torch.ones(2, 3, 4, 5)
+        with torch.no_grad():
+            adapter.tangential.weight.fill_(1.0)
+
+        adapter(features).sum().backward()
+
+        self.assertGreater(
+            torch.count_nonzero(adapter.boundary.weight.grad).item(),
+            0,
+        )
+        self.assertGreater(
+            torch.count_nonzero(adapter.normal.weight.grad).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(adapter.tangential.weight.grad).item(),
+            0,
+        )
+        self.assertNotEqual(adapter.tangential_gate.grad.item(), 0.0)
+
+    def test_nonzero_gate_enables_tangential_weight_gradient(self):
+        adapter = FactorizedContactAdapter(latent_dim=4)
+        features = torch.ones(2, 3, 4, 5)
+        with torch.no_grad():
+            adapter.tangential_gate.fill_(1.0)
+
+        adapter(features).sum().backward()
+
+        self.assertGreater(
+            torch.count_nonzero(adapter.tangential.weight.grad).item(),
+            0,
+        )
+
+    def test_rejects_non_bfn5_inputs(self):
+        adapter = FactorizedContactAdapter(latent_dim=4)
+        invalid_shapes = (
+            (2, 3, 5),
+            (2, 3, 4, 4),
+            (2, 3, 4, 5, 1),
+        )
+
+        for shape in invalid_shapes:
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, r"\(B, F, N, 5\)"):
+                    adapter(torch.zeros(shape))
 
 
 def _model_config(contact_particle_cond=False):
