@@ -4,6 +4,9 @@ from torch import nn
 
 class FactorizedContactAdapter(nn.Module):
     def __init__(self, latent_dim: int):
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be positive")
+
         super().__init__()
         self.boundary = nn.Linear(2, latent_dim, bias=False)
         self.normal = nn.Linear(1, latent_dim, bias=False)

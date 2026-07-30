@@ -22,6 +22,15 @@ from utils.contact import (
 
 
 class FactorizedContactAdapterTests(unittest.TestCase):
+    def test_rejects_nonpositive_latent_dim(self):
+        for latent_dim in (0, -1):
+            with self.subTest(latent_dim=latent_dim):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "latent_dim must be positive",
+                ):
+                    FactorizedContactAdapter(latent_dim=latent_dim)
+
     def test_fixed_feature_groups_sum_with_gated_tangential_branch(self):
         adapter = FactorizedContactAdapter(latent_dim=2)
         features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
