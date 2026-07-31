@@ -608,8 +608,185 @@ class ContactFeatureTests(unittest.TestCase):
         cfg = _model_config(True)
         cfg.contact_injection_mode = "unknown"
 
-        with self.assertRaisesRegex(ValueError, "contact_injection_mode"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "contact_injection_mode must be one of "
+            "'separate', 'shared', or 'factorized'; got 'unknown'",
+        ):
             MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_factorized_contact_requires_particle_conditioning(self):
+        cfg = _model_config(False)
+        cfg.contact_injection_mode = "factorized"
+        cfg.contact_velocity_mode = "xyz"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "contact_injection_mode='factorized' requires "
+            "contact_particle_cond=true",
+        ):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_factorized_contact_requires_xyz_velocity_mode(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "factorized"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "contact_injection_mode='factorized' requires "
+            "contact_velocity_mode='xyz'",
+        ):
+            MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+    def test_factorized_contact_uses_adapter_without_contact_encoder(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "factorized"
+        cfg.contact_velocity_mode = "xyz"
+
+        model = MDM_ST(8, 1, n_feats=3, model_config=cfg)
+
+        self.assertIsInstance(model.contact_adapter, FactorizedContactAdapter)
+        self.assertFalse(hasattr(model, "contact_encoder"))
+
+    def test_factorized_contact_preserves_dit_initialization_rng(self):
+        separate_cfg = _model_config(True)
+        separate_cfg.contact_velocity_mode = "xyz"
+        factorized_cfg = _model_config(True)
+        factorized_cfg.contact_injection_mode = "factorized"
+        factorized_cfg.contact_velocity_mode = "xyz"
+
+        torch.manual_seed(1234)
+        separate_model = MDM_ST(
+            8,
+            1,
+            n_feats=3,
+            model_config=separate_cfg,
+        )
+        separate_state = {
+            key: value.detach().clone()
+            for key, value in separate_model.dit.state_dict().items()
+        }
+
+        torch.manual_seed(1234)
+        factorized_model = MDM_ST(
+            8,
+            1,
+            n_feats=3,
+            model_config=factorized_cfg,
+        )
+        factorized_state = factorized_model.dit.state_dict()
+
+        self.assertEqual(separate_state.keys(), factorized_state.keys())
+        for key in separate_state:
+            with self.subTest(key=key):
+                torch.testing.assert_close(
+                    factorized_state[key],
+                    separate_state[key],
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_factorized_step_zero_matches_separate_xyz_exactly(self):
+        separate_cfg = _model_config(True)
+        separate_cfg.contact_velocity_mode = "xyz"
+        factorized_cfg = _model_config(True)
+        factorized_cfg.contact_injection_mode = "factorized"
+        factorized_cfg.contact_velocity_mode = "xyz"
+
+        torch.manual_seed(4321)
+        separate_model = MDM_ST(
+            4,
+            1,
+            n_feats=3,
+            model_config=separate_cfg,
+        ).eval()
+        torch.manual_seed(4321)
+        factorized_model = MDM_ST(
+            4,
+            1,
+            n_feats=3,
+            model_config=factorized_cfg,
+        ).eval()
+        batch = _small_model_batch()
+
+        with torch.no_grad():
+            separate_output = separate_model(**batch)
+            factorized_output = factorized_model(**batch)
+
+        torch.testing.assert_close(
+            factorized_output,
+            separate_output,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_factorized_contact_injects_only_real_condition_frames(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "factorized"
+        cfg.contact_velocity_mode = "xyz"
+        cfg.contact_feature_mask = [1.0, 0.0, 1.0, 0.0, 1.0]
+        cfg.contact_bias_scale = 0.25
+        cfg.mask_cond = True
+        model = MDM_ST(4, 1, n_feats=3, model_config=cfg).eval()
+        batch = _small_model_batch()
+        batch["drag_mask"] = batch["drag_mask"].unsqueeze(1)
+        batch["start_vel"] = None
+        captured_hidden = []
+
+        with torch.no_grad():
+            model.contact_adapter.boundary.weight.fill_(1.0)
+            model.contact_adapter.normal.weight.fill_(2.0)
+            model.contact_adapter.tangential.weight.fill_(3.0)
+            model.contact_adapter.tangential_gate.fill_(1.0)
+            model.contact_adapter.shared_bias.fill_(4.0)
+
+        def capture_hidden(_module, inputs):
+            captured_hidden.append(inputs[0].detach().clone())
+
+        hook = model.dit.register_forward_pre_hook(capture_hidden)
+        try:
+            with torch.no_grad():
+                model(**batch)
+                model.contact_particle_cond = False
+                model(**batch)
+        finally:
+            hook.remove()
+
+        contact_features = build_contact_features(
+            batch["init_pc"],
+            batch["floor_height"].unsqueeze(1),
+            start_velocity=batch["start_vel"],
+            sigma=cfg.contact_feature_sigma,
+            velocity_mode="xyz",
+        )
+        contact_features = apply_contact_feature_mask(
+            contact_features,
+            cfg.contact_feature_mask,
+        )
+        expected_contact = model.contact_adapter(
+            contact_features,
+            bias_scale=cfg.contact_bias_scale,
+        ).to(captured_hidden[0].dtype)
+
+        self.assertEqual(captured_hidden[0].shape[1], 4)
+        torch.testing.assert_close(
+            captured_hidden[0][:, 0],
+            captured_hidden[1][:, 0],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            captured_hidden[0][:, 1:3],
+            captured_hidden[1][:, 1:3] + expected_contact,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            captured_hidden[0][:, 3],
+            captured_hidden[1][:, 3],
+            rtol=0,
+            atol=0,
+        )
 
     def test_xyz_contact_encoder_uses_five_features(self):
         cfg = _model_config(True)

@@ -7,6 +7,7 @@ import sys
 sys.path.append('./')
 
 from einops import rearrange, repeat
+from model.contact_adapter import FactorizedContactAdapter
 from model.dit import *
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
 from diffusers.models.embeddings import LabelEmbedding 
@@ -2560,15 +2561,20 @@ class MDM_ST(nn.Module):
             'contact_injection_mode',
             'separate',
         )
-        if self.contact_injection_mode not in ('separate', 'shared'):
-            raise ValueError(
-                "contact_injection_mode must be either 'separate' or 'shared'; "
-                f"got {self.contact_injection_mode!r}"
-            )
         self.contact_velocity_mode = model_config.get(
             'contact_velocity_mode',
             'vertical',
         )
+        if self.contact_injection_mode not in (
+            'separate',
+            'shared',
+            'factorized',
+        ):
+            raise ValueError(
+                "contact_injection_mode must be one of "
+                "'separate', 'shared', or 'factorized'; "
+                f"got {self.contact_injection_mode!r}"
+            )
         self.contact_feature_names = contact_feature_names(
             self.contact_velocity_mode
         )
@@ -2597,6 +2603,17 @@ class MDM_ST(nn.Module):
                 raise ValueError(
                     "contact_injection_mode='shared' requires "
                     "force_as_latent=false"
+                )
+        elif self.contact_injection_mode == 'factorized':
+            if not self.contact_particle_cond:
+                raise ValueError(
+                    "contact_injection_mode='factorized' requires "
+                    "contact_particle_cond=true"
+                )
+            if self.contact_velocity_mode != 'xyz':
+                raise ValueError(
+                    "contact_injection_mode='factorized' requires "
+                    "contact_velocity_mode='xyz'"
                 )
 
         if point_embed:
@@ -2689,6 +2706,13 @@ class MDM_ST(nn.Module):
             )
             nn.init.zeros_(self.contact_encoder.weight)
             nn.init.zeros_(self.contact_encoder.bias)
+        elif self.contact_injection_mode == 'factorized':
+            # Match separate+xyz RNG before isolated adapter initialization.
+            nn.Linear(5, self.latent_dim)
+            with torch.random.fork_rng(devices=[]):
+                self.contact_adapter = FactorizedContactAdapter(
+                    self.latent_dim
+                )
         if model_config.transformer_block == "SpatialTemporalTransformerNoDiffusion":
             self.dit = SpatialTemporalTransformerNoDiffusion(
                 sample_points=n_points,
@@ -2921,7 +2945,7 @@ class MDM_ST(nn.Module):
         )
         if (
             self.contact_particle_cond
-            and self.contact_injection_mode == 'separate'
+            and self.contact_injection_mode in ('separate', 'factorized')
         ):
             if floor_height is None:
                 raise ValueError("contact_particle_cond requires floor_height")
@@ -2931,19 +2955,29 @@ class MDM_ST(nn.Module):
                 start_velocity=start_vel,
                 sigma=self.contact_feature_sigma,
                 velocity_mode=self.contact_velocity_mode,
-            ).to(dtype=self.contact_encoder.weight.dtype)
+            )
+            if self.contact_injection_mode == 'separate':
+                contact_features = contact_features.to(
+                    dtype=self.contact_encoder.weight.dtype
+                )
             contact_features = apply_contact_feature_mask(
                 contact_features,
                 self.contact_feature_mask,
             )
-            contact_bias = self.contact_encoder.bias
-            if contact_bias is not None:
-                contact_bias = contact_bias * self.contact_bias_scale
-            contact_hidden = F.linear(
-                contact_features,
-                self.contact_encoder.weight,
-                contact_bias,
-            ).to(hidden_states.dtype)
+            if self.contact_injection_mode == 'separate':
+                contact_bias = self.contact_encoder.bias
+                if contact_bias is not None:
+                    contact_bias = contact_bias * self.contact_bias_scale
+                contact_hidden = F.linear(
+                    contact_features,
+                    self.contact_encoder.weight,
+                    contact_bias,
+                ).to(hidden_states.dtype)
+            else:
+                contact_hidden = self.contact_adapter(
+                    contact_features,
+                    bias_scale=self.contact_bias_scale,
+                ).to(hidden_states.dtype)
             n_contact_frames = contact_hidden.shape[1]
             hidden_states = torch.cat([
                 hidden_states[:, :n_contact_frames] + contact_hidden,
