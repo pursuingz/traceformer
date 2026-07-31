@@ -12,6 +12,7 @@ from contact_feature_diagnostics import (
     collect_grouped_features,
     load_contact_projection,
 )
+from model.contact_adapter import FactorizedContactAdapter
 
 
 class ContactFeatureDiagnosticTests(unittest.TestCase):
@@ -102,6 +103,22 @@ class ContactFeatureDiagnosticTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_loads_projection_from_real_factorized_adapter_state(self):
+        adapter = FactorizedContactAdapter(latent_dim=2)
+        state = {
+            f"model.contact_adapter.{key}": value
+            for key, value in adapter.state_dict().items()
+        }
+
+        weight, bias = load_contact_projection(
+            state,
+            injection_mode="factorized",
+            feature_dim=5,
+        )
+
+        torch.testing.assert_close(weight, torch.zeros(2, 5))
+        torch.testing.assert_close(bias, torch.zeros(2))
 
     def test_factorized_projection_requires_five_features(self):
         with self.assertRaisesRegex(

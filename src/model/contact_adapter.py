@@ -20,14 +20,14 @@ class FactorizedContactAdapter(nn.Module):
             raise ValueError("latent_dim must be positive")
 
         super().__init__()
-        self.boundary = nn.Linear(2, latent_dim, bias=False)
-        self.normal = nn.Linear(1, latent_dim, bias=False)
-        self.tangential = nn.Linear(2, latent_dim, bias=False)
+        self.boundary_encoder = nn.Linear(2, latent_dim, bias=False)
+        self.normal_encoder = nn.Linear(1, latent_dim, bias=False)
+        self.tangential_encoder = nn.Linear(2, latent_dim, bias=False)
         self.shared_bias = nn.Parameter(torch.zeros(latent_dim))
         self.tangential_gate = nn.Parameter(torch.zeros(()))
 
-        nn.init.zeros_(self.boundary.weight)
-        nn.init.zeros_(self.normal.weight)
+        nn.init.zeros_(self.boundary_encoder.weight)
+        nn.init.zeros_(self.normal_encoder.weight)
 
     def forward(
         self,
@@ -40,9 +40,11 @@ class FactorizedContactAdapter(nn.Module):
                 f"got {tuple(features.shape)}"
             )
 
-        boundary = self.boundary(features[..., BOUNDARY_FEATURE_INDICES])
-        normal = self.normal(features[..., NORMAL_FEATURE_INDICES])
-        tangential = self.tangential(
+        boundary = self.boundary_encoder(
+            features[..., BOUNDARY_FEATURE_INDICES]
+        )
+        normal = self.normal_encoder(features[..., NORMAL_FEATURE_INDICES])
+        tangential = self.tangential_encoder(
             features[..., TANGENTIAL_FEATURE_INDICES]
         )
         tangential_gate = torch.tanh(self.tangential_gate).to(

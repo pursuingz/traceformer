@@ -61,11 +61,11 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
 
         with torch.no_grad():
-            adapter.boundary.weight.copy_(
+            adapter.boundary_encoder.weight.copy_(
                 torch.tensor([[1.0, 10.0], [100.0, 1000.0]])
             )
-            adapter.normal.weight.copy_(torch.tensor([[2.0], [3.0]]))
-            adapter.tangential.weight.copy_(
+            adapter.normal_encoder.weight.copy_(torch.tensor([[2.0], [3.0]]))
+            adapter.tangential_encoder.weight.copy_(
                 torch.tensor([[4.0, 5.0], [6.0, 7.0]])
             )
             adapter.shared_bias.copy_(torch.tensor([8.0, 9.0]))
@@ -81,10 +81,12 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
 
         with torch.no_grad():
-            adapter.boundary.weight.copy_(
+            adapter.boundary_encoder.weight.copy_(
                 torch.tensor([[1.0, 2.0], [3.0, 4.0]])
             )
-            adapter.normal.weight.copy_(torch.tensor([[5.0], [6.0]]))
+            adapter.normal_encoder.weight.copy_(
+                torch.tensor([[5.0], [6.0]])
+            )
             adapter.shared_bias.copy_(torch.tensor([2.0, -4.0]))
 
         without_bias = adapter(features, bias_scale=0.0)
@@ -107,7 +109,7 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         adapter = FactorizedContactAdapter(latent_dim=4)
         features = torch.ones(2, 3, 4, 5)
         with torch.no_grad():
-            adapter.tangential.weight.fill_(1.0)
+            adapter.tangential_encoder.weight.fill_(1.0)
             adapter.shared_bias.fill_(1.0)
 
         with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -121,15 +123,15 @@ class FactorizedContactAdapterTests(unittest.TestCase):
     def test_latent_256_has_expected_parameterization(self):
         adapter = FactorizedContactAdapter(latent_dim=256)
 
-        self.assertEqual(adapter.boundary.in_features, 2)
-        self.assertEqual(adapter.boundary.out_features, 256)
-        self.assertIsNone(adapter.boundary.bias)
-        self.assertEqual(adapter.normal.in_features, 1)
-        self.assertEqual(adapter.normal.out_features, 256)
-        self.assertIsNone(adapter.normal.bias)
-        self.assertEqual(adapter.tangential.in_features, 2)
-        self.assertEqual(adapter.tangential.out_features, 256)
-        self.assertIsNone(adapter.tangential.bias)
+        self.assertEqual(adapter.boundary_encoder.in_features, 2)
+        self.assertEqual(adapter.boundary_encoder.out_features, 256)
+        self.assertIsNone(adapter.boundary_encoder.bias)
+        self.assertEqual(adapter.normal_encoder.in_features, 1)
+        self.assertEqual(adapter.normal_encoder.out_features, 256)
+        self.assertIsNone(adapter.normal_encoder.bias)
+        self.assertEqual(adapter.tangential_encoder.in_features, 2)
+        self.assertEqual(adapter.tangential_encoder.out_features, 256)
+        self.assertIsNone(adapter.tangential_encoder.bias)
         self.assertEqual(
             sum(parameter.numel() for parameter in adapter.parameters()),
             1537,
@@ -140,12 +142,18 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         adapter = FactorizedContactAdapter(latent_dim=16)
         features = torch.randn(2, 3, 4, 5)
 
-        self.assertEqual(torch.count_nonzero(adapter.boundary.weight).item(), 0)
-        self.assertEqual(torch.count_nonzero(adapter.normal.weight).item(), 0)
+        self.assertEqual(
+            torch.count_nonzero(adapter.boundary_encoder.weight).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(adapter.normal_encoder.weight).item(),
+            0,
+        )
         self.assertEqual(torch.count_nonzero(adapter.shared_bias).item(), 0)
         self.assertEqual(torch.count_nonzero(adapter.tangential_gate).item(), 0)
         self.assertGreater(
-            torch.count_nonzero(adapter.tangential.weight).item(),
+            torch.count_nonzero(adapter.tangential_encoder.weight).item(),
             0,
         )
         torch.testing.assert_close(
@@ -159,20 +167,22 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         adapter = FactorizedContactAdapter(latent_dim=4)
         features = torch.ones(2, 3, 4, 5)
         with torch.no_grad():
-            adapter.tangential.weight.fill_(1.0)
+            adapter.tangential_encoder.weight.fill_(1.0)
 
         adapter(features).sum().backward()
 
         self.assertGreater(
-            torch.count_nonzero(adapter.boundary.weight.grad).item(),
+            torch.count_nonzero(adapter.boundary_encoder.weight.grad).item(),
             0,
         )
         self.assertGreater(
-            torch.count_nonzero(adapter.normal.weight.grad).item(),
+            torch.count_nonzero(adapter.normal_encoder.weight.grad).item(),
             0,
         )
         self.assertEqual(
-            torch.count_nonzero(adapter.tangential.weight.grad).item(),
+            torch.count_nonzero(
+                adapter.tangential_encoder.weight.grad
+            ).item(),
             0,
         )
         self.assertNotEqual(adapter.tangential_gate.grad.item(), 0.0)
@@ -186,7 +196,9 @@ class FactorizedContactAdapterTests(unittest.TestCase):
         adapter(features).sum().backward()
 
         self.assertGreater(
-            torch.count_nonzero(adapter.tangential.weight.grad).item(),
+            torch.count_nonzero(
+                adapter.tangential_encoder.weight.grad
+            ).item(),
             0,
         )
 
@@ -802,7 +814,7 @@ class ContactFeatureTests(unittest.TestCase):
         finally:
             hook.remove()
 
-        adapter_parameter = model.contact_adapter.boundary.weight
+        adapter_parameter = model.contact_adapter.boundary_encoder.weight
         self.assertEqual(batch["init_pc"].dtype, torch.float32)
         self.assertEqual(
             captured_adapter_spec,
@@ -828,9 +840,9 @@ class ContactFeatureTests(unittest.TestCase):
         captured_adapter_features = []
 
         with torch.no_grad():
-            model.contact_adapter.boundary.weight.fill_(1.0)
-            model.contact_adapter.normal.weight.fill_(2.0)
-            model.contact_adapter.tangential.weight.fill_(3.0)
+            model.contact_adapter.boundary_encoder.weight.fill_(1.0)
+            model.contact_adapter.normal_encoder.weight.fill_(2.0)
+            model.contact_adapter.tangential_encoder.weight.fill_(3.0)
             model.contact_adapter.tangential_gate.fill_(1.0)
             model.contact_adapter.shared_bias.fill_(4.0)
             model.start_vel_encoder.weight.zero_()

@@ -2983,7 +2983,7 @@ class MDM_ST(nn.Module):
                 ).to(hidden_states.dtype)
             else:
                 contact_features = contact_features.to(
-                    self.contact_adapter.boundary.weight
+                    self.contact_adapter.boundary_encoder.weight
                 )
                 contact_hidden = self.contact_adapter(
                     contact_features,
