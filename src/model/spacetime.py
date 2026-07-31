@@ -2708,8 +2708,16 @@ class MDM_ST(nn.Module):
             nn.init.zeros_(self.contact_encoder.bias)
         elif self.contact_injection_mode == 'factorized':
             # Match separate+xyz RNG before isolated adapter initialization.
-            nn.Linear(5, self.latent_dim)
-            with torch.random.fork_rng(devices=[]):
+            legacy_rng_anchor = nn.Linear(5, self.latent_dim)
+            anchor_device = legacy_rng_anchor.weight.device
+            fork_devices = []
+            if anchor_device.type == 'cuda':
+                device_index = anchor_device.index
+                if device_index is None:
+                    device_index = torch.cuda.current_device()
+                fork_devices = [device_index]
+            del legacy_rng_anchor
+            with torch.random.fork_rng(devices=fork_devices):
                 self.contact_adapter = FactorizedContactAdapter(
                     self.latent_dim
                 )
@@ -2974,6 +2982,9 @@ class MDM_ST(nn.Module):
                     contact_bias,
                 ).to(hidden_states.dtype)
             else:
+                contact_features = contact_features.to(
+                    self.contact_adapter.boundary.weight
+                )
                 contact_hidden = self.contact_adapter(
                     contact_features,
                     bias_scale=self.contact_bias_scale,

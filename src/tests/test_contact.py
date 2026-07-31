@@ -686,6 +686,51 @@ class ContactFeatureTests(unittest.TestCase):
                     atol=0,
                 )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_factorized_contact_preserves_dit_rng_on_default_cuda(self):
+        separate_cfg = _model_config(True)
+        separate_cfg.contact_velocity_mode = "xyz"
+        factorized_cfg = _model_config(True)
+        factorized_cfg.contact_injection_mode = "factorized"
+        factorized_cfg.contact_velocity_mode = "xyz"
+        original_default_device = torch.get_default_device()
+        cuda_device = torch.device("cuda", torch.cuda.current_device())
+
+        try:
+            torch.set_default_device(cuda_device)
+            torch.manual_seed(5678)
+            separate_model = MDM_ST(
+                8,
+                1,
+                n_feats=3,
+                model_config=separate_cfg,
+            )
+            separate_state = {
+                key: value.detach().clone()
+                for key, value in separate_model.dit.state_dict().items()
+            }
+
+            torch.manual_seed(5678)
+            factorized_model = MDM_ST(
+                8,
+                1,
+                n_feats=3,
+                model_config=factorized_cfg,
+            )
+            factorized_state = factorized_model.dit.state_dict()
+        finally:
+            torch.set_default_device(original_default_device)
+
+        self.assertEqual(separate_state.keys(), factorized_state.keys())
+        for key in separate_state:
+            with self.subTest(key=key):
+                torch.testing.assert_close(
+                    factorized_state[key],
+                    separate_state[key],
+                    rtol=0,
+                    atol=0,
+                )
+
     def test_factorized_step_zero_matches_separate_xyz_exactly(self):
         separate_cfg = _model_config(True)
         separate_cfg.contact_velocity_mode = "xyz"
@@ -720,6 +765,51 @@ class ContactFeatureTests(unittest.TestCase):
             atol=0,
         )
 
+    def test_factorized_contact_casts_fp32_features_for_bfloat16_model(self):
+        cfg = _model_config(True)
+        cfg.contact_injection_mode = "factorized"
+        cfg.contact_velocity_mode = "xyz"
+        cfg.frame_cond = False
+        cfg.cond_frames = 0
+        cfg.pred_offset = False
+        model = MDM_ST(4, 1, n_feats=3, model_config=cfg).to(
+            torch.bfloat16
+        ).eval()
+        batch = _small_model_batch(cond_frames=1)
+        for key in (
+            "x",
+            "force",
+            "E",
+            "nu",
+            "drag_mask",
+            "drag_point",
+            "floor_height",
+        ):
+            batch[key] = batch[key].to(torch.bfloat16)
+        captured_adapter_spec = []
+
+        def capture_adapter_features(_module, inputs):
+            captured_adapter_spec.append(
+                (inputs[0].dtype, inputs[0].device)
+            )
+
+        hook = model.contact_adapter.register_forward_pre_hook(
+            capture_adapter_features
+        )
+        try:
+            with torch.no_grad():
+                output = model(**batch)
+        finally:
+            hook.remove()
+
+        adapter_parameter = model.contact_adapter.boundary.weight
+        self.assertEqual(batch["init_pc"].dtype, torch.float32)
+        self.assertEqual(
+            captured_adapter_spec,
+            [(adapter_parameter.dtype, adapter_parameter.device)],
+        )
+        self.assertEqual(output.dtype, torch.bfloat16)
+
     def test_factorized_contact_injects_only_real_condition_frames(self):
         cfg = _model_config(True)
         cfg.contact_injection_mode = "factorized"
@@ -730,8 +820,12 @@ class ContactFeatureTests(unittest.TestCase):
         model = MDM_ST(4, 1, n_feats=3, model_config=cfg).eval()
         batch = _small_model_batch()
         batch["drag_mask"] = batch["drag_mask"].unsqueeze(1)
-        batch["start_vel"] = None
+        batch["start_vel"].zero_()
+        batch["start_vel"][..., 0] = 0.25
+        batch["start_vel"][..., 1] = 0.1
+        batch["start_vel"][..., 2] = -0.5
         captured_hidden = []
+        captured_adapter_features = []
 
         with torch.no_grad():
             model.contact_adapter.boundary.weight.fill_(1.0)
@@ -739,30 +833,70 @@ class ContactFeatureTests(unittest.TestCase):
             model.contact_adapter.tangential.weight.fill_(3.0)
             model.contact_adapter.tangential_gate.fill_(1.0)
             model.contact_adapter.shared_bias.fill_(4.0)
+            model.start_vel_encoder.weight.zero_()
+            model.start_vel_encoder.bias.zero_()
 
         def capture_hidden(_module, inputs):
             captured_hidden.append(inputs[0].detach().clone())
 
-        hook = model.dit.register_forward_pre_hook(capture_hidden)
+        def capture_adapter_features(_module, inputs):
+            captured_adapter_features.append(inputs[0].detach().clone())
+
+        dit_hook = model.dit.register_forward_pre_hook(capture_hidden)
+        adapter_hook = model.contact_adapter.register_forward_pre_hook(
+            capture_adapter_features
+        )
         try:
             with torch.no_grad():
                 model(**batch)
                 model.contact_particle_cond = False
                 model(**batch)
         finally:
-            hook.remove()
+            adapter_hook.remove()
+            dit_hook.remove()
 
-        contact_features = build_contact_features(
+        unmasked_contact_features = build_contact_features(
             batch["init_pc"],
             batch["floor_height"].unsqueeze(1),
             start_velocity=batch["start_vel"],
             sigma=cfg.contact_feature_sigma,
             velocity_mode="xyz",
         )
+        self.assertGreater(
+            torch.count_nonzero(unmasked_contact_features[..., 1]).item(),
+            0,
+        )
+        self.assertGreater(
+            torch.count_nonzero(unmasked_contact_features[..., 3]).item(),
+            0,
+        )
         contact_features = apply_contact_feature_mask(
-            contact_features,
+            unmasked_contact_features,
             cfg.contact_feature_mask,
         )
+        self.assertEqual(len(captured_adapter_features), 1)
+        torch.testing.assert_close(
+            captured_adapter_features[0],
+            contact_features,
+            rtol=0,
+            atol=0,
+        )
+        for channel_index in (1, 3):
+            with self.subTest(masked_channel=channel_index):
+                self.assertEqual(
+                    torch.count_nonzero(
+                        captured_adapter_features[0][..., channel_index]
+                    ).item(),
+                    0,
+                )
+        for channel_index in (0, 2, 4):
+            with self.subTest(retained_channel=channel_index):
+                torch.testing.assert_close(
+                    captured_adapter_features[0][..., channel_index],
+                    unmasked_contact_features[..., channel_index],
+                    rtol=0,
+                    atol=0,
+                )
         expected_contact = model.contact_adapter(
             contact_features,
             bias_scale=cfg.contact_bias_scale,
