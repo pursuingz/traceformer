@@ -4,7 +4,6 @@ import argparse
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 
@@ -166,6 +165,17 @@ def load_factorized_contact_stats(state):
     }
 
 
+def _mean_projected_token_norm(features, weight):
+    gram = weight.T @ weight
+    norm_sq = torch.einsum(
+        "ti,ij,tj->t",
+        features,
+        gram,
+        features,
+    ).clamp_min(0)
+    return torch.sqrt(norm_sq).mean()
+
+
 def factorized_branch_hidden_norms(features, state):
     """Return mean per-token hidden norms for each factorized branch."""
     if features.ndim != 2 or features.shape[1] != 5:
@@ -180,25 +190,22 @@ def factorized_branch_hidden_norms(features, state):
         _,
         effective_gate,
     ) = _load_factorized_contact_parameters(state)
-    boundary_hidden = F.linear(features[:, [0, 4]], boundary_weight)
-    normal_hidden = F.linear(features[:, 2:3], normal_weight)
-    tangential_hidden = effective_gate * F.linear(
+    boundary_norm = _mean_projected_token_norm(
+        features[:, [0, 4]],
+        boundary_weight,
+    )
+    normal_norm = _mean_projected_token_norm(
+        features[:, 2:3],
+        normal_weight,
+    )
+    tangential_norm = _mean_projected_token_norm(
         features[:, [1, 3]],
         tangential_weight,
-    )
+    ) * effective_gate.abs()
     return {
-        "boundary": torch.linalg.vector_norm(
-            boundary_hidden,
-            dim=1,
-        ).mean().item(),
-        "normal": torch.linalg.vector_norm(
-            normal_hidden,
-            dim=1,
-        ).mean().item(),
-        "tangential": torch.linalg.vector_norm(
-            tangential_hidden,
-            dim=1,
-        ).mean().item(),
+        "boundary": boundary_norm.item(),
+        "normal": normal_norm.item(),
+        "tangential": tangential_norm.item(),
     }
 
 

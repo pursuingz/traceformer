@@ -195,6 +195,35 @@ class ContactFeatureDiagnosticTests(unittest.TestCase):
             places=5,
         )
 
+    def test_factorized_branch_hidden_norms_do_not_call_linear(self):
+        state = self._factorized_state()
+        state["model.contact_adapter.tangential_gate"] = torch.atanh(
+            torch.tensor(-0.5)
+        )
+        features = torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 4.0, 5.0],
+                [0.0, 1.0, 2.0, 3.0, 4.0],
+            ]
+        )
+
+        with patch(
+            "torch.nn.functional.linear",
+            side_effect=AssertionError("F.linear must not be called"),
+        ):
+            norms = (
+                contact_feature_diagnostics.factorized_branch_hidden_norms(
+                    features,
+                    state,
+                )
+            )
+
+        self.assertAlmostEqual(
+            norms["tangential"],
+            (math.sqrt(1370.0) + math.sqrt(620.5)) / 2.0,
+            places=5,
+        )
+
     def test_factorized_branch_hidden_norms_require_token_matrix(self):
         state = self._factorized_state()
         invalid_features = (
