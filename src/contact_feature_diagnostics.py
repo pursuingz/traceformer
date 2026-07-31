@@ -4,6 +4,7 @@ import argparse
 from collections import defaultdict
 
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 
@@ -32,6 +33,68 @@ def _state_tensor_by_suffix(state, suffix):
     return matches[0].float()
 
 
+def _load_factorized_contact_parameters(state):
+    boundary_weight = _state_tensor_by_suffix(
+        state,
+        "contact_adapter.boundary_encoder.weight",
+    )
+    normal_weight = _state_tensor_by_suffix(
+        state,
+        "contact_adapter.normal_encoder.weight",
+    )
+    tangential_weight = _state_tensor_by_suffix(
+        state,
+        "contact_adapter.tangential_encoder.weight",
+    )
+    shared_bias = _state_tensor_by_suffix(
+        state,
+        "contact_adapter.shared_bias",
+    )
+    raw_gate = _state_tensor_by_suffix(
+        state,
+        "contact_adapter.tangential_gate",
+    )
+
+    if boundary_weight.ndim != 2 or boundary_weight.shape[1] != 2:
+        raise ValueError(
+            "factorized boundary weight must have shape (H, 2), "
+            f"got {tuple(boundary_weight.shape)}"
+        )
+    hidden_dim = boundary_weight.shape[0]
+    expected_shapes = {
+        "normal": (hidden_dim, 1),
+        "tangential": (hidden_dim, 2),
+    }
+    branch_weights = {
+        "normal": normal_weight,
+        "tangential": tangential_weight,
+    }
+    for name, weight in branch_weights.items():
+        if tuple(weight.shape) != expected_shapes[name]:
+            raise ValueError(
+                f"factorized {name} weight must have shape "
+                f"{expected_shapes[name]}, got {tuple(weight.shape)}"
+            )
+    if tuple(shared_bias.shape) != (hidden_dim,):
+        raise ValueError(
+            "factorized shared bias must have shape "
+            f"({hidden_dim},), got {tuple(shared_bias.shape)}"
+        )
+    if raw_gate.ndim != 0:
+        raise ValueError(
+            "factorized tangential gate must be a scalar, "
+            f"got shape {tuple(raw_gate.shape)}"
+        )
+
+    return (
+        boundary_weight,
+        normal_weight,
+        tangential_weight,
+        shared_bias,
+        torch.tanh(raw_gate),
+    )
+
+
 def load_contact_projection(state, injection_mode, feature_dim):
     """Return the learned contact projection and any contact-only bias."""
     if injection_mode == "separate":
@@ -49,9 +112,27 @@ def load_contact_projection(state, injection_mode, feature_dim):
             )
         weight = full_weight[:, -feature_dim:]
         bias = None
+    elif injection_mode == "factorized":
+        if feature_dim != 5:
+            raise ValueError(
+                "factorized contact projection requires feature_dim=5; "
+                f"got {feature_dim}"
+            )
+        (
+            boundary_weight,
+            normal_weight,
+            tangential_weight,
+            bias,
+            effective_gate,
+        ) = _load_factorized_contact_parameters(state)
+        weight = boundary_weight.new_zeros(boundary_weight.shape[0], 5)
+        weight[:, [0, 4]] = boundary_weight
+        weight[:, 2:3] = normal_weight
+        weight[:, [1, 3]] = effective_gate * tangential_weight
     else:
         raise ValueError(
-            "contact_injection_mode must be either 'separate' or 'shared'; "
+            "contact_injection_mode must be one of "
+            "'separate', 'shared', or 'factorized'; "
             f"got {injection_mode!r}"
         )
 
@@ -61,6 +142,64 @@ def load_contact_projection(state, injection_mode, feature_dim):
             f"dimension: shape={tuple(weight.shape)}, feature_dim={feature_dim}"
         )
     return weight, bias
+
+
+def load_factorized_contact_stats(state):
+    """Return effective gate and parameter norms for a factorized adapter."""
+    (
+        boundary_weight,
+        normal_weight,
+        tangential_weight,
+        shared_bias,
+        effective_gate,
+    ) = _load_factorized_contact_parameters(state)
+    return {
+        "effective_gate": effective_gate.item(),
+        "boundary_weight_norm": torch.linalg.vector_norm(
+            boundary_weight
+        ).item(),
+        "normal_weight_norm": torch.linalg.vector_norm(normal_weight).item(),
+        "tangential_weight_norm": torch.linalg.vector_norm(
+            tangential_weight
+        ).item(),
+        "shared_bias_norm": torch.linalg.vector_norm(shared_bias).item(),
+    }
+
+
+def factorized_branch_hidden_norms(features, state):
+    """Return mean per-token hidden norms for each factorized branch."""
+    if features.ndim != 2 or features.shape[1] != 5:
+        raise ValueError(
+            "features must have shape (tokens, 5), "
+            f"got {tuple(features.shape)}"
+        )
+    (
+        boundary_weight,
+        normal_weight,
+        tangential_weight,
+        _,
+        effective_gate,
+    ) = _load_factorized_contact_parameters(state)
+    boundary_hidden = F.linear(features[:, [0, 4]], boundary_weight)
+    normal_hidden = F.linear(features[:, 2:3], normal_weight)
+    tangential_hidden = effective_gate * F.linear(
+        features[:, [1, 3]],
+        tangential_weight,
+    )
+    return {
+        "boundary": torch.linalg.vector_norm(
+            boundary_hidden,
+            dim=1,
+        ).mean().item(),
+        "normal": torch.linalg.vector_norm(
+            normal_hidden,
+            dim=1,
+        ).mean().item(),
+        "tangential": torch.linalg.vector_norm(
+            tangential_hidden,
+            dim=1,
+        ).mean().item(),
+    }
 
 
 def _quantile_text(values):
@@ -121,6 +260,9 @@ def main(cfg):
         injection_mode=injection_mode,
         feature_dim=len(feature_names),
     )
+    factorized_stats = None
+    if injection_mode == "factorized":
+        factorized_stats = load_factorized_contact_stats(state)
     grouped_features = collect_grouped_features(
         loader,
         sigma,
@@ -135,6 +277,19 @@ def main(cfg):
         print("encoder bias: shared point bias (not contact-specific)")
     else:
         print(f"encoder bias norm: {torch.linalg.vector_norm(bias).item():.6g}")
+    if factorized_stats is not None:
+        print(
+            "factorized effective gate: "
+            f"{factorized_stats['effective_gate']:.6g}"
+        )
+        print(
+            "factorized parameter norms: "
+            f"boundary={factorized_stats['boundary_weight_norm']:.6g}, "
+            f"normal={factorized_stats['normal_weight_norm']:.6g}, "
+            f"tangential="
+            f"{factorized_stats['tangential_weight_norm']:.6g}, "
+            f"shared_bias={factorized_stats['shared_bias_norm']:.6g}"
+        )
 
     for mat_type in sorted(grouped_features):
         features = torch.cat(grouped_features[mat_type], dim=0)
@@ -172,6 +327,14 @@ def main(cfg):
                 )
             )
         )
+        if injection_mode == "factorized":
+            branch_norms = factorized_branch_hidden_norms(features, state)
+            print(
+                "factorized branch hidden norms: "
+                f"boundary={branch_norms['boundary']:.6g}, "
+                f"normal={branch_norms['normal']:.6g}, "
+                f"tangential={branch_norms['tangential']:.6g}"
+            )
 
 
 if __name__ == "__main__":
