@@ -12,6 +12,7 @@ from unittest import mock
 import h5py
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -987,7 +988,13 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 (nonzero_batch, {}),
                 *((batch, {}) for batch in start_zero_batches),
             ]
-            args = self._b0_args()
+            from src.options import TestingConfig
+
+            config_path = PROJECT_ROOT / "src" / "configs" / "eval_mm3_contact_cond.yaml"
+            args = OmegaConf.merge(
+                OmegaConf.structured(TestingConfig),
+                OmegaConf.load(config_path),
+            )
             args.resume = str(checkpoint)
             args.train_dataset.dataset_path = str(dataset_root)
             output_dir = root / "reports"
@@ -1053,7 +1060,7 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             mock.ANY,
             batch_size=1,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
         )
 
     def test_progress_and_completion_output_are_concise_and_include_artifacts(self):

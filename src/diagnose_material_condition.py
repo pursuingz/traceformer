@@ -668,7 +668,6 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
     parameter_derangement = build_parameter_derangement(records, permutation_seed)
 
     device = "cuda"
-    args.device = device
     model = MDM_ST(args.pc_size, output_frames, n_feats=3, model_config=args.model_config).to(device)
     _load_checkpoint_strict(model, resume, load_file)
     model.eval().requires_grad_(False)
