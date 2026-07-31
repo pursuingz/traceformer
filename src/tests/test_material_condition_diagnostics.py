@@ -104,29 +104,48 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             pred_offset=True,
             seed=0,
             pc_size=2048,
+            model_type="dit_st",
+            vis_dir="vis_results_mm3_contact_cond",
+            per_model_csv=True,
             train_dataset=NamespaceConfig(
+                category="hf-objaverse-v1",
                 dataset_path=r"D:\data\mm3_data\mm3_test",
+                dataset_list="DATASET_ITEM_LIST",
+                has_gravity=True,
+                max_num_forces=1,
+                norm_fac=5,
+                stage="deform",
+                mode="diff",
+                pc_size=2048,
+                repeat=1,
+                seed=0,
+                n_sample_pro_model=300,
+                n_frames_interval=1,
+                n_training_frames=24,
+                batch_size=20,
+                overfit=False,
                 input_frames=5,
                 output_frames=1,
-                norm_fac=5,
-                n_frames_interval=1,
             ),
             model_config=NamespaceConfig(
-                contact_particle_cond=True,
-                contact_feature_sigma=0.04,
-                class_token=True,
-                num_mat=4,
-                pred_offset=True,
-                transformer_block="SpatialTemporalTransformerBlock",
                 n_layers=8,
                 latent_dim=256,
                 frame_cond=True,
                 point_embed=True,
                 mask_cond=True,
+                pred_offset=True,
+                num_neighbors=-1,
                 floor_cond=True,
-                gravity_emb=True,
+                max_num_forces=1,
                 force_as_token=False,
                 force_as_latent=False,
+                gravity_emb=True,
+                coeff_cond=False,
+                num_mat=4,
+                class_token=True,
+                transformer_block="SpatialTemporalTransformerBlock",
+                contact_particle_cond=True,
+                contact_feature_sigma=0.04,
             ),
         )
 
@@ -415,7 +434,13 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 load_material_records(root, ["duplicate.h5", "other/duplicate.h5"])
 
     def test_b0_identity_requires_all_registered_config_fields(self):
-        from src.diagnose_material_condition import _validate_b0_identity
+        from src.diagnose_material_condition import (
+            EXPECTED_MODEL_CONFIG,
+            EXPECTED_MODEL_DEFAULT_VALUES,
+            EXPECTED_TOP_LEVEL_CONFIG,
+            EXPECTED_TRAIN_DATASET_CONFIG,
+            _validate_b0_identity,
+        )
 
         records = self._b0_records()
         _validate_b0_identity(self._b0_args(), records)
@@ -430,30 +455,58 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             "pred_offset": False,
             "seed": 1,
             "pc_size": 1024,
+            "model_type": "mdm",
+            "train_dataset.category": "other-category",
+            "train_dataset.dataset_list": "OTHER_LIST",
+            "train_dataset.has_gravity": False,
+            "train_dataset.max_num_forces": 2,
+            "train_dataset.norm_fac": 4,
+            "train_dataset.stage": "shape",
+            "train_dataset.mode": "ae",
+            "train_dataset.pc_size": 1024,
+            "train_dataset.repeat": 2,
+            "train_dataset.seed": 1,
+            "train_dataset.n_sample_pro_model": 200,
+            "train_dataset.n_frames_interval": 2,
+            "train_dataset.n_training_frames": 23,
+            "train_dataset.batch_size": 19,
+            "train_dataset.overfit": True,
             "train_dataset.input_frames": 4,
             "train_dataset.output_frames": 5,
-            "train_dataset.norm_fac": 4,
-            "train_dataset.n_frames_interval": 2,
-            "model_config.contact_particle_cond": False,
-            "model_config.contact_feature_sigma": 0.08,
-            "model_config.class_token": False,
-            "model_config.num_mat": 3,
-            "model_config.pred_offset": False,
-            "model_config.transformer_block": "SpatialTemporalTransformerBlockv3",
             "model_config.n_layers": 5,
             "model_config.latent_dim": 128,
             "model_config.frame_cond": False,
             "model_config.point_embed": False,
             "model_config.mask_cond": False,
+            "model_config.pred_offset": False,
+            "model_config.num_neighbors": 8,
             "model_config.floor_cond": False,
-            "model_config.gravity_emb": False,
+            "model_config.max_num_forces": 2,
             "model_config.force_as_token": True,
             "model_config.force_as_latent": True,
+            "model_config.gravity_emb": False,
+            "model_config.coeff_cond": True,
+            "model_config.num_mat": 3,
+            "model_config.class_token": False,
+            "model_config.transformer_block": "SpatialTemporalTransformerBlockv3",
+            "model_config.contact_particle_cond": False,
+            "model_config.contact_feature_sigma": 0.08,
             "model_config.contact_injection_mode": "shared",
             "model_config.contact_velocity_mode": "xyz",
             "model_config.contact_feature_mask": [1, 0, 1],
             "model_config.contact_bias_scale": 0.5,
         }
+        expected_fields = set(EXPECTED_TOP_LEVEL_CONFIG)
+        expected_fields.update(
+            f"model_config.{field}" for field in EXPECTED_MODEL_CONFIG
+        )
+        expected_fields.update(
+            f"model_config.{field}" for field in EXPECTED_MODEL_DEFAULT_VALUES
+        )
+        expected_fields.update(
+            f"train_dataset.{field}" for field in EXPECTED_TRAIN_DATASET_CONFIG
+        )
+        self.assertEqual(set(mismatches), expected_fields)
         for field, value in mismatches.items():
             with self.subTest(field=field):
                 args = self._b0_args()
@@ -471,6 +524,33 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         explicit_defaults.model_config.contact_feature_mask = [1, 1, 1]
         explicit_defaults.model_config.contact_bias_scale = 1.0
         _validate_b0_identity(explicit_defaults, records)
+
+    def test_b0_identity_allows_only_declared_nonsemantic_runtime_fields(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        args = self._b0_args()
+        args.dataloader_num_workers = 12
+        args.vis_dir = "another-visualization-directory"
+        args.per_model_csv = False
+        args.contact_eval_margin = 123.0
+
+        _validate_b0_identity(args, self._b0_records())
+
+    def test_b0_identity_rejects_unregistered_config_fields(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        for section, field in (
+            ("top-level", "unexpected_semantic"),
+            ("model_config", "pred_velocity"),
+            ("train_dataset", "rollout_random_window"),
+        ):
+            with self.subTest(section=section, field=field):
+                args = self._b0_args()
+                target = args if section == "top-level" else getattr(args, section)
+                setattr(target, field, True)
+
+                with self.assertRaisesRegex(ValueError, rf"unexpected.*{field}"):
+                    _validate_b0_identity(args, self._b0_records())
 
     def test_b0_identity_requires_expected_paths_counts_and_unique_metadata_set(self):
         from src.diagnose_material_condition import _validate_b0_identity

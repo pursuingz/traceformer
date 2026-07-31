@@ -82,41 +82,84 @@ EXPECTED_MODEL_NAMES = frozenset(
         "44503_001.h5",
     }
 )
-EXPECTED_CONFIG_VALUES = (
-    ("input_frames", 5),
-    ("output_frames", 1),
-    ("use_diffusion", False),
-    ("num_inference_steps", 1),
-    ("eval_batch_size", 1),
-    ("floor_projection", False),
-    ("pred_offset", True),
-    ("seed", 0),
-    ("pc_size", 2048),
-    ("train_dataset.input_frames", 5),
-    ("train_dataset.output_frames", 1),
-    ("train_dataset.norm_fac", 5),
-    ("train_dataset.n_frames_interval", 1),
-    ("model_config.contact_particle_cond", True),
-    ("model_config.contact_feature_sigma", 0.04),
-    ("model_config.class_token", True),
-    ("model_config.num_mat", 4),
-    ("model_config.pred_offset", True),
-    ("model_config.transformer_block", "SpatialTemporalTransformerBlock"),
-    ("model_config.n_layers", 8),
-    ("model_config.latent_dim", 256),
-    ("model_config.frame_cond", True),
-    ("model_config.point_embed", True),
-    ("model_config.mask_cond", True),
-    ("model_config.floor_cond", True),
-    ("model_config.gravity_emb", True),
-    ("model_config.force_as_token", False),
-    ("model_config.force_as_latent", False),
+EXPECTED_TOP_LEVEL_CONFIG = {
+    "pc_size": 2048,
+    "eval_batch_size": 1,
+    "seed": 0,
+    "pred_offset": True,
+    "model_type": "dit_st",
+    "use_diffusion": False,
+    "num_inference_steps": 1,
+    "input_frames": 5,
+    "output_frames": 1,
+    "floor_projection": False,
+}
+EXPECTED_MODEL_CONFIG = {
+    "n_layers": 8,
+    "latent_dim": 256,
+    "frame_cond": True,
+    "point_embed": True,
+    "mask_cond": True,
+    "pred_offset": True,
+    "num_neighbors": -1,
+    "floor_cond": True,
+    "max_num_forces": 1,
+    "force_as_token": False,
+    "force_as_latent": False,
+    "gravity_emb": True,
+    "coeff_cond": False,
+    "num_mat": 4,
+    "class_token": True,
+    "transformer_block": "SpatialTemporalTransformerBlock",
+    "contact_particle_cond": True,
+    "contact_feature_sigma": 0.04,
+}
+EXPECTED_MODEL_DEFAULT_VALUES = {
+    "contact_injection_mode": "separate",
+    "contact_velocity_mode": "vertical",
+    "contact_feature_mask": [1, 1, 1],
+    "contact_bias_scale": 1.0,
+}
+EXPECTED_TRAIN_DATASET_CONFIG = {
+    "category": "hf-objaverse-v1",
+    "dataset_list": "DATASET_ITEM_LIST",
+    "has_gravity": True,
+    "max_num_forces": 1,
+    "norm_fac": 5,
+    "stage": "deform",
+    "mode": "diff",
+    "pc_size": 2048,
+    "repeat": 1,
+    "seed": 0,
+    "n_sample_pro_model": 300,
+    "n_frames_interval": 1,
+    "n_training_frames": 24,
+    "batch_size": 20,
+    "overfit": False,
+    "input_frames": 5,
+    "output_frames": 1,
+}
+# Runtime/reporting fields are intentionally not identity-bearing:
+# dataloader_num_workers, vis_dir, and per_model_csv. contact_eval_margin is also
+# excluded because this standalone script neither reads it nor passes it to model forward.
+# resume and train_dataset.dataset_path are validated separately by fixed suffixes.
+ALLOWED_TOP_LEVEL_FIELDS = frozenset(
+    set(EXPECTED_TOP_LEVEL_CONFIG)
+    | {
+        "model_config",
+        "train_dataset",
+        "resume",
+        "dataloader_num_workers",
+        "vis_dir",
+        "per_model_csv",
+        "contact_eval_margin",
+    }
 )
-EXPECTED_MODEL_DEFAULT_VALUES = (
-    ("model_config.contact_injection_mode", "separate"),
-    ("model_config.contact_velocity_mode", "vertical"),
-    ("model_config.contact_feature_mask", [1, 1, 1]),
-    ("model_config.contact_bias_scale", 1.0),
+ALLOWED_MODEL_CONFIG_FIELDS = frozenset(
+    set(EXPECTED_MODEL_CONFIG) | set(EXPECTED_MODEL_DEFAULT_VALUES)
+)
+ALLOWED_TRAIN_DATASET_FIELDS = frozenset(
+    set(EXPECTED_TRAIN_DATASET_CONFIG) | {"dataset_path"}
 )
 _MISSING = object()
 
@@ -227,11 +270,53 @@ def _validate_config_value(
         )
 
 
+def _config_field_names(config: Any) -> set[str]:
+    keys = getattr(config, "keys", None)
+    if callable(keys):
+        return {str(key) for key in keys()}
+    try:
+        return set(vars(config))
+    except TypeError as exc:
+        raise ValueError(f"B0 config section is not inspectable: {config!r}") from exc
+
+
+def _validate_allowed_fields(config: Any, section: str, allowed: frozenset[str]) -> None:
+    unexpected = sorted(_config_field_names(config) - allowed)
+    if unexpected:
+        raise ValueError(f"B0 config has unexpected {section} field(s): {unexpected}")
+
+
 def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None) -> None:
-    for field, expected in EXPECTED_CONFIG_VALUES:
+    _validate_allowed_fields(args, "top-level", ALLOWED_TOP_LEVEL_FIELDS)
+    _validate_allowed_fields(
+        args.model_config, "model_config", ALLOWED_MODEL_CONFIG_FIELDS
+    )
+    _validate_allowed_fields(
+        args.train_dataset, "train_dataset", ALLOWED_TRAIN_DATASET_FIELDS
+    )
+    for field, expected in EXPECTED_TOP_LEVEL_CONFIG.items():
         _validate_config_value(args, field, expected, use_default_when_missing=False)
-    for field, expected in EXPECTED_MODEL_DEFAULT_VALUES:
-        _validate_config_value(args, field, expected, use_default_when_missing=True)
+    for field, expected in EXPECTED_MODEL_CONFIG.items():
+        _validate_config_value(
+            args,
+            f"model_config.{field}",
+            expected,
+            use_default_when_missing=False,
+        )
+    for field, expected in EXPECTED_MODEL_DEFAULT_VALUES.items():
+        _validate_config_value(
+            args,
+            f"model_config.{field}",
+            expected,
+            use_default_when_missing=True,
+        )
+    for field, expected in EXPECTED_TRAIN_DATASET_CONFIG.items():
+        _validate_config_value(
+            args,
+            f"train_dataset.{field}",
+            expected,
+            use_default_when_missing=False,
+        )
     resume = _normalized_path(args.resume)
     if not resume.endswith(EXPECTED_RESUME_SUFFIX):
         raise ValueError(
@@ -566,7 +651,6 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
     output_frames = int(args.output_frames)
     args.train_dataset.input_frames = input_frames
     args.train_dataset.output_frames = output_frames
-    args.model_config.cond_frames = input_frames
     resume = Path(args.resume)
     dataset_root = Path(args.train_dataset.dataset_path)
     if not resume.is_file():
@@ -577,6 +661,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
     dataset = TrajDataset("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
     _validate_b0_identity(args, records)
+    args.model_config.cond_frames = input_frames
     if len(records) != EXPECTED_MODEL_COUNT:
         raise ValueError(f"expected {EXPECTED_MODEL_COUNT} material records, got {len(records)}")
     records_by_model = {record.model: record for record in records}
