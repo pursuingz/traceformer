@@ -1,6 +1,12 @@
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import h5py
 import numpy as np
 import torch
 
@@ -213,6 +219,141 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(
             summary["overall"]["gm_mse"]["response_ratio_pct"], 17.0 / 14.0 * 100.0
         )
+
+    def test_load_material_records_uses_basename_and_dataset_log10_e(self):
+        from src.diagnose_material_condition import load_material_records
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, e_value, nu_value, mat_type in (
+                ("elastic.h5", 1_000.0, 0.2, 0),
+                ("sand.h5", 100_000.0, 0.35, 2),
+            ):
+                with h5py.File(root / name, "w") as handle:
+                    handle["E"] = e_value
+                    handle["nu"] = nu_value
+                    handle["mat_type"] = mat_type
+
+            records = load_material_records(root, ["elastic.h5", "nested/sand.h5"])
+
+        self.assertEqual([record.model for record in records], ["elastic.h5", "sand.h5"])
+        self.assertEqual([record.mat_type for record in records], [0, 2])
+        self.assertAlmostEqual(records[0].log10_e, 3.0)
+        self.assertAlmostEqual(records[1].log10_e, 5.0)
+        self.assertAlmostEqual(records[0].nu, 0.2)
+
+    def test_load_material_records_reports_model_for_invalid_metadata(self):
+        from src.diagnose_material_condition import load_material_records
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with h5py.File(root / "missing.h5", "w") as handle:
+                handle["E"] = 1_000.0
+                handle["nu"] = 0.2
+
+            with self.assertRaisesRegex(ValueError, "missing.h5"):
+                load_material_records(root, ["missing.h5"])
+            with self.assertRaisesRegex(ValueError, "missing-file.h5"):
+                load_material_records(root, ["missing-file.h5"])
+            with self.assertRaisesRegex(ValueError, "missing.h5"):
+                load_material_records(root, ["missing.h5", "other/missing.h5"])
+
+    def test_rollout_condition_isolates_intervention_without_mutating_batch(self):
+        from src.diagnose_material_condition import rollout_condition
+
+        class RecordingPipeline:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(
+                self,
+                init_pc,
+                force,
+                E,
+                nu,
+                mask,
+                drag_point,
+                floor_height,
+                gravity,
+                coeff,
+                **kwargs,
+            ):
+                self.calls.append(
+                    {
+                        "force": force.clone(),
+                        "E": E.clone(),
+                        "nu": nu.clone(),
+                        "mask": mask.clone(),
+                        "drag_point": drag_point.clone(),
+                        "floor_height": floor_height.clone(),
+                        "gravity": gravity.clone(),
+                        "coeff": coeff.clone(),
+                        "y": kwargs["y"].clone(),
+                        "start_vel": kwargs["start_vel"].clone(),
+                        "seed": kwargs["generator"].initial_seed(),
+                    }
+                )
+                return init_pc[:, -1:] + 1.0
+
+        points = torch.arange(5, dtype=torch.float32).view(1, 5, 1, 1).repeat(1, 1, 1, 3)
+        batch = {
+            "points_src": points,
+            "force": torch.tensor([[1.0, 2.0, 3.0]]),
+            "E": torch.tensor([[3.0]]),
+            "nu": torch.tensor([[0.1]]),
+            "mask": torch.ones(1, 1, 1, 2),
+            "drag_point": torch.tensor([[[4.0, 5.0, 6.0]]]),
+            "floor_height": torch.tensor([0.25]),
+            "gravity": torch.tensor([[0.0, -1.0, 0.0]]),
+            "base_drag_coeff": torch.tensor([[0.4]]),
+            "mat_type": torch.tensor([0]),
+            "start_vel": torch.full((1, 1, 3), -7.0),
+        }
+        original = {key: value.clone() for key, value in batch.items()}
+        args = SimpleNamespace(
+            input_frames=5,
+            output_frames=1,
+            eval_batch_size=1,
+            num_inference_steps=1,
+            seed=17,
+            device="cpu",
+        )
+        pipeline = RecordingPipeline()
+
+        output = rollout_condition(pipeline, batch, args, 4.5, 0.33, 2)
+
+        self.assertEqual(tuple(output.shape), (1, 25, 1, 3))
+        torch.testing.assert_close(output[:, :5], points)
+        self.assertEqual(len(pipeline.calls), 20)
+        for call in pipeline.calls:
+            torch.testing.assert_close(call["E"], torch.tensor([[4.5]]))
+            torch.testing.assert_close(call["nu"], torch.tensor([[0.33]]))
+            torch.testing.assert_close(call["y"], torch.tensor([2]))
+            self.assertEqual(call["seed"], 17)
+            for key in ("force", "mask", "drag_point", "floor_height", "gravity", "coeff"):
+                expected_key = "base_drag_coeff" if key == "coeff" else key
+                expected = original[expected_key]
+                if key == "mask":
+                    expected = expected[..., :1]
+                torch.testing.assert_close(call[key], expected)
+        torch.testing.assert_close(pipeline.calls[0]["start_vel"], original["start_vel"])
+        torch.testing.assert_close(pipeline.calls[1]["start_vel"], torch.ones(1, 1, 3))
+        for key, value in batch.items():
+            torch.testing.assert_close(value, original[key])
+
+    def test_diagnose_cli_help_requires_no_runtime_inputs(self):
+        repository = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [sys.executable, "src/diagnose_material_condition.py", "--help"],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for option in ("--config", "--output-dir", "--permutation-seed", "--bootstrap-samples"):
+            self.assertIn(option, result.stdout)
 
 
 if __name__ == "__main__":

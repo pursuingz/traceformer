@@ -1,0 +1,394 @@
+"""Run B0 material-condition counterfactual diagnostics without importing eval.py."""
+
+import argparse
+import csv
+import math
+from pathlib import Path
+from typing import Any
+
+import h5py
+import numpy as np
+import torch
+
+try:  # Supports both ``python src/...`` and ``import src....``.
+    from utils.material_condition_diagnostics import (
+        MaterialRecord,
+        build_parameter_derangement,
+        condition_response_metrics,
+        rotate_material_type,
+        summarize_rows,
+        trajectory_metrics,
+    )
+except ModuleNotFoundError:
+    from src.utils.material_condition_diagnostics import (
+        MaterialRecord,
+        build_parameter_derangement,
+        condition_response_metrics,
+        rotate_material_type,
+        summarize_rows,
+        trajectory_metrics,
+    )
+
+
+ROLLOUT_HORIZON = 20
+EXPECTED_MODEL_COUNT = 41
+
+
+def _scalar_from_h5(handle: h5py.File, field: str, model: str) -> float:
+    if field not in handle:
+        raise ValueError(f"{model}: missing HDF5 field '{field}'")
+    value = np.asarray(handle[field])
+    if value.size != 1:
+        raise ValueError(f"{model}: HDF5 field '{field}' must be scalar")
+    return float(value.reshape(-1)[0])
+
+
+def load_material_records(
+    dataset_root: str | Path, model_names: list[str]
+) -> list[MaterialRecord]:
+    """Read material metadata with the same ``log10(E)`` convention as TrajDataset."""
+    root = Path(dataset_root)
+    records: list[MaterialRecord] = []
+    seen_models: set[str] = set()
+    for model_name in model_names:
+        model = Path(model_name).name
+        if model in seen_models:
+            raise ValueError(f"{model}: duplicate model record")
+        seen_models.add(model)
+        path = root / model
+        if not path.is_file():
+            raise ValueError(f"{model}: HDF5 file does not exist at {path}")
+        try:
+            with h5py.File(path, "r") as handle:
+                e_value = _scalar_from_h5(handle, "E", model)
+                nu_value = _scalar_from_h5(handle, "nu", model)
+                mat_type_value = _scalar_from_h5(handle, "mat_type", model)
+        except OSError as error:
+            raise ValueError(f"{model}: cannot read HDF5 metadata") from error
+        if not math.isfinite(e_value) or e_value <= 0:
+            raise ValueError(f"{model}: E must be finite and positive")
+        if not math.isfinite(nu_value):
+            raise ValueError(f"{model}: nu must be finite")
+        if not math.isfinite(mat_type_value) or not mat_type_value.is_integer():
+            raise ValueError(f"{model}: mat_type must be an integer")
+        records.append(
+            MaterialRecord(
+                model=model,
+                mat_type=int(mat_type_value),
+                log10_e=math.log10(e_value),
+                nu=nu_value,
+            )
+        )
+    return records
+
+
+def _constant_like(value: torch.Tensor, replacement: float | int) -> torch.Tensor:
+    return torch.full_like(value, replacement)
+
+
+@torch.no_grad()
+def rollout_condition(
+    pipeline: Any,
+    batch: dict[str, Any],
+    args: Any,
+    e_value: float,
+    nu_value: float,
+    mat_type: int,
+) -> torch.Tensor:
+    """Generate a 20-frame autoregressive rollout under one material condition."""
+    input_frames = int(args.input_frames)
+    output_frames = int(args.output_frames)
+    if input_frames <= 0 or output_frames <= 0:
+        raise ValueError("input_frames and output_frames must be positive")
+
+    device = getattr(args, "device", "cuda")
+    current_input = batch["points_src"].to(device)
+    if current_input.shape[1] != input_frames:
+        raise ValueError(
+            f"points_src has {current_input.shape[1]} frames; expected {input_frames}"
+        )
+    rollout_chunks = [current_input]
+    previous_input = current_input
+    steps = math.ceil(ROLLOUT_HORIZON / output_frames)
+    e_condition = _constant_like(batch["E"], e_value)
+    nu_condition = _constant_like(batch["nu"], nu_value)
+    if "mat_type" in batch:
+        y_condition = _constant_like(batch["mat_type"], mat_type)
+    else:
+        y_condition = torch.full(
+            (current_input.shape[0],),
+            mat_type,
+            dtype=torch.long,
+            device=current_input.device,
+        )
+
+    for step_idx in range(steps):
+        if step_idx == 0:
+            step_start_vel = batch.get("start_vel")
+            if step_start_vel is not None:
+                step_start_vel = step_start_vel.to(device)
+        elif input_frames == 1:
+            step_start_vel = current_input[:, -1] - previous_input[:, -1]
+        elif output_frames >= 2:
+            step_start_vel = current_input[:, 1] - previous_input[:, -1]
+        else:
+            step_start_vel = current_input[:, 1] - current_input[:, 0]
+
+        pred_chunk = pipeline(
+            current_input,
+            batch["force"],
+            e_condition,
+            nu_condition,
+            batch["mask"][..., :1],
+            batch["drag_point"],
+            batch["floor_height"],
+            batch["gravity"],
+            batch["base_drag_coeff"],
+            start_vel=step_start_vel,
+            points_rest=batch.get("points_rest"),
+            y=y_condition,
+            device=device,
+            batch_size=args.eval_batch_size,
+            generator=torch.Generator().manual_seed(args.seed),
+            n_frames=output_frames,
+            num_inference_steps=args.num_inference_steps,
+        )
+        if getattr(args, "floor_projection", False):
+            floor_height = batch["floor_height"].to(device).view(-1, 1, 1)
+            pred_chunk = pred_chunk.clone()
+            pred_chunk[..., 1] = torch.maximum(pred_chunk[..., 1], floor_height)
+        rollout_chunks.append(pred_chunk)
+        previous_input = current_input
+        current_input = torch.cat([current_input, pred_chunk], dim=1)[:, -input_frames:]
+
+    return torch.cat(rollout_chunks, dim=1)[:, : input_frames + ROLLOUT_HORIZON]
+
+
+def _build_raw_reference(batch: dict[str, Any], dataset_cfg: Any) -> torch.Tensor:
+    interval = int(dataset_cfg.get("n_frames_interval", 1))
+    sequences = []
+    for index, model_name in enumerate(batch["model"]):
+        path = Path(dataset_cfg.dataset_path) / Path(model_name).name
+        with h5py.File(path, "r") as handle:
+            raw_points = torch.from_numpy(np.asarray(handle["x"]))
+        point_indices = batch["point_indices"][index].cpu().numpy()
+        selected_frames = np.arange(25) * interval
+        if selected_frames[-1] >= raw_points.shape[0]:
+            raise ValueError(f"{model_name}: cannot provide 25 ground-truth frames")
+        sequence = raw_points[selected_frames][:, point_indices].float()
+        sequences.append((sequence - dataset_cfg.norm_fac) / 2)
+    return torch.stack(sequences, dim=0)
+
+
+def _metric_row(prefix: str, pred: torch.Tensor, gt: torch.Tensor, input_frames: int) -> dict[str, float]:
+    return {
+        f"{prefix}_{name}": value
+        for name, value in trajectory_metrics(pred, gt, input_frames).items()
+    }
+
+
+def _response_row(prefix: str, normal: torch.Tensor, counterfactual: torch.Tensor, input_frames: int) -> dict[str, float]:
+    return {
+        f"{prefix}_{name}": value
+        for name, value in condition_response_metrics(
+            normal, counterfactual, input_frames
+        ).items()
+    }
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        raise ValueError("cannot write an empty diagnostics CSV")
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_markdown(
+    path: Path,
+    rows: list[dict[str, Any],],
+    samples: int,
+    seed: int,
+) -> None:
+    lines = ["# B0 Material-Condition Diagnostics", ""]
+    for intervention in ("shuffle_params", "shuffle_class"):
+        summary = summarize_rows(rows, intervention, samples=samples, seed=seed)
+        lines.extend([f"## {intervention}", ""])
+        lines.append(
+            "| Group | Metric | Baseline | Counterfactual | Relative change | "
+            "Paired delta 95% CI | Response ratio | Label |"
+        )
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |")
+        for group, metrics in summary.items():
+            for metric, stats in metrics.items():
+                lines.append(
+                    "| {group} | {metric} | {normal_mean:.6e} | {counterfactual_mean:.6e} | "
+                    "{relative_change_pct:+.2f}% | [{ci_low:.6e}, {ci_high:.6e}] | "
+                    "{response_ratio_pct:.2f}% | {label} |".format(
+                        group=group,
+                        metric=metric,
+                        **stats,
+                    )
+                )
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstrap_samples: int) -> list[dict[str, Any]]:
+    """Load the model once, evaluate each test model's start-0 window once, and write rows."""
+    from diffusers import DDIMScheduler
+    from safetensors.torch import load_file
+
+    try:
+        from dataset.traj_dataset import TrajDataset
+        from model.spacetime import MDM_ST
+        from pipeline_traj import TrajPipeline
+    except ModuleNotFoundError:
+        from src.dataset.traj_dataset import TrajDataset
+        from src.model.spacetime import MDM_ST
+        from src.pipeline_traj import TrajPipeline
+
+    input_frames = int(args.input_frames)
+    output_frames = int(args.output_frames)
+    args.train_dataset.input_frames = input_frames
+    args.train_dataset.output_frames = output_frames
+    args.model_config.cond_frames = input_frames
+    resume = Path(args.resume)
+    dataset_root = Path(args.train_dataset.dataset_path)
+    if not resume.is_file():
+        raise FileNotFoundError(f"checkpoint does not exist: {resume}")
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(f"dataset directory does not exist: {dataset_root}")
+
+    dataset = TrajDataset("test", args.train_dataset)
+    records = load_material_records(dataset_root, dataset.split_lst_save)
+    if len(records) != EXPECTED_MODEL_COUNT:
+        raise ValueError(f"expected {EXPECTED_MODEL_COUNT} material records, got {len(records)}")
+    records_by_model = {record.model: record for record in records}
+    parameter_derangement = build_parameter_derangement(records, permutation_seed)
+
+    device = "cuda"
+    args.device = device
+    model = MDM_ST(args.pc_size, output_frames, n_feats=3, model_config=args.model_config).to(device)
+    model.load_state_dict(load_file(str(resume), device="cpu"), strict=False)
+    model.eval().requires_grad_(False)
+    model = torch.compile(model)
+    scheduler = (
+        DDIMScheduler(num_train_timesteps=1000, prediction_type="sample", clip_sample=False)
+        if args.use_diffusion
+        else None
+    )
+    pipeline = TrajPipeline(model=model, scheduler=scheduler)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.dataloader_num_workers,
+    )
+
+    rows: list[dict[str, Any]] = []
+    evaluated_models: set[str] = set()
+    for batch, _ in dataloader:
+        start_indices = batch["start_idx"]
+        if not torch.all(start_indices == 0):
+            if torch.any(start_indices == 0):
+                raise ValueError("start-0 and nonzero windows must not share a batch")
+            continue
+        names = [Path(name).name for name in batch["model"]]
+        if len(names) != 1:
+            raise ValueError("B0 diagnostics requires eval_batch_size=1 for per-model rows")
+        model_name = names[0]
+        if model_name in evaluated_models:
+            raise ValueError(f"{model_name}: evaluated more than once")
+        record = records_by_model.get(model_name)
+        if record is None:
+            raise ValueError(f"{model_name}: missing material metadata")
+        gt = _build_raw_reference(batch, args.train_dataset)
+        normal = rollout_condition(pipeline, batch, args, record.log10_e, record.nu, record.mat_type)
+        shuffled_e, shuffled_nu = parameter_derangement[model_name]
+        shuffled_params = rollout_condition(
+            pipeline, batch, args, shuffled_e, shuffled_nu, record.mat_type
+        )
+        shuffled_class_type = rotate_material_type(record.mat_type)
+        shuffled_class = rollout_condition(
+            pipeline,
+            batch,
+            args,
+            record.log10_e,
+            record.nu,
+            shuffled_class_type,
+        )
+        row: dict[str, Any] = {
+            "model": model_name,
+            "mat_type": record.mat_type,
+            "true_log10_e": record.log10_e,
+            "true_nu": record.nu,
+            "shuffled_log10_e": shuffled_e,
+            "shuffled_nu": shuffled_nu,
+            "shuffled_mat_type": shuffled_class_type,
+        }
+        row.update(_metric_row("normal", normal[0], gt[0], input_frames))
+        row.update(_metric_row("shuffle_params", shuffled_params[0], gt[0], input_frames))
+        row.update(_metric_row("shuffle_class", shuffled_class[0], gt[0], input_frames))
+        row.update(_response_row("shuffle_params", normal[0], shuffled_params[0], input_frames))
+        row.update(_response_row("shuffle_class", normal[0], shuffled_class[0], input_frames))
+        rows.append(row)
+        evaluated_models.add(model_name)
+
+    if len(evaluated_models) != EXPECTED_MODEL_COUNT:
+        raise ValueError(
+            f"expected {EXPECTED_MODEL_COUNT} start-0 evaluations, got {len(evaluated_models)}"
+        )
+    if evaluated_models != set(records_by_model):
+        missing = sorted(set(records_by_model) - evaluated_models)
+        unexpected = sorted(evaluated_models - set(records_by_model))
+        raise ValueError(f"evaluated models do not match metadata; missing={missing}, unexpected={unexpected}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(output_dir / f"material_condition_b0_seed{permutation_seed}.csv", rows)
+    _write_markdown(
+        output_dir / f"material_condition_b0_seed{permutation_seed}.md",
+        rows,
+        samples=bootstrap_samples,
+        seed=permutation_seed,
+    )
+    return rows
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run B0 material-condition counterfactual diagnostics.")
+    parser.add_argument("--config", required=True, help="Evaluation YAML matching the checkpoint.")
+    parser.add_argument(
+        "--output-dir",
+        default="results/material_condition_b0",
+        help="Directory for the per-model CSV and summary Markdown.",
+    )
+    parser.add_argument("--permutation-seed", type=int, default=0)
+    parser.add_argument("--bootstrap-samples", type=int, default=10000)
+    return parser.parse_args()
+
+
+def main() -> None:
+    cli_args = _parse_args()
+    if cli_args.bootstrap_samples <= 0:
+        raise ValueError("bootstrap-samples must be positive")
+
+    from omegaconf import OmegaConf
+
+    try:
+        from options import TestingConfig
+    except ModuleNotFoundError:
+        from src.options import TestingConfig
+
+    args = OmegaConf.merge(OmegaConf.structured(TestingConfig), OmegaConf.load(cli_args.config))
+    run_diagnostics(
+        args,
+        output_dir=Path(cli_args.output_dir),
+        permutation_seed=cli_args.permutation_seed,
+        bootstrap_samples=cli_args.bootstrap_samples,
+    )
+
+
+if __name__ == "__main__":
+    main()
