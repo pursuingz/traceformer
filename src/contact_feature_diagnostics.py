@@ -166,12 +166,14 @@ def load_factorized_contact_stats(state):
 
 
 def _mean_projected_token_norm(features, weight):
-    gram = weight.T @ weight
+    features64 = features.double()
+    weight64 = weight.double()
+    gram = weight64.T @ weight64
     norm_sq = torch.einsum(
         "ti,ij,tj->t",
-        features,
+        features64,
         gram,
-        features,
+        features64,
     ).clamp_min(0)
     return torch.sqrt(norm_sq).mean()
 
@@ -201,7 +203,7 @@ def factorized_branch_hidden_norms(features, state):
     tangential_norm = _mean_projected_token_norm(
         features[:, [1, 3]],
         tangential_weight,
-    ) * effective_gate.abs()
+    ) * effective_gate.double().abs()
     return {
         "boundary": boundary_norm.item(),
         "normal": normal_norm.item(),

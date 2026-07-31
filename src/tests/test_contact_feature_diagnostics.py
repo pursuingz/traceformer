@@ -5,6 +5,7 @@ from io import StringIO
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 import contact_feature_diagnostics
@@ -193,6 +194,51 @@ class ContactFeatureDiagnosticTests(unittest.TestCase):
             norms["tangential"],
             (math.sqrt(1370.0) + math.sqrt(620.5)) / 2.0,
             places=5,
+        )
+
+    def test_factorized_branch_norms_match_float64_linear_when_cancelling(self):
+        base_column = torch.tensor(
+            [100.0, 200.0, 300.0, 400.0],
+            dtype=torch.float32,
+        )
+        adjacent_column = torch.nextafter(
+            base_column,
+            torch.full_like(base_column, float("inf")),
+        )
+        boundary_weight = torch.stack(
+            [base_column, adjacent_column],
+            dim=1,
+        )
+        state = {
+            "model.contact_adapter.boundary_encoder.weight": boundary_weight,
+            "model.contact_adapter.normal_encoder.weight": torch.zeros(4, 1),
+            "model.contact_adapter.tangential_encoder.weight": torch.zeros(
+                4,
+                2,
+            ),
+            "model.contact_adapter.shared_bias": torch.zeros(4),
+            "model.contact_adapter.tangential_gate": torch.zeros(()),
+        }
+        features = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0, -1.0]],
+            dtype=torch.float32,
+        )
+        boundary_input = features[:, [0, 4]]
+        expected = torch.linalg.vector_norm(
+            F.linear(boundary_input.double(), boundary_weight.double()),
+            dim=-1,
+        ).mean()
+
+        actual = contact_feature_diagnostics.factorized_branch_hidden_norms(
+            features,
+            state,
+        )["boundary"]
+
+        torch.testing.assert_close(
+            torch.tensor(actual, dtype=torch.float64),
+            expected,
+            rtol=1e-12,
+            atol=1e-15,
         )
 
     def test_factorized_branch_hidden_norms_do_not_call_linear(self):
