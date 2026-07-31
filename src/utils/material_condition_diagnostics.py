@@ -6,7 +6,7 @@ import torch
 
 def _to_numpy(value: np.ndarray) -> np.ndarray:
     if torch.is_tensor(value):
-        value = value.detach().cpu().numpy()
+        value = value.detach().cpu().float().numpy()
     return np.asarray(value, dtype=np.float64)
 
 

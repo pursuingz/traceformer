@@ -37,6 +37,22 @@ EXPECTED_MODEL_COUNT = 41
 EXPECTED_RESUME_SUFFIX = "outputs/mm3_contact_cond_8L/checkpoint-90000/model.safetensors"
 EXPECTED_DATASET_SUFFIX = "mm3_data/mm3_test"
 EXPECTED_MATERIAL_COUNTS = {0: 13, 1: 14, 2: 14}
+EXPECTED_CONFIG_VALUES = (
+    ("input_frames", 5),
+    ("output_frames", 1),
+    ("use_diffusion", False),
+    ("num_inference_steps", 1),
+    ("eval_batch_size", 1),
+    ("floor_projection", False),
+    ("pred_offset", True),
+    ("train_dataset.input_frames", 5),
+    ("train_dataset.output_frames", 1),
+    ("model_config.contact_particle_cond", True),
+    ("model_config.class_token", True),
+    ("model_config.num_mat", 4),
+    ("model_config.pred_offset", True),
+)
+_MISSING = object()
 
 
 def _scalar_from_h5(handle: h5py.File, field: str, model: str) -> float:
@@ -95,7 +111,32 @@ def _normalized_path(value: str | Path) -> str:
     return os.path.normpath(str(value)).replace("\\", "/")
 
 
+def _nested_config_value(config: Any, field: str) -> Any:
+    value = config
+    for part in field.split("."):
+        try:
+            value = getattr(value, part)
+        except (AttributeError, KeyError):
+            try:
+                value = value[part]
+            except (KeyError, TypeError):
+                return _MISSING
+    return value
+
+
 def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None) -> None:
+    for field, expected in EXPECTED_CONFIG_VALUES:
+        actual = _nested_config_value(args, field)
+        if (
+            actual is _MISSING
+            or type(actual) is not type(expected)
+            or actual != expected
+        ):
+            actual_repr = "<missing>" if actual is _MISSING else repr(actual)
+            raise ValueError(
+                f"B0 config mismatch for {field}: "
+                f"actual={actual_repr}; expected={expected!r}"
+            )
     resume = _normalized_path(args.resume)
     if not resume.endswith(EXPECTED_RESUME_SUFFIX):
         raise ValueError(
@@ -114,6 +155,56 @@ def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None
             raise ValueError(
                 "B0 material counts mismatch: "
                 f"actual={actual_counts}; expected={EXPECTED_MATERIAL_COUNTS}"
+            )
+        if len(records) != EXPECTED_MODEL_COUNT:
+            raise ValueError(
+                f"expected {EXPECTED_MODEL_COUNT} material records, got {len(records)}"
+            )
+        name_counts = Counter(record.model for record in records)
+        duplicates = sorted(name for name, count in name_counts.items() if count > 1)
+        if duplicates:
+            raise ValueError(
+                f"duplicate material metadata model(s): {duplicates}"
+            )
+
+
+def _batch_material_scalar(
+    batch: dict[str, Any], field: str, model: str
+) -> float:
+    if field not in batch:
+        raise ValueError(f"{model}: batch is missing material field '{field}'")
+    value = batch[field]
+    if torch.is_tensor(value):
+        value = value.detach().cpu().float().numpy()
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(f"{model}: batch material field '{field}' must be scalar")
+    scalar = float(array.reshape(-1)[0])
+    if not math.isfinite(scalar):
+        raise ValueError(f"{model}: batch material field '{field}' must be finite")
+    return scalar
+
+
+def _validate_normal_material_condition(
+    batch: dict[str, Any], record: MaterialRecord
+) -> None:
+    expected = {
+        "E": record.log10_e,
+        "nu": record.nu,
+        "mat_type": record.mat_type,
+    }
+    for field, expected_value in expected.items():
+        actual = _batch_material_scalar(batch, field, record.model)
+        if field == "mat_type":
+            matches = actual.is_integer() and int(actual) == expected_value
+        else:
+            matches = bool(
+                np.isclose(actual, expected_value, rtol=1e-5, atol=1e-6)
+            )
+        if not matches:
+            raise ValueError(
+                f"{record.model}: batch/HDF5 {field} mismatch: "
+                f"batch={actual!r}; HDF5={expected_value!r}"
             )
 
 
@@ -208,6 +299,7 @@ def rollout_counterfactuals(
     shuffled_parameters: tuple[float, float],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate all B0 conditions under eval.py's CUDA bfloat16 inference context."""
+    _validate_normal_material_condition(batch, record)
     shuffled_e, shuffled_nu = shuffled_parameters
     with torch.autocast("cuda", dtype=torch.bfloat16):
         normal = rollout_condition(
@@ -262,10 +354,11 @@ def _response_row(prefix: str, normal: torch.Tensor, counterfactual: torch.Tenso
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         raise ValueError("cannot write an empty diagnostics CSV")
+    ordered_rows = sorted(rows, key=lambda row: str(row["model"]))
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=list(ordered_rows[0]))
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(ordered_rows)
 
 
 def _write_markdown(
@@ -275,6 +368,19 @@ def _write_markdown(
     seed: int,
 ) -> None:
     lines = ["# B0 Material-Condition Diagnostics", ""]
+    model_names = sorted(str(row["model"]) for row in rows)
+    if len(model_names) != len(set(model_names)):
+        raise ValueError("diagnostics report contains duplicate model names")
+    lines.extend(
+        [
+            "## Evaluated Models",
+            "",
+            f"Count: {len(model_names)}",
+            "",
+            *(f"- `{model_name}`" for model_name in model_names),
+            "",
+        ]
+    )
     for intervention in ("shuffle_params", "shuffle_class"):
         summary = summarize_rows(rows, intervention, samples=samples, seed=seed)
         lines.extend([f"## {intervention}", ""])
@@ -306,6 +412,38 @@ def _write_markdown(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _output_paths(output_dir: Path, permutation_seed: int) -> tuple[Path, Path]:
+    stem = f"material_condition_b0_seed{permutation_seed}"
+    return output_dir / f"{stem}.csv", output_dir / f"{stem}.md"
+
+
+def _print_model_progress(completed: int, total: int, model_name: str) -> None:
+    print(f"[{completed}/{total}] {model_name} complete")
+
+
+def _print_completion(
+    output_dir: Path,
+    permutation_seed: int,
+    rows: list[dict[str, Any]],
+    samples: int,
+) -> None:
+    csv_path, markdown_path = _output_paths(output_dir, permutation_seed)
+    print(f"CSV: {csv_path.resolve()}")
+    print(f"Markdown: {markdown_path.resolve()}")
+    print("Overall summary:")
+    for intervention in ("shuffle_params", "shuffle_class"):
+        overall = summarize_rows(
+            rows, intervention, samples=samples, seed=permutation_seed
+        )["overall"]
+        print(f"  {intervention}:")
+        for metric, stats in overall.items():
+            print(
+                f"    {metric}: {stats['normal_mean']:.6e} -> "
+                f"{stats['counterfactual_mean']:.6e} "
+                f"({stats['relative_change_pct']:+.2f}%, {stats['label']})"
+            )
+
+
 def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstrap_samples: int) -> list[dict[str, Any]]:
     """Load the model once, evaluate each test model's start-0 window once, and write rows."""
     from diffusers import DDIMScheduler
@@ -320,12 +458,12 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         from src.model.spacetime import MDM_ST
         from src.pipeline_traj import TrajPipeline
 
+    _validate_b0_identity(args)
     input_frames = int(args.input_frames)
     output_frames = int(args.output_frames)
     args.train_dataset.input_frames = input_frames
     args.train_dataset.output_frames = output_frames
     args.model_config.cond_frames = input_frames
-    _validate_b0_identity(args)
     resume = Path(args.resume)
     dataset_root = Path(args.train_dataset.dataset_path)
     if not resume.is_file():
@@ -403,6 +541,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         row.update(_response_row("shuffle_class", normal[0], shuffled_class[0], input_frames))
         rows.append(row)
         evaluated_models.add(model_name)
+        _print_model_progress(len(evaluated_models), EXPECTED_MODEL_COUNT, model_name)
 
     if len(evaluated_models) != EXPECTED_MODEL_COUNT:
         raise ValueError(
@@ -413,10 +552,12 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         unexpected = sorted(evaluated_models - set(records_by_model))
         raise ValueError(f"evaluated models do not match metadata; missing={missing}, unexpected={unexpected}")
 
+    rows.sort(key=lambda row: str(row["model"]))
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(output_dir / f"material_condition_b0_seed{permutation_seed}.csv", rows)
+    csv_path, markdown_path = _output_paths(output_dir, permutation_seed)
+    _write_csv(csv_path, rows)
     _write_markdown(
-        output_dir / f"material_condition_b0_seed{permutation_seed}.md",
+        markdown_path,
         rows,
         samples=bootstrap_samples,
         seed=permutation_seed,
@@ -450,11 +591,17 @@ def main() -> None:
         from src.options import TestingConfig
 
     args = OmegaConf.merge(OmegaConf.structured(TestingConfig), OmegaConf.load(cli_args.config))
-    run_diagnostics(
+    rows = run_diagnostics(
         args,
         output_dir=Path(cli_args.output_dir),
         permutation_seed=cli_args.permutation_seed,
         bootstrap_samples=cli_args.bootstrap_samples,
+    )
+    _print_completion(
+        Path(cli_args.output_dir),
+        permutation_seed=cli_args.permutation_seed,
+        rows=rows,
+        samples=cli_args.bootstrap_samples,
     )
 
 

@@ -1,9 +1,12 @@
+import csv
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import h5py
@@ -34,6 +37,76 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         for frame in range(5, 25):
             pred[frame, :, :] = frame - 4
         return pred, gt
+
+    @staticmethod
+    def _b0_args():
+        return SimpleNamespace(
+            resume=(
+                r"D:\runs\outputs\mm3_contact_cond_8L\checkpoint-90000\model.safetensors"
+            ),
+            input_frames=5,
+            output_frames=1,
+            use_diffusion=False,
+            num_inference_steps=1,
+            eval_batch_size=1,
+            floor_projection=False,
+            pred_offset=True,
+            train_dataset=SimpleNamespace(
+                dataset_path=r"D:\data\mm3_data\mm3_test",
+                input_frames=5,
+                output_frames=1,
+            ),
+            model_config=SimpleNamespace(
+                contact_particle_cond=True,
+                class_token=True,
+                num_mat=4,
+                pred_offset=True,
+            ),
+        )
+
+    @staticmethod
+    def _b0_records():
+        records = [
+            MaterialRecord(f"elastic-{index}.h5", 0, 3.0, 0.2)
+            for index in range(13)
+        ]
+        records += [
+            MaterialRecord(f"plasticine-{index}.h5", 1, 4.0, 0.3)
+            for index in range(14)
+        ]
+        records += [
+            MaterialRecord(f"sand-{index}.h5", 2, 5.0, 0.4)
+            for index in range(14)
+        ]
+        return records
+
+    @staticmethod
+    def _summary_rows(model_names=("elastic.h5", "plasticine.h5", "sand.h5")):
+        rows = []
+        for mat_type, model_name in enumerate(model_names):
+            row = {"model": model_name, "mat_type": mat_type}
+            for prefix, value in (
+                ("normal", 2.0),
+                ("shuffle_params", 3.0),
+                ("shuffle_class", 4.0),
+            ):
+                for metric in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
+                    row[f"{prefix}_{metric}"] = value
+            row["shuffle_params_prediction_mse"] = 1.0
+            row["shuffle_params_final_prediction_mse"] = 1.25
+            row["shuffle_class_prediction_mse"] = 1.5
+            row["shuffle_class_final_prediction_mse"] = 1.75
+            row.update(
+                {
+                    "true_log10_e": 3.0 + mat_type,
+                    "true_nu": 0.2 + mat_type * 0.05,
+                    "shuffled_log10_e": 3.5 + mat_type,
+                    "shuffled_nu": 0.25 + mat_type * 0.05,
+                    "shuffled_mat_type": (mat_type + 1) % 3,
+                }
+            )
+            rows.append(row)
+        return rows
 
     def test_trajectory_metrics_match_full_rollout_and_prediction_horizon(self):
         pred, gt = self._trajectory()
@@ -67,6 +140,15 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["full_rollout_mse"], 114.8)
 
+    def test_trajectory_metrics_supports_torch_bfloat16(self):
+        gt = torch.zeros((25, 2, 3), dtype=torch.bfloat16)
+        pred = gt.clone()
+        pred[5:] = 1.0
+
+        metrics = trajectory_metrics(pred, gt, input_frames=5)
+
+        self.assertAlmostEqual(metrics["full_rollout_mse"], 0.8)
+
     def test_torch_conversion_path_does_not_pass_original_tensor_to_numpy(self):
         pred, gt = self._trajectory()
 
@@ -81,6 +163,10 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
             def cpu(self):
                 self.calls.append("cpu")
+                return self
+
+            def float(self):
+                self.calls.append("float")
                 return self
 
             def numpy(self):
@@ -105,8 +191,8 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         ):
             trajectory_metrics(guarded_pred, guarded_gt, input_frames=5)
 
-        self.assertEqual(guarded_pred.calls, ["detach", "cpu", "numpy"])
-        self.assertEqual(guarded_gt.calls, ["detach", "cpu", "numpy"])
+        self.assertEqual(guarded_pred.calls, ["detach", "cpu", "float", "numpy"])
+        self.assertEqual(guarded_gt.calls, ["detach", "cpu", "float", "numpy"])
 
     def test_trajectory_metrics_rejects_non_three_dimensional_inputs(self):
         with self.assertRaisesRegex(ValueError, r"shape \(T,N,3\)"):
@@ -266,27 +352,43 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"duplicate.h5: duplicate model record"):
                 load_material_records(root, ["duplicate.h5", "other/duplicate.h5"])
 
-    def test_b0_identity_requires_expected_checkpoint_dataset_and_material_counts(self):
+    def test_b0_identity_requires_all_registered_config_fields(self):
         from src.diagnose_material_condition import _validate_b0_identity
 
-        records = [
-            MaterialRecord(f"elastic-{index}.h5", 0, 3.0, 0.2)
-            for index in range(13)
-        ]
-        records += [
-            MaterialRecord(f"plasticine-{index}.h5", 1, 4.0, 0.3)
-            for index in range(14)
-        ]
-        records += [
-            MaterialRecord(f"sand-{index}.h5", 2, 5.0, 0.4)
-            for index in range(14)
-        ]
-        args = SimpleNamespace(
-            resume=r"D:\runs\outputs\mm3_contact_cond_8L\checkpoint-90000\model.safetensors",
-            train_dataset=SimpleNamespace(dataset_path=r"D:\data\mm3_data\mm3_test"),
-        )
+        records = self._b0_records()
+        _validate_b0_identity(self._b0_args(), records)
 
-        _validate_b0_identity(args, records)
+        mismatches = {
+            "input_frames": 4,
+            "output_frames": 5,
+            "use_diffusion": True,
+            "num_inference_steps": 2,
+            "eval_batch_size": 2,
+            "floor_projection": True,
+            "pred_offset": False,
+            "train_dataset.input_frames": 4,
+            "train_dataset.output_frames": 5,
+            "model_config.contact_particle_cond": False,
+            "model_config.class_token": False,
+            "model_config.num_mat": 3,
+            "model_config.pred_offset": False,
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                args = self._b0_args()
+                owner = args
+                parts = field.split(".")
+                for part in parts[:-1]:
+                    owner = getattr(owner, part)
+                setattr(owner, parts[-1], value)
+                with self.assertRaisesRegex(ValueError, field.replace(".", r"\.")):
+                    _validate_b0_identity(args, records)
+
+    def test_b0_identity_requires_expected_paths_counts_and_unique_metadata_set(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        records = self._b0_records()
+        args = self._b0_args()
 
         args.resume = "outputs/mm3_contact_full_8L/checkpoint-90000/model.safetensors"
         with self.assertRaisesRegex(ValueError, r"actual=.*expected=.*mm3_contact_cond_8L"):
@@ -298,6 +400,75 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         args.train_dataset.dataset_path = r"D:\data\mm3_data\mm3_test"
         with self.assertRaisesRegex(ValueError, r"actual=.*expected=.*\{0: 13, 1: 14, 2: 14\}"):
             _validate_b0_identity(args, records[:-1])
+        duplicate_records = list(records)
+        duplicate_records[-1] = MaterialRecord(
+            records[0].model,
+            duplicate_records[-1].mat_type,
+            duplicate_records[-1].log10_e,
+            duplicate_records[-1].nu,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate material metadata model"):
+            _validate_b0_identity(args, duplicate_records)
+
+    def test_build_raw_reference_uses_interval_point_indices_and_normalization(self):
+        from src.diagnose_material_condition import _build_raw_reference
+
+        class DatasetConfig(SimpleNamespace):
+            def get(self, name, default=None):
+                return getattr(self, name, default)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = np.arange(50 * 4 * 3, dtype=np.float32).reshape(50, 4, 3)
+            with h5py.File(root / "model.h5", "w") as handle:
+                handle["x"] = raw
+            batch = {
+                "model": ["nested/model.h5"],
+                "point_indices": torch.tensor([[3, 1]]),
+            }
+            config = DatasetConfig(
+                dataset_path=str(root), n_frames_interval=2, norm_fac=10.0
+            )
+
+            reference = _build_raw_reference(batch, config)
+
+        expected = torch.from_numpy(raw[np.arange(25) * 2][:, [3, 1]]).float()
+        expected = (expected - 10.0) / 2
+        torch.testing.assert_close(reference, expected.unsqueeze(0))
+
+    def test_normal_rollout_rejects_batch_material_mismatch_before_inference(self):
+        from src.diagnose_material_condition import rollout_counterfactuals
+
+        record = MaterialRecord("model.h5", 0, 3.0, 0.2)
+        matching_batch = {
+            "E": torch.tensor([[3.0 + 1e-6]]),
+            "nu": torch.tensor([[0.2 + 1e-7]]),
+            "mat_type": torch.tensor([0]),
+        }
+        mismatches = {
+            "E": torch.tensor([[4.0]]),
+            "nu": torch.tensor([[0.4]]),
+            "mat_type": torch.tensor([2]),
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                batch = dict(matching_batch)
+                batch[field] = value
+                with mock.patch(
+                    "src.diagnose_material_condition.rollout_condition"
+                ) as rollout, mock.patch(
+                    "src.diagnose_material_condition.torch.autocast"
+                ) as autocast:
+                    with self.assertRaisesRegex(ValueError, rf"model\.h5.*{field}"):
+                        rollout_counterfactuals(
+                            pipeline=object(),
+                            batch=batch,
+                            args=SimpleNamespace(),
+                            record=record,
+                            shuffled_parameters=(4.5, 0.35),
+                        )
+                rollout.assert_not_called()
+                autocast.assert_not_called()
 
     def test_strict_checkpoint_loader_rejects_state_dict_mismatch(self):
         from src.diagnose_material_condition import _load_checkpoint_strict
@@ -335,6 +506,11 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 events.append("exit")
 
         record = MaterialRecord("model.h5", 0, 3.0, 0.2)
+        batch = {
+            "E": torch.tensor([[3.0]]),
+            "nu": torch.tensor([[0.2]]),
+            "mat_type": torch.tensor([0]),
+        }
 
         def fake_rollout(pipeline, batch, args, e_value, nu_value, mat_type):
             events.append((e_value, nu_value, mat_type))
@@ -349,7 +525,7 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         ):
             normal, shuffled_params, shuffled_class = rollout_counterfactuals(
                 pipeline=object(),
-                batch={},
+                batch=batch,
                 args=SimpleNamespace(),
                 record=record,
                 shuffled_parameters=(4.5, 0.35),
@@ -381,6 +557,11 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 coeff,
                 **kwargs,
             ):
+                noise = torch.randn(
+                    init_pc[:, -1:].shape,
+                    generator=kwargs["generator"],
+                    dtype=init_pc.dtype,
+                )
                 self.calls.append(
                     {
                         "force": force.clone(),
@@ -395,9 +576,10 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                         "start_vel": kwargs["start_vel"].clone(),
                         "points_rest": kwargs["points_rest"].clone(),
                         "seed": kwargs["generator"].initial_seed(),
+                        "noise": noise.clone(),
                     }
                 )
-                return init_pc[:, -1:] + 1.0
+                return init_pc[:, -1:] + 1.0 + noise
 
         points = torch.arange(5, dtype=torch.float32).view(1, 5, 1, 1).repeat(1, 1, 1, 3)
         batch = {
@@ -441,6 +623,8 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 [call["seed"] for call in (normal_call, params_call, class_call)],
                 [17, 17, 17],
             )
+            torch.testing.assert_close(normal_call["noise"], params_call["noise"])
+            torch.testing.assert_close(normal_call["noise"], class_call["noise"])
             for key in ("force", "mask", "drag_point", "floor_height", "gravity", "coeff", "points_rest"):
                 expected_key = "base_drag_coeff" if key == "coeff" else key
                 expected = original[expected_key]
@@ -465,15 +649,7 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
     def test_shuffle_class_markdown_explains_its_diagnostic_scope(self):
         from src.diagnose_material_condition import _write_markdown
 
-        rows = []
-        for mat_type in (0, 1, 2):
-            row = {"model": f"model-{mat_type}", "mat_type": mat_type}
-            for prefix, value in (("normal", 2.0), ("shuffle_params", 3.0), ("shuffle_class", 4.0)):
-                for metric in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
-                    row[f"{prefix}_{metric}"] = value
-            row["shuffle_params_prediction_mse"] = 1.0
-            row["shuffle_class_prediction_mse"] = 1.5
-            rows.append(row)
+        rows = self._summary_rows(("z.h5", "a.h5", "m.h5"))
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.md"
@@ -483,6 +659,102 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertIn("## shuffle_class", markdown)
         self.assertIn("only measures class-condition dependence", markdown)
         self.assertIn("does not represent physical accuracy", markdown)
+        self.assertIn("## Evaluated Models", markdown)
+        self.assertLess(markdown.index("`a.h5`"), markdown.index("`m.h5`"))
+        self.assertLess(markdown.index("`m.h5`"), markdown.index("`z.h5`"))
+
+    def test_csv_contains_key_columns_and_sorts_models(self):
+        from src.diagnose_material_condition import _write_csv
+
+        rows = self._summary_rows(("z.h5", "a.h5", "m.h5"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "diagnostics.csv"
+            _write_csv(path, rows)
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                written = list(reader)
+
+        self.assertEqual([row["model"] for row in written], ["a.h5", "m.h5", "z.h5"])
+        key_columns = {
+            "model",
+            "mat_type",
+            "true_log10_e",
+            "true_nu",
+            "shuffled_log10_e",
+            "shuffled_nu",
+            "shuffled_mat_type",
+            "normal_full_rollout_mse",
+            "shuffle_params_full_rollout_mse",
+            "shuffle_class_full_rollout_mse",
+            "shuffle_params_prediction_mse",
+            "shuffle_class_prediction_mse",
+        }
+        self.assertTrue(key_columns.issubset(reader.fieldnames))
+
+    def test_progress_and_completion_output_are_concise_and_include_artifacts(self):
+        from src.diagnose_material_condition import (
+            _print_completion,
+            _print_model_progress,
+        )
+
+        rows = self._summary_rows()
+        with tempfile.TemporaryDirectory() as directory, io.StringIO() as output:
+            with redirect_stdout(output):
+                _print_model_progress(2, 41, "model.h5")
+                _print_completion(Path(directory), permutation_seed=7, rows=rows, samples=10)
+            rendered = output.getvalue()
+
+        self.assertIn("[2/41] model.h5 complete", rendered)
+        self.assertIn("material_condition_b0_seed7.csv", rendered)
+        self.assertIn("material_condition_b0_seed7.md", rendered)
+        self.assertIn("Overall summary", rendered)
+        self.assertIn("shuffle_params", rendered)
+        self.assertIn("shuffle_class", rendered)
+
+    def test_main_prints_completion_after_diagnostics_finish(self):
+        import src.diagnose_material_condition as diagnostic
+
+        cli_args = SimpleNamespace(
+            config="registered.yaml",
+            output_dir="results/b0",
+            permutation_seed=7,
+            bootstrap_samples=10,
+        )
+        config = self._b0_args()
+        rows = self._summary_rows()
+        omega_conf = mock.Mock()
+        omega_conf.structured.return_value = object()
+        omega_conf.load.return_value = object()
+        omega_conf.merge.return_value = config
+        omega_module = ModuleType("omegaconf")
+        omega_module.OmegaConf = omega_conf
+        options_module = ModuleType("options")
+        options_module.TestingConfig = object
+
+        with mock.patch.dict(
+            sys.modules,
+            {"omegaconf": omega_module, "options": options_module},
+        ), mock.patch.object(
+            diagnostic, "_parse_args", return_value=cli_args
+        ), mock.patch.object(
+            diagnostic, "run_diagnostics", return_value=rows
+        ) as run, mock.patch.object(
+            diagnostic, "_print_completion"
+        ) as completion:
+            diagnostic.main()
+
+        run.assert_called_once_with(
+            config,
+            output_dir=Path("results/b0"),
+            permutation_seed=7,
+            bootstrap_samples=10,
+        )
+        completion.assert_called_once_with(
+            Path("results/b0"),
+            permutation_seed=7,
+            rows=rows,
+            samples=10,
+        )
 
     def test_diagnose_cli_help_requires_no_runtime_inputs(self):
         repository = Path(__file__).resolve().parents[2]
