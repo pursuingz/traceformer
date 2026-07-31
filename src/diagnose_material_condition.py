@@ -3,6 +3,8 @@
 import argparse
 import csv
 import math
+import os
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,9 @@ except ModuleNotFoundError:
 
 ROLLOUT_HORIZON = 20
 EXPECTED_MODEL_COUNT = 41
+EXPECTED_RESUME_SUFFIX = "outputs/mm3_contact_cond_8L/checkpoint-90000/model.safetensors"
+EXPECTED_DATASET_SUFFIX = "mm3_data/mm3_test"
+EXPECTED_MATERIAL_COUNTS = {0: 13, 1: 14, 2: 14}
 
 
 def _scalar_from_h5(handle: h5py.File, field: str, model: str) -> float:
@@ -84,6 +89,37 @@ def load_material_records(
 
 def _constant_like(value: torch.Tensor, replacement: float | int) -> torch.Tensor:
     return torch.full_like(value, replacement)
+
+
+def _normalized_path(value: str | Path) -> str:
+    return os.path.normpath(str(value)).replace("\\", "/")
+
+
+def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None) -> None:
+    resume = _normalized_path(args.resume)
+    if not resume.endswith(EXPECTED_RESUME_SUFFIX):
+        raise ValueError(
+            "B0 checkpoint mismatch: "
+            f"actual={resume!r}; expected={EXPECTED_RESUME_SUFFIX!r}"
+        )
+    dataset_path = _normalized_path(args.train_dataset.dataset_path)
+    if not dataset_path.endswith(EXPECTED_DATASET_SUFFIX):
+        raise ValueError(
+            "B0 dataset mismatch: "
+            f"actual={dataset_path!r}; expected={EXPECTED_DATASET_SUFFIX!r}"
+        )
+    if records is not None:
+        actual_counts = dict(sorted(Counter(record.mat_type for record in records).items()))
+        if actual_counts != EXPECTED_MATERIAL_COUNTS:
+            raise ValueError(
+                "B0 material counts mismatch: "
+                f"actual={actual_counts}; expected={EXPECTED_MATERIAL_COUNTS}"
+            )
+
+
+def _load_checkpoint_strict(model: Any, resume: str | Path, loader: Any) -> None:
+    checkpoint = loader(str(resume), device="cpu")
+    model.load_state_dict(checkpoint, strict=True)
 
 
 @torch.no_grad()
@@ -164,6 +200,33 @@ def rollout_condition(
     return torch.cat(rollout_chunks, dim=1)[:, : input_frames + ROLLOUT_HORIZON]
 
 
+def rollout_counterfactuals(
+    pipeline: Any,
+    batch: dict[str, Any],
+    args: Any,
+    record: MaterialRecord,
+    shuffled_parameters: tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate all B0 conditions under eval.py's CUDA bfloat16 inference context."""
+    shuffled_e, shuffled_nu = shuffled_parameters
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        normal = rollout_condition(
+            pipeline, batch, args, record.log10_e, record.nu, record.mat_type
+        )
+        shuffled_params = rollout_condition(
+            pipeline, batch, args, shuffled_e, shuffled_nu, record.mat_type
+        )
+        shuffled_class = rollout_condition(
+            pipeline,
+            batch,
+            args,
+            record.log10_e,
+            record.nu,
+            rotate_material_type(record.mat_type),
+        )
+    return normal, shuffled_params, shuffled_class
+
+
 def _build_raw_reference(batch: dict[str, Any], dataset_cfg: Any) -> torch.Tensor:
     interval = int(dataset_cfg.get("n_frames_interval", 1))
     sequences = []
@@ -215,6 +278,14 @@ def _write_markdown(
     for intervention in ("shuffle_params", "shuffle_class"):
         summary = summarize_rows(rows, intervention, samples=samples, seed=seed)
         lines.extend([f"## {intervention}", ""])
+        if intervention == "shuffle_class":
+            lines.extend(
+                [
+                    "This intervention only measures class-condition dependence; "
+                    "it does not represent physical accuracy.",
+                    "",
+                ]
+            )
         lines.append(
             "| Group | Metric | Baseline | Counterfactual | Relative change | "
             "Paired delta 95% CI | Response ratio | Label |"
@@ -254,6 +325,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
     args.train_dataset.input_frames = input_frames
     args.train_dataset.output_frames = output_frames
     args.model_config.cond_frames = input_frames
+    _validate_b0_identity(args)
     resume = Path(args.resume)
     dataset_root = Path(args.train_dataset.dataset_path)
     if not resume.is_file():
@@ -263,6 +335,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
 
     dataset = TrajDataset("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
+    _validate_b0_identity(args, records)
     if len(records) != EXPECTED_MODEL_COUNT:
         raise ValueError(f"expected {EXPECTED_MODEL_COUNT} material records, got {len(records)}")
     records_by_model = {record.model: record for record in records}
@@ -271,7 +344,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
     device = "cuda"
     args.device = device
     model = MDM_ST(args.pc_size, output_frames, n_feats=3, model_config=args.model_config).to(device)
-    model.load_state_dict(load_file(str(resume), device="cpu"), strict=False)
+    _load_checkpoint_strict(model, resume, load_file)
     model.eval().requires_grad_(False)
     model = torch.compile(model)
     scheduler = (
@@ -305,19 +378,14 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         if record is None:
             raise ValueError(f"{model_name}: missing material metadata")
         gt = _build_raw_reference(batch, args.train_dataset)
-        normal = rollout_condition(pipeline, batch, args, record.log10_e, record.nu, record.mat_type)
         shuffled_e, shuffled_nu = parameter_derangement[model_name]
-        shuffled_params = rollout_condition(
-            pipeline, batch, args, shuffled_e, shuffled_nu, record.mat_type
-        )
         shuffled_class_type = rotate_material_type(record.mat_type)
-        shuffled_class = rollout_condition(
+        normal, shuffled_params, shuffled_class = rollout_counterfactuals(
             pipeline,
             batch,
             args,
-            record.log10_e,
-            record.nu,
-            shuffled_class_type,
+            record,
+            (shuffled_e, shuffled_nu),
         )
         row: dict[str, Any] = {
             "model": model_name,

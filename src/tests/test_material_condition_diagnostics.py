@@ -247,16 +247,115 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with h5py.File(root / "missing.h5", "w") as handle:
+            with h5py.File(root / "missing-field.h5", "w") as handle:
                 handle["E"] = 1_000.0
                 handle["nu"] = 0.2
+            with h5py.File(root / "duplicate.h5", "w") as handle:
+                handle["E"] = 1_000.0
+                handle["nu"] = 0.2
+                handle["mat_type"] = 0
 
-            with self.assertRaisesRegex(ValueError, "missing.h5"):
-                load_material_records(root, ["missing.h5"])
+            with self.assertRaisesRegex(ValueError, "missing-field.h5"):
+                load_material_records(root, ["missing-field.h5"])
             with self.assertRaisesRegex(ValueError, "missing-file.h5"):
                 load_material_records(root, ["missing-file.h5"])
-            with self.assertRaisesRegex(ValueError, "missing.h5"):
-                load_material_records(root, ["missing.h5", "other/missing.h5"])
+            with self.assertRaisesRegex(ValueError, r"duplicate.h5: duplicate model record"):
+                load_material_records(root, ["duplicate.h5", "other/duplicate.h5"])
+
+    def test_b0_identity_requires_expected_checkpoint_dataset_and_material_counts(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        records = [
+            MaterialRecord(f"elastic-{index}.h5", 0, 3.0, 0.2)
+            for index in range(13)
+        ]
+        records += [
+            MaterialRecord(f"plasticine-{index}.h5", 1, 4.0, 0.3)
+            for index in range(14)
+        ]
+        records += [
+            MaterialRecord(f"sand-{index}.h5", 2, 5.0, 0.4)
+            for index in range(14)
+        ]
+        args = SimpleNamespace(
+            resume=r"D:\runs\outputs\mm3_contact_cond_8L\checkpoint-90000\model.safetensors",
+            train_dataset=SimpleNamespace(dataset_path=r"D:\data\mm3_data\mm3_test"),
+        )
+
+        _validate_b0_identity(args, records)
+
+        args.resume = "outputs/mm3_contact_full_8L/checkpoint-90000/model.safetensors"
+        with self.assertRaisesRegex(ValueError, r"actual=.*expected=.*mm3_contact_cond_8L"):
+            _validate_b0_identity(args, records)
+        args.resume = r"D:\runs\outputs\mm3_contact_cond_8L\checkpoint-90000\model.safetensors"
+        args.train_dataset.dataset_path = "mm3_data/not_the_b0_test"
+        with self.assertRaisesRegex(ValueError, r"actual=.*expected=.*mm3_data/mm3_test"):
+            _validate_b0_identity(args, records)
+        args.train_dataset.dataset_path = r"D:\data\mm3_data\mm3_test"
+        with self.assertRaisesRegex(ValueError, r"actual=.*expected=.*\{0: 13, 1: 14, 2: 14\}"):
+            _validate_b0_identity(args, records[:-1])
+
+    def test_strict_checkpoint_loader_rejects_state_dict_mismatch(self):
+        from src.diagnose_material_condition import _load_checkpoint_strict
+
+        class Model:
+            def __init__(self, error=None):
+                self.calls = []
+                self.error = error
+
+            def load_state_dict(self, checkpoint, strict):
+                self.calls.append((checkpoint, strict))
+                if self.error is not None:
+                    raise self.error
+
+        loader = mock.Mock(return_value={"weights": torch.tensor(1.0)})
+        model = Model()
+
+        _load_checkpoint_strict(model, "checkpoint.safetensors", loader)
+
+        loader.assert_called_once_with("checkpoint.safetensors", device="cpu")
+        self.assertEqual(model.calls, [({"weights": torch.tensor(1.0)}, True)])
+        with self.assertRaisesRegex(RuntimeError, "missing key"):
+            _load_checkpoint_strict(Model(RuntimeError("missing key")), "bad.safetensors", loader)
+
+    def test_three_rollouts_share_one_cuda_autocast_context(self):
+        from src.diagnose_material_condition import rollout_counterfactuals
+
+        events = []
+
+        class RecordingAutocast:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append("exit")
+
+        record = MaterialRecord("model.h5", 0, 3.0, 0.2)
+
+        def fake_rollout(pipeline, batch, args, e_value, nu_value, mat_type):
+            events.append((e_value, nu_value, mat_type))
+            return torch.tensor([mat_type])
+
+        with mock.patch(
+            "src.diagnose_material_condition.torch.autocast",
+            return_value=RecordingAutocast(),
+        ) as autocast, mock.patch(
+            "src.diagnose_material_condition.rollout_condition",
+            side_effect=fake_rollout,
+        ):
+            normal, shuffled_params, shuffled_class = rollout_counterfactuals(
+                pipeline=object(),
+                batch={},
+                args=SimpleNamespace(),
+                record=record,
+                shuffled_parameters=(4.5, 0.35),
+            )
+
+        autocast.assert_called_once_with("cuda", dtype=torch.bfloat16)
+        self.assertEqual(events, ["enter", (3.0, 0.2, 0), (4.5, 0.35, 0), (3.0, 0.2, 1), "exit"])
+        torch.testing.assert_close(normal, torch.tensor([0]))
+        torch.testing.assert_close(shuffled_params, torch.tensor([0]))
+        torch.testing.assert_close(shuffled_class, torch.tensor([1]))
 
     def test_rollout_condition_isolates_intervention_without_mutating_batch(self):
         from src.diagnose_material_condition import rollout_condition
@@ -290,6 +389,7 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                         "coeff": coeff.clone(),
                         "y": kwargs["y"].clone(),
                         "start_vel": kwargs["start_vel"].clone(),
+                        "points_rest": kwargs["points_rest"].clone(),
                         "seed": kwargs["generator"].initial_seed(),
                     }
                 )
@@ -318,28 +418,67 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             seed=17,
             device="cpu",
         )
+        batch["points_rest"] = torch.tensor([[[7.0, 8.0, 9.0]]])
+        original["points_rest"] = batch["points_rest"].clone()
         pipeline = RecordingPipeline()
 
-        output = rollout_condition(pipeline, batch, args, 4.5, 0.33, 2)
+        normal = rollout_condition(pipeline, batch, args, 3.0, 0.1, 0)
+        shuffled_params = rollout_condition(pipeline, batch, args, 4.5, 0.33, 0)
+        shuffled_class = rollout_condition(pipeline, batch, args, 3.0, 0.1, 2)
 
-        self.assertEqual(tuple(output.shape), (1, 25, 1, 3))
-        torch.testing.assert_close(output[:, :5], points)
-        self.assertEqual(len(pipeline.calls), 20)
-        for call in pipeline.calls:
-            torch.testing.assert_close(call["E"], torch.tensor([[4.5]]))
-            torch.testing.assert_close(call["nu"], torch.tensor([[0.33]]))
-            torch.testing.assert_close(call["y"], torch.tensor([2]))
-            self.assertEqual(call["seed"], 17)
-            for key in ("force", "mask", "drag_point", "floor_height", "gravity", "coeff"):
+        for output in (normal, shuffled_params, shuffled_class):
+            self.assertEqual(tuple(output.shape), (1, 25, 1, 3))
+            torch.testing.assert_close(output[:, :5], points)
+        self.assertEqual(len(pipeline.calls), 60)
+        paths = [pipeline.calls[index : index + 20] for index in range(0, 60, 20)]
+        for step in range(20):
+            normal_call, params_call, class_call = (path[step] for path in paths)
+            self.assertEqual(
+                [call["seed"] for call in (normal_call, params_call, class_call)],
+                [17, 17, 17],
+            )
+            for key in ("force", "mask", "drag_point", "floor_height", "gravity", "coeff", "points_rest"):
                 expected_key = "base_drag_coeff" if key == "coeff" else key
                 expected = original[expected_key]
                 if key == "mask":
                     expected = expected[..., :1]
-                torch.testing.assert_close(call[key], expected)
-        torch.testing.assert_close(pipeline.calls[0]["start_vel"], original["start_vel"])
-        torch.testing.assert_close(pipeline.calls[1]["start_vel"], torch.ones(1, 1, 3))
+                for call in (normal_call, params_call, class_call):
+                    torch.testing.assert_close(call[key], expected)
+            torch.testing.assert_close(normal_call["E"], torch.tensor([[3.0]]))
+            torch.testing.assert_close(normal_call["nu"], torch.tensor([[0.1]]))
+            torch.testing.assert_close(normal_call["y"], torch.tensor([0]))
+            torch.testing.assert_close(params_call["E"], torch.tensor([[4.5]]))
+            torch.testing.assert_close(params_call["nu"], torch.tensor([[0.33]]))
+            torch.testing.assert_close(params_call["y"], normal_call["y"])
+            torch.testing.assert_close(class_call["E"], normal_call["E"])
+            torch.testing.assert_close(class_call["nu"], normal_call["nu"])
+            torch.testing.assert_close(class_call["y"], torch.tensor([2]))
+        torch.testing.assert_close(paths[0][0]["start_vel"], original["start_vel"])
+        torch.testing.assert_close(paths[0][1]["start_vel"], torch.ones(1, 1, 3))
         for key, value in batch.items():
             torch.testing.assert_close(value, original[key])
+
+    def test_shuffle_class_markdown_explains_its_diagnostic_scope(self):
+        from src.diagnose_material_condition import _write_markdown
+
+        rows = []
+        for mat_type in (0, 1, 2):
+            row = {"model": f"model-{mat_type}", "mat_type": mat_type}
+            for prefix, value in (("normal", 2.0), ("shuffle_params", 3.0), ("shuffle_class", 4.0)):
+                for metric in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
+                    row[f"{prefix}_{metric}"] = value
+            row["shuffle_params_prediction_mse"] = 1.0
+            row["shuffle_class_prediction_mse"] = 1.5
+            rows.append(row)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            _write_markdown(path, rows, samples=10, seed=0)
+            markdown = path.read_text(encoding="utf-8")
+
+        self.assertIn("## shuffle_class", markdown)
+        self.assertIn("only measures class-condition dependence", markdown)
+        self.assertIn("does not represent physical accuracy", markdown)
 
     def test_diagnose_cli_help_requires_no_runtime_inputs(self):
         repository = Path(__file__).resolve().parents[2]
