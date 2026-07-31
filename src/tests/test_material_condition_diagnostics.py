@@ -33,6 +33,19 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected one of"):
             rotate_material_type(3)
 
+    def test_rejects_unsupported_material_class_in_records(self):
+        records = [
+            MaterialRecord("e0.h5", 0, 4.0, 0.1),
+            MaterialRecord("x0.h5", 3, 5.0, 0.2),
+        ]
+        with self.assertRaisesRegex(ValueError, "expected one of"):
+            build_parameter_derangement(records, seed=7)
+
+    def test_rejects_singleton_material_group(self):
+        records = [MaterialRecord("e0.h5", 0, 4.0, 0.1)]
+        with self.assertRaisesRegex(ValueError, "at least two records"):
+            build_parameter_derangement(records, seed=7)
+
 
 if __name__ == "__main__":
     unittest.main()

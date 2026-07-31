@@ -16,6 +16,8 @@ def build_parameter_derangement(
 ) -> dict[str, tuple[float, float]]:
     grouped: dict[int, list[MaterialRecord]] = {}
     for record in records:
+        if record.mat_type not in (0, 1, 2):
+            raise ValueError("mat_type expected one of 0, 1, 2")
         grouped.setdefault(record.mat_type, []).append(record)
 
     assignments: dict[str, tuple[float, float]] = {}
