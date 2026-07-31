@@ -8,7 +8,10 @@ from src.utils.material_condition_diagnostics import (
     MaterialRecord,
     build_parameter_derangement,
     condition_response_metrics,
+    dependency_label,
+    paired_bootstrap,
     rotate_material_type,
+    summarize_rows,
     trajectory_metrics,
 )
 
@@ -143,6 +146,70 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         records = [MaterialRecord("e0.h5", 0, 4.0, 0.1)]
         with self.assertRaisesRegex(ValueError, "at least two records"):
             build_parameter_derangement(records, seed=7)
+
+    def test_paired_bootstrap_preserves_pairing_and_is_reproducible(self):
+        normal = np.array([1.0, 3.0, 5.0])
+        counterfactual = normal + 2.0
+
+        first = paired_bootstrap(normal, counterfactual, samples=100, seed=11)
+        second = paired_bootstrap(normal, counterfactual, samples=100, seed=11)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["normal_mean"], 3.0)
+        self.assertEqual(first["counterfactual_mean"], 5.0)
+        self.assertEqual(first["mean_delta"], 2.0)
+        self.assertAlmostEqual(first["relative_change_pct"], 200.0 / 3.0)
+        self.assertEqual(first["ci_low"], 2.0)
+        self.assertEqual(first["ci_high"], 2.0)
+
+    def test_paired_bootstrap_rejects_invalid_inputs(self):
+        for normal, counterfactual, samples in (
+            ([], [], 10),
+            ([1.0], [1.0, 2.0], 10),
+            ([0.0, 0.0], [1.0, 1.0], 10),
+            ([1.0], [2.0], 0),
+        ):
+            with self.subTest(normal=normal, counterfactual=counterfactual, samples=samples):
+                with self.assertRaises(ValueError):
+                    paired_bootstrap(normal, counterfactual, samples=samples, seed=0)
+
+    def test_dependency_label_applies_effect_ci_and_response_thresholds(self):
+        self.assertEqual(dependency_label(5.0, 0.01, 0.2, 10.0), "used")
+        self.assertEqual(dependency_label(1.9, -0.1, 0.1, 1.9), "ignored")
+        self.assertEqual(dependency_label(4.0, 0.01, 0.2, 5.0), "ambiguous")
+        self.assertEqual(dependency_label(-6.0, -0.3, -0.1, 10.0), "ambiguous")
+
+    def test_summarize_rows_groups_metrics_and_uses_group_response_ratio(self):
+        rows = []
+        for mat_type, normal_mse, counterfactual_mse, prediction_mse in (
+            (0, 2.0, 4.0, 1.0),
+            (1, 4.0, 8.0, 4.0),
+            (2, 8.0, 16.0, 12.0),
+        ):
+            row = {"model": f"model-{mat_type}", "mat_type": mat_type}
+            for metric in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
+                row[f"normal_{metric}"] = normal_mse
+                row[f"shuffle_params_{metric}"] = counterfactual_mse
+            row["shuffle_params_prediction_mse"] = prediction_mse
+            rows.append(row)
+
+        summary = summarize_rows(rows, "shuffle_params", samples=100, seed=3)
+
+        self.assertEqual(set(summary), {"overall", "elastic", "plasticine", "sand"})
+        self.assertEqual(
+            set(summary["overall"]),
+            {"full_rollout_mse", "gm_mse", "long_seg_mse", "fde"},
+        )
+        elastic = summary["elastic"]["full_rollout_mse"]
+        self.assertEqual(elastic["normal_mean"], 2.0)
+        self.assertEqual(elastic["counterfactual_mean"], 4.0)
+        self.assertEqual(elastic["mean_delta"], 2.0)
+        self.assertEqual(elastic["relative_change_pct"], 100.0)
+        self.assertEqual(elastic["response_ratio_pct"], 50.0)
+        self.assertEqual(elastic["label"], "used")
+        self.assertAlmostEqual(
+            summary["overall"]["gm_mse"]["response_ratio_pct"], 17.0 / 14.0 * 100.0
+        )
 
 
 if __name__ == "__main__":
