@@ -1,6 +1,13 @@
 from dataclasses import dataclass
 
 import numpy as np
+import torch
+
+
+def _to_numpy(value: np.ndarray) -> np.ndarray:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
 
 
 def _validate_trajectory_pair(
@@ -8,8 +15,8 @@ def _validate_trajectory_pair(
     second: np.ndarray,
     input_frames: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    first_array = np.asarray(first, dtype=np.float64)
-    second_array = np.asarray(second, dtype=np.float64)
+    first_array = _to_numpy(first)
+    second_array = _to_numpy(second)
     if (
         first_array.ndim != 3
         or second_array.ndim != 3

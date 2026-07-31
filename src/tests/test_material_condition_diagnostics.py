@@ -1,6 +1,8 @@
 import unittest
+from unittest import mock
 
 import numpy as np
+import torch
 
 from src.utils.material_condition_diagnostics import (
     MaterialRecord,
@@ -42,6 +44,56 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
         self.assertAlmostEqual(response["prediction_mse"], 143.5)
         self.assertAlmostEqual(response["final_prediction_mse"], 400.0)
+
+    def test_trajectory_metrics_detaches_cpu_tensor_before_numpy_conversion(self):
+        pred, gt = self._trajectory()
+        pred_tensor = torch.tensor(pred, requires_grad=True)
+        gt_tensor = torch.tensor(gt, requires_grad=True)
+
+        metrics = trajectory_metrics(pred_tensor, gt_tensor, input_frames=5)
+
+        self.assertAlmostEqual(metrics["full_rollout_mse"], 114.8)
+
+    def test_torch_conversion_path_does_not_pass_original_tensor_to_numpy(self):
+        pred, gt = self._trajectory()
+
+        class GuardedTensor:
+            def __init__(self, value):
+                self.value = value
+                self.calls = []
+
+            def detach(self):
+                self.calls.append("detach")
+                return self
+
+            def cpu(self):
+                self.calls.append("cpu")
+                return self
+
+            def numpy(self):
+                self.calls.append("numpy")
+                return self.value
+
+        guarded_pred = GuardedTensor(pred)
+        guarded_gt = GuardedTensor(gt)
+        original_asarray = np.asarray
+
+        def assert_numpy_input(value, *args, **kwargs):
+            self.assertIsNot(value, guarded_pred)
+            self.assertIsNot(value, guarded_gt)
+            return original_asarray(value, *args, **kwargs)
+
+        with mock.patch(
+            "src.utils.material_condition_diagnostics.torch.is_tensor",
+            side_effect=lambda value: value in (guarded_pred, guarded_gt),
+        ), mock.patch(
+            "src.utils.material_condition_diagnostics.np.asarray",
+            side_effect=assert_numpy_input,
+        ):
+            trajectory_metrics(guarded_pred, guarded_gt, input_frames=5)
+
+        self.assertEqual(guarded_pred.calls, ["detach", "cpu", "numpy"])
+        self.assertEqual(guarded_gt.calls, ["detach", "cpu", "numpy"])
 
     def test_trajectory_metrics_rejects_non_three_dimensional_inputs(self):
         with self.assertRaisesRegex(ValueError, r"shape \(T,N,3\)"):
