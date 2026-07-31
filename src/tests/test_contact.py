@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+import model.contact_adapter as contact_adapter_module
 from dataset.traj_dataset import TrajDataset
 from model.contact_adapter import FactorizedContactAdapter
 from model.spacetime import MDM_ST, PointEmbed
@@ -22,6 +23,30 @@ from utils.contact import (
 
 
 class FactorizedContactAdapterTests(unittest.TestCase):
+    def test_declares_feature_order_and_branch_indices(self):
+        self.assertEqual(
+            getattr(contact_adapter_module, "CONTACT_FEATURE_ORDER", None),
+            (
+                "signed_gap",
+                "displacement_x",
+                "displacement_y",
+                "displacement_z",
+                "proximity",
+            ),
+        )
+        self.assertEqual(
+            getattr(contact_adapter_module, "BOUNDARY_FEATURE_INDICES", None),
+            (0, 4),
+        )
+        self.assertEqual(
+            getattr(contact_adapter_module, "NORMAL_FEATURE_INDICES", None),
+            (2,),
+        )
+        self.assertEqual(
+            getattr(contact_adapter_module, "TANGENTIAL_FEATURE_INDICES", None),
+            (1, 3),
+        )
+
     def test_rejects_nonpositive_latent_dim(self):
         for latent_dim in (0, -1):
             with self.subTest(latent_dim=latent_dim):
@@ -53,19 +78,45 @@ class FactorizedContactAdapterTests(unittest.TestCase):
 
     def test_bias_scale_applies_only_to_shared_bias(self):
         adapter = FactorizedContactAdapter(latent_dim=2)
-        features = torch.zeros(1, 1, 1, 5)
+        features = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 5.0]]]])
 
         with torch.no_grad():
+            adapter.boundary.weight.copy_(
+                torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            )
+            adapter.normal.weight.copy_(torch.tensor([[5.0], [6.0]]))
             adapter.shared_bias.copy_(torch.tensor([2.0, -4.0]))
 
-        actual = adapter(features, bias_scale=0.25)
+        without_bias = adapter(features, bias_scale=0.0)
+        with_half_bias = adapter(features, bias_scale=0.5)
 
         torch.testing.assert_close(
-            actual,
-            torch.tensor([[[[0.5, -1.0]]]]),
+            without_bias,
+            torch.tensor([[[[26.0, 41.0]]]]),
             rtol=0,
             atol=0,
         )
+        torch.testing.assert_close(
+            with_half_bias - without_bias,
+            0.5 * adapter.shared_bias.detach().reshape(1, 1, 1, -1),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_cpu_bfloat16_autocast_preserves_output_dtype_and_gradients(self):
+        adapter = FactorizedContactAdapter(latent_dim=4)
+        features = torch.ones(2, 3, 4, 5)
+        with torch.no_grad():
+            adapter.tangential.weight.fill_(1.0)
+            adapter.shared_bias.fill_(1.0)
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = adapter(features)
+        output.sum().backward()
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertIsNotNone(adapter.tangential_gate.grad)
+        self.assertIsNotNone(adapter.shared_bias.grad)
 
     def test_latent_256_has_expected_parameterization(self):
         adapter = FactorizedContactAdapter(latent_dim=256)

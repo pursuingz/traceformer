@@ -2,6 +2,18 @@ import torch
 from torch import nn
 
 
+CONTACT_FEATURE_ORDER = (
+    "signed_gap",
+    "displacement_x",
+    "displacement_y",
+    "displacement_z",
+    "proximity",
+)
+BOUNDARY_FEATURE_INDICES = (0, 4)
+NORMAL_FEATURE_INDICES = (2,)
+TANGENTIAL_FEATURE_INDICES = (1, 3)
+
+
 class FactorizedContactAdapter(nn.Module):
     def __init__(self, latent_dim: int):
         if latent_dim <= 0:
@@ -28,12 +40,18 @@ class FactorizedContactAdapter(nn.Module):
                 f"got {tuple(features.shape)}"
             )
 
-        boundary = self.boundary(features[..., [0, 4]])
-        normal = self.normal(features[..., [2]])
-        tangential = self.tangential(features[..., [1, 3]])
+        boundary = self.boundary(features[..., BOUNDARY_FEATURE_INDICES])
+        normal = self.normal(features[..., NORMAL_FEATURE_INDICES])
+        tangential = self.tangential(
+            features[..., TANGENTIAL_FEATURE_INDICES]
+        )
+        tangential_gate = torch.tanh(self.tangential_gate).to(
+            dtype=tangential.dtype
+        )
+        shared_bias = self.shared_bias.to(dtype=boundary.dtype)
         return (
             boundary
             + normal
-            + torch.tanh(self.tangential_gate) * tangential
-            + bias_scale * self.shared_bias
+            + tangential_gate * tangential
+            + bias_scale * shared_bias
         )
