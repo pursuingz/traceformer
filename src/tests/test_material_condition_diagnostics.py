@@ -29,6 +29,56 @@ from src.utils.material_condition_diagnostics import (
 )
 
 
+EXPECTED_B0_MODEL_NAMES = (
+    "39478_000.h5",
+    "45767_002.h5",
+    "39999_000.h5",
+    "43624_001.h5",
+    "47781_002.h5",
+    "42107_001.h5",
+    "45583_002.h5",
+    "39973_000.h5",
+    "39511_000.h5",
+    "43739_001.h5",
+    "39726_000.h5",
+    "39659_000.h5",
+    "39959_000.h5",
+    "40481_001.h5",
+    "41341_001.h5",
+    "48721_002.h5",
+    "44431_001.h5",
+    "47458_002.h5",
+    "49860_002.h5",
+    "47570_002.h5",
+    "42798_001.h5",
+    "39746_000.h5",
+    "46809_002.h5",
+    "39586_000.h5",
+    "49196_002.h5",
+    "39764_000.h5",
+    "39653_000.h5",
+    "47956_002.h5",
+    "39714_000.h5",
+    "45752_002.h5",
+    "43014_001.h5",
+    "43941_001.h5",
+    "45790_002.h5",
+    "43393_001.h5",
+    "44732_001.h5",
+    "46081_002.h5",
+    "46213_002.h5",
+    "42473_001.h5",
+    "39560_000.h5",
+    "44774_001.h5",
+    "44503_001.h5",
+)
+
+
+class NamespaceConfig(SimpleNamespace):
+    def get(self, name, default=None):
+        return getattr(self, name, default)
+
+
 class MaterialConditionDiagnosticsTest(unittest.TestCase):
     @staticmethod
     def _trajectory():
@@ -49,36 +99,48 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             use_diffusion=False,
             num_inference_steps=1,
             eval_batch_size=1,
+            dataloader_num_workers=0,
             floor_projection=False,
             pred_offset=True,
-            train_dataset=SimpleNamespace(
+            seed=0,
+            pc_size=2048,
+            train_dataset=NamespaceConfig(
                 dataset_path=r"D:\data\mm3_data\mm3_test",
                 input_frames=5,
                 output_frames=1,
+                norm_fac=5,
+                n_frames_interval=1,
             ),
-            model_config=SimpleNamespace(
+            model_config=NamespaceConfig(
                 contact_particle_cond=True,
+                contact_feature_sigma=0.04,
                 class_token=True,
                 num_mat=4,
                 pred_offset=True,
+                transformer_block="SpatialTemporalTransformerBlock",
+                n_layers=8,
+                latent_dim=256,
+                frame_cond=True,
+                point_embed=True,
+                mask_cond=True,
+                floor_cond=True,
+                gravity_emb=True,
+                force_as_token=False,
+                force_as_latent=False,
             ),
         )
 
     @staticmethod
     def _b0_records():
-        records = [
-            MaterialRecord(f"elastic-{index}.h5", 0, 3.0, 0.2)
-            for index in range(13)
+        return [
+            MaterialRecord(
+                model_name,
+                int(Path(model_name).stem.rsplit("_", 1)[1]),
+                3.0,
+                0.2,
+            )
+            for model_name in EXPECTED_B0_MODEL_NAMES
         ]
-        records += [
-            MaterialRecord(f"plasticine-{index}.h5", 1, 4.0, 0.3)
-            for index in range(14)
-        ]
-        records += [
-            MaterialRecord(f"sand-{index}.h5", 2, 5.0, 0.4)
-            for index in range(14)
-        ]
-        return records
 
     @staticmethod
     def _summary_rows(model_names=("elastic.h5", "plasticine.h5", "sand.h5")):
@@ -366,12 +428,31 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             "eval_batch_size": 2,
             "floor_projection": True,
             "pred_offset": False,
+            "seed": 1,
+            "pc_size": 1024,
             "train_dataset.input_frames": 4,
             "train_dataset.output_frames": 5,
+            "train_dataset.norm_fac": 4,
+            "train_dataset.n_frames_interval": 2,
             "model_config.contact_particle_cond": False,
+            "model_config.contact_feature_sigma": 0.08,
             "model_config.class_token": False,
             "model_config.num_mat": 3,
             "model_config.pred_offset": False,
+            "model_config.transformer_block": "SpatialTemporalTransformerBlockv3",
+            "model_config.n_layers": 5,
+            "model_config.latent_dim": 128,
+            "model_config.frame_cond": False,
+            "model_config.point_embed": False,
+            "model_config.mask_cond": False,
+            "model_config.floor_cond": False,
+            "model_config.gravity_emb": False,
+            "model_config.force_as_token": True,
+            "model_config.force_as_latent": True,
+            "model_config.contact_injection_mode": "shared",
+            "model_config.contact_velocity_mode": "xyz",
+            "model_config.contact_feature_mask": [1, 0, 1],
+            "model_config.contact_bias_scale": 0.5,
         }
         for field, value in mismatches.items():
             with self.subTest(field=field):
@@ -383,6 +464,13 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 setattr(owner, parts[-1], value)
                 with self.assertRaisesRegex(ValueError, field.replace(".", r"\.")):
                     _validate_b0_identity(args, records)
+
+        explicit_defaults = self._b0_args()
+        explicit_defaults.model_config.contact_injection_mode = "separate"
+        explicit_defaults.model_config.contact_velocity_mode = "vertical"
+        explicit_defaults.model_config.contact_feature_mask = [1, 1, 1]
+        explicit_defaults.model_config.contact_bias_scale = 1.0
+        _validate_b0_identity(explicit_defaults, records)
 
     def test_b0_identity_requires_expected_paths_counts_and_unique_metadata_set(self):
         from src.diagnose_material_condition import _validate_b0_identity
@@ -409,6 +497,28 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "duplicate material metadata model"):
             _validate_b0_identity(args, duplicate_records)
+
+    def test_b0_identity_freezes_exact_model_set_with_actionable_difference(self):
+        from src.diagnose_material_condition import (
+            EXPECTED_MODEL_NAMES,
+            _validate_b0_identity,
+        )
+
+        self.assertEqual(EXPECTED_MODEL_NAMES, frozenset(EXPECTED_B0_MODEL_NAMES))
+        records = self._b0_records()
+        replaced = records[0]
+        records[0] = MaterialRecord(
+            "39998_000.h5",
+            replaced.mat_type,
+            replaced.log10_e,
+            replaced.nu,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"missing=.*39478_000\.h5.*unexpected=.*39998_000\.h5",
+        ):
+            _validate_b0_identity(self._b0_args(), records)
 
     def test_build_raw_reference_uses_interval_point_indices_and_normalization(self):
         from src.diagnose_material_condition import _build_raw_reference
@@ -690,6 +800,181 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             "shuffle_class_prediction_mse",
         }
         self.assertTrue(key_columns.issubset(reader.fieldnames))
+
+    def test_run_diagnostics_orchestrates_start_zero_models_and_writes_reports(self):
+        import src.diagnose_material_condition as diagnostic
+
+        model_names = (
+            "10000_000.h5",
+            "10001_000.h5",
+            "20000_001.h5",
+            "20001_001.h5",
+            "30000_002.h5",
+            "30001_002.h5",
+        )
+
+        class FakeDataset:
+            def __init__(self, split, config):
+                self.split = split
+                self.config = config
+                self.split_lst_save = list(model_names)
+
+        class FakeModel:
+            def __init__(self):
+                self.loaded_strict = None
+                self.requires_grad = None
+
+            def to(self, device):
+                self.device = device
+                return self
+
+            def load_state_dict(self, checkpoint, strict):
+                self.loaded_strict = strict
+
+            def eval(self):
+                return self
+
+            def requires_grad_(self, enabled):
+                self.requires_grad = enabled
+                return self
+
+        fake_model = FakeModel()
+        model_constructor = mock.Mock(return_value=fake_model)
+        fake_pipeline = object()
+        pipeline_constructor = mock.Mock(return_value=fake_pipeline)
+        dataset_module = ModuleType("dataset.traj_dataset")
+        dataset_module.TrajDataset = FakeDataset
+        dataset_package = ModuleType("dataset")
+        dataset_package.__path__ = []
+        model_module = ModuleType("model.spacetime")
+        model_module.MDM_ST = model_constructor
+        model_package = ModuleType("model")
+        model_package.__path__ = []
+        pipeline_module = ModuleType("pipeline_traj")
+        pipeline_module.TrajPipeline = pipeline_constructor
+        imported_modules = {
+            "dataset": dataset_package,
+            "dataset.traj_dataset": dataset_module,
+            "model": model_package,
+            "model.spacetime": model_module,
+            "pipeline_traj": pipeline_module,
+        }
+
+        def fake_rollouts(pipeline, batch, args, record, shuffled_parameters):
+            self.assertIs(pipeline, fake_pipeline)
+            baseline = torch.full((1, 25, 1, 3), -2.5)
+            outputs = []
+            for delta in (0.1, 0.2, 0.3):
+                trajectory = baseline.clone()
+                trajectory[:, 5:] += delta
+                outputs.append(trajectory)
+            return tuple(outputs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = (
+                root
+                / "outputs"
+                / "mm3_contact_cond_8L"
+                / "checkpoint-90000"
+                / "model.safetensors"
+            )
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.touch()
+            dataset_root = root / "mm3_data" / "mm3_test"
+            dataset_root.mkdir(parents=True)
+            for index, model_name in enumerate(model_names):
+                mat_type = int(Path(model_name).stem.rsplit("_", 1)[1])
+                with h5py.File(dataset_root / model_name, "w") as handle:
+                    handle["E"] = 10.0 ** (3.0 + index / 10.0)
+                    handle["nu"] = 0.2 + index / 100.0
+                    handle["mat_type"] = mat_type
+                    handle["x"] = np.zeros((25, 1, 3), dtype=np.float32)
+
+            nonzero_batch = {
+                "model": [model_names[0]],
+                "start_idx": torch.tensor([5]),
+            }
+            start_zero_batches = [
+                {
+                    "model": [model_name],
+                    "start_idx": torch.tensor([0]),
+                    "point_indices": torch.tensor([[0]]),
+                }
+                for model_name in reversed(model_names)
+            ]
+            dataloader = [
+                (nonzero_batch, {}),
+                *((batch, {}) for batch in start_zero_batches),
+            ]
+            args = self._b0_args()
+            args.resume = str(checkpoint)
+            args.train_dataset.dataset_path = str(dataset_root)
+            output_dir = root / "reports"
+
+            with mock.patch.dict(sys.modules, imported_modules), mock.patch(
+                "safetensors.torch.load_file", return_value={"weight": 1}
+            ) as checkpoint_loader, mock.patch.object(
+                diagnostic.torch, "compile", side_effect=lambda model: model
+            ), mock.patch.object(
+                diagnostic.torch.utils.data,
+                "DataLoader",
+                return_value=dataloader,
+            ) as dataloader_constructor, mock.patch.object(
+                diagnostic,
+                "rollout_counterfactuals",
+                side_effect=fake_rollouts,
+            ) as rollout, mock.patch.object(
+                diagnostic, "EXPECTED_MODEL_COUNT", len(model_names)
+            ), mock.patch.object(
+                diagnostic,
+                "EXPECTED_MATERIAL_COUNTS",
+                {0: 2, 1: 2, 2: 2},
+            ), mock.patch.object(
+                diagnostic, "EXPECTED_MODEL_NAMES", frozenset(model_names)
+            ), io.StringIO() as progress, redirect_stdout(progress):
+                rows = diagnostic.run_diagnostics(
+                    args,
+                    output_dir=output_dir,
+                    permutation_seed=3,
+                    bootstrap_samples=20,
+                )
+
+            csv_path = output_dir / "material_condition_b0_seed3.csv"
+            markdown_path = output_dir / "material_condition_b0_seed3.md"
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                csv_rows = list(csv.DictReader(handle))
+            markdown = markdown_path.read_text(encoding="utf-8")
+
+        self.assertEqual([row["model"] for row in rows], sorted(model_names))
+        self.assertEqual([row["model"] for row in csv_rows], sorted(model_names))
+        self.assertEqual(rollout.call_count, len(model_names))
+        self.assertEqual(
+            {call.args[3].model for call in rollout.call_args_list},
+            set(model_names),
+        )
+        self.assertAlmostEqual(rows[0]["normal_full_rollout_mse"], 0.008)
+        self.assertAlmostEqual(rows[0]["shuffle_params_full_rollout_mse"], 0.032)
+        self.assertAlmostEqual(rows[0]["shuffle_class_full_rollout_mse"], 0.072)
+        self.assertAlmostEqual(rows[0]["shuffle_params_prediction_mse"], 0.01)
+        self.assertIn("Count: 6", markdown)
+        self.assertIn("only measures class-condition dependence", markdown)
+        checkpoint_loader.assert_called_once_with(str(checkpoint), device="cpu")
+        self.assertTrue(fake_model.loaded_strict)
+        self.assertFalse(fake_model.requires_grad)
+        model_constructor.assert_called_once_with(
+            2048,
+            1,
+            n_feats=3,
+            model_config=args.model_config,
+        )
+        pipeline_constructor.assert_called_once_with(model=fake_model, scheduler=None)
+        dataloader_constructor.assert_called_once_with(
+            mock.ANY,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+        )
 
     def test_progress_and_completion_output_are_concise_and_include_artifacts(self):
         from src.diagnose_material_condition import (

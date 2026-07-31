@@ -37,6 +37,51 @@ EXPECTED_MODEL_COUNT = 41
 EXPECTED_RESUME_SUFFIX = "outputs/mm3_contact_cond_8L/checkpoint-90000/model.safetensors"
 EXPECTED_DATASET_SUFFIX = "mm3_data/mm3_test"
 EXPECTED_MATERIAL_COUNTS = {0: 13, 1: 14, 2: 14}
+EXPECTED_MODEL_NAMES = frozenset(
+    {
+        "39478_000.h5",
+        "45767_002.h5",
+        "39999_000.h5",
+        "43624_001.h5",
+        "47781_002.h5",
+        "42107_001.h5",
+        "45583_002.h5",
+        "39973_000.h5",
+        "39511_000.h5",
+        "43739_001.h5",
+        "39726_000.h5",
+        "39659_000.h5",
+        "39959_000.h5",
+        "40481_001.h5",
+        "41341_001.h5",
+        "48721_002.h5",
+        "44431_001.h5",
+        "47458_002.h5",
+        "49860_002.h5",
+        "47570_002.h5",
+        "42798_001.h5",
+        "39746_000.h5",
+        "46809_002.h5",
+        "39586_000.h5",
+        "49196_002.h5",
+        "39764_000.h5",
+        "39653_000.h5",
+        "47956_002.h5",
+        "39714_000.h5",
+        "45752_002.h5",
+        "43014_001.h5",
+        "43941_001.h5",
+        "45790_002.h5",
+        "43393_001.h5",
+        "44732_001.h5",
+        "46081_002.h5",
+        "46213_002.h5",
+        "42473_001.h5",
+        "39560_000.h5",
+        "44774_001.h5",
+        "44503_001.h5",
+    }
+)
 EXPECTED_CONFIG_VALUES = (
     ("input_frames", 5),
     ("output_frames", 1),
@@ -45,12 +90,33 @@ EXPECTED_CONFIG_VALUES = (
     ("eval_batch_size", 1),
     ("floor_projection", False),
     ("pred_offset", True),
+    ("seed", 0),
+    ("pc_size", 2048),
     ("train_dataset.input_frames", 5),
     ("train_dataset.output_frames", 1),
+    ("train_dataset.norm_fac", 5),
+    ("train_dataset.n_frames_interval", 1),
     ("model_config.contact_particle_cond", True),
+    ("model_config.contact_feature_sigma", 0.04),
     ("model_config.class_token", True),
     ("model_config.num_mat", 4),
     ("model_config.pred_offset", True),
+    ("model_config.transformer_block", "SpatialTemporalTransformerBlock"),
+    ("model_config.n_layers", 8),
+    ("model_config.latent_dim", 256),
+    ("model_config.frame_cond", True),
+    ("model_config.point_embed", True),
+    ("model_config.mask_cond", True),
+    ("model_config.floor_cond", True),
+    ("model_config.gravity_emb", True),
+    ("model_config.force_as_token", False),
+    ("model_config.force_as_latent", False),
+)
+EXPECTED_MODEL_DEFAULT_VALUES = (
+    ("model_config.contact_injection_mode", "separate"),
+    ("model_config.contact_velocity_mode", "vertical"),
+    ("model_config.contact_feature_mask", [1, 1, 1]),
+    ("model_config.contact_bias_scale", 1.0),
 )
 _MISSING = object()
 
@@ -124,19 +190,48 @@ def _nested_config_value(config: Any, field: str) -> Any:
     return value
 
 
+def _config_values_match(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        try:
+            actual_values = list(actual)
+        except TypeError:
+            return False
+        return len(actual_values) == len(expected) and all(
+            not isinstance(actual_value, bool)
+            and isinstance(actual_value, (int, float))
+            and math.isclose(
+                float(actual_value), float(expected_value), rel_tol=0.0, abs_tol=1e-12
+            )
+            for actual_value, expected_value in zip(actual_values, expected)
+        )
+    if isinstance(expected, float):
+        return (
+            not isinstance(actual, bool)
+            and isinstance(actual, (int, float))
+            and math.isclose(float(actual), expected, rel_tol=0.0, abs_tol=1e-12)
+        )
+    return type(actual) is type(expected) and actual == expected
+
+
+def _validate_config_value(
+    args: Any, field: str, expected: Any, use_default_when_missing: bool
+) -> None:
+    actual = _nested_config_value(args, field)
+    if actual is _MISSING and use_default_when_missing:
+        actual = expected
+    if actual is _MISSING or not _config_values_match(actual, expected):
+        actual_repr = "<missing>" if actual is _MISSING else repr(actual)
+        raise ValueError(
+            f"B0 config mismatch for {field}: "
+            f"actual={actual_repr}; expected={expected!r}"
+        )
+
+
 def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None) -> None:
     for field, expected in EXPECTED_CONFIG_VALUES:
-        actual = _nested_config_value(args, field)
-        if (
-            actual is _MISSING
-            or type(actual) is not type(expected)
-            or actual != expected
-        ):
-            actual_repr = "<missing>" if actual is _MISSING else repr(actual)
-            raise ValueError(
-                f"B0 config mismatch for {field}: "
-                f"actual={actual_repr}; expected={expected!r}"
-            )
+        _validate_config_value(args, field, expected, use_default_when_missing=False)
+    for field, expected in EXPECTED_MODEL_DEFAULT_VALUES:
+        _validate_config_value(args, field, expected, use_default_when_missing=True)
     resume = _normalized_path(args.resume)
     if not resume.endswith(EXPECTED_RESUME_SUFFIX):
         raise ValueError(
@@ -165,6 +260,14 @@ def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None
         if duplicates:
             raise ValueError(
                 f"duplicate material metadata model(s): {duplicates}"
+            )
+        actual_names = set(name_counts)
+        if actual_names != EXPECTED_MODEL_NAMES:
+            missing = sorted(EXPECTED_MODEL_NAMES - actual_names)
+            unexpected = sorted(actual_names - EXPECTED_MODEL_NAMES)
+            raise ValueError(
+                "B0 model set mismatch: "
+                f"missing={missing}; unexpected={unexpected}"
             )
 
 
