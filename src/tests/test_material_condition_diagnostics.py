@@ -1,13 +1,59 @@
 import unittest
 
+import numpy as np
+
 from src.utils.material_condition_diagnostics import (
     MaterialRecord,
     build_parameter_derangement,
+    condition_response_metrics,
     rotate_material_type,
+    trajectory_metrics,
 )
 
 
 class MaterialConditionDiagnosticsTest(unittest.TestCase):
+    @staticmethod
+    def _trajectory():
+        gt = np.zeros((25, 2, 3), dtype=np.float64)
+        pred = np.zeros_like(gt)
+        for frame in range(5, 25):
+            pred[frame, :, :] = frame - 4
+        return pred, gt
+
+    def test_trajectory_metrics_match_full_rollout_and_prediction_horizon(self):
+        pred, gt = self._trajectory()
+
+        metrics = trajectory_metrics(pred, gt, input_frames=5)
+
+        expected_gm = float(np.exp(np.mean(np.log(np.arange(1, 21, dtype=float) ** 2))))
+        self.assertAlmostEqual(metrics["full_rollout_mse"], 114.8)
+        self.assertAlmostEqual(metrics["gm_mse"], expected_gm)
+        self.assertAlmostEqual(metrics["long_seg_mse"], 293.0)
+        self.assertAlmostEqual(metrics["fde"], 20.0 * np.sqrt(3.0))
+
+    def test_condition_response_metrics_excludes_identical_condition_frames(self):
+        normal = np.zeros((25, 2, 3), dtype=np.float64)
+        counterfactual = np.zeros_like(normal)
+        counterfactual[:5] = 100.0
+        for frame in range(5, 25):
+            counterfactual[frame, :, :] = frame - 4
+
+        response = condition_response_metrics(normal, counterfactual, input_frames=5)
+
+        self.assertAlmostEqual(response["prediction_mse"], 143.5)
+        self.assertAlmostEqual(response["final_prediction_mse"], 400.0)
+
+    def test_trajectory_metrics_rejects_non_three_dimensional_inputs(self):
+        with self.assertRaisesRegex(ValueError, r"shape \(T,N,3\)"):
+            trajectory_metrics(np.zeros((1, 2, 3, 1)), np.zeros((1, 2, 3, 1)))
+
+    def test_trajectory_metrics_rejects_invalid_input_frame_count(self):
+        pred, gt = self._trajectory()
+        for input_frames in (0, 25):
+            with self.subTest(input_frames=input_frames):
+                with self.assertRaisesRegex(ValueError, "input_frames"):
+                    trajectory_metrics(pred, gt, input_frames=input_frames)
+
     def test_derangement_is_within_material_one_to_one_and_reproducible(self):
         records = [
             MaterialRecord("e0.h5", 0, 4.0, 0.1),
