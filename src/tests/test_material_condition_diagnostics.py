@@ -175,7 +175,10 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
     def test_dependency_label_applies_effect_ci_and_response_thresholds(self):
         self.assertEqual(dependency_label(5.0, 0.01, 0.2, 10.0), "used")
+        self.assertEqual(dependency_label(5.0, 0.01, 0.2, 0.0), "used")
         self.assertEqual(dependency_label(1.9, -0.1, 0.1, 1.9), "ignored")
+        self.assertEqual(dependency_label(1.9, 0.1, 0.2, 1.9), "ambiguous")
+        self.assertEqual(dependency_label(1.9, -0.1, 0.1, 2.0), "ignored")
         self.assertEqual(dependency_label(4.0, 0.01, 0.2, 5.0), "ambiguous")
         self.assertEqual(dependency_label(-6.0, -0.3, -0.1, 10.0), "ambiguous")
 

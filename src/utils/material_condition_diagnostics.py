@@ -155,13 +155,13 @@ def dependency_label(
     response_ratio_pct: float,
 ) -> str:
     """Classify condition dependence from effect size, confidence interval, and response."""
-    if (
-        relative_change_pct >= 5.0
-        and ci_low > 0.0
-        and response_ratio_pct >= 10.0
-    ):
+    if relative_change_pct >= 5.0 and ci_low > 0.0:
         return "used"
-    if abs(relative_change_pct) < 2.0 and response_ratio_pct < 2.0:
+    if (
+        abs(relative_change_pct) < 2.0
+        and ci_low <= 0.0 <= ci_high
+        and response_ratio_pct <= 2.0
+    ):
         return "ignored"
     return "ambiguous"
 
