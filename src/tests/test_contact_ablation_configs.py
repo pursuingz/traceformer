@@ -2,6 +2,7 @@ import copy
 import unittest
 from pathlib import Path
 
+import torch
 from omegaconf import OmegaConf
 
 from model.spacetime import MDM_ST
@@ -337,6 +338,152 @@ class ContactAblationConfigTests(unittest.TestCase):
             OmegaConf.to_container(train.model_config, resolve=True),
         )
 
+        self.assertEqual(
+            train.train_dataset.dataset_path,
+            "mm3_data/mm3_train",
+        )
+        self.assertEqual(
+            eval_cfg.train_dataset.dataset_path,
+            "mm3_data/mm3_test",
+        )
+        ignored = {"dataset_path"}
+        self.assertEqual(
+            _without_paths(eval_cfg.train_dataset, ignored),
+            _without_paths(train.train_dataset, ignored),
+        )
+
+    def test_factorized_vxyz_changes_only_output_and_injection_mode(self):
+        baseline_plain = OmegaConf.load(
+            CONFIG_DIR / "config_mm3_contact_vxyz.yaml"
+        )
+        arm_plain = OmegaConf.load(
+            CONFIG_DIR / "config_mm3_contact_vxyz_factorized.yaml"
+        )
+        baseline = _load_structured(
+            "config_mm3_contact_vxyz.yaml",
+            TrainingConfig,
+        )
+        arm = _load_structured(
+            "config_mm3_contact_vxyz_factorized.yaml",
+            TrainingConfig,
+        )
+        ignored = {
+            "output_dir",
+            "model_config.contact_injection_mode",
+        }
+
+        self.assertEqual(
+            arm.output_dir,
+            "./outputs/mm3_contact_vxyz_factorized_8L",
+        )
+        self.assertEqual(arm.max_train_steps, 90000)
+        self.assertEqual(arm.stop_after_steps, 45000)
+        self.assertEqual(arm.model_config.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            arm.model_config.contact_injection_mode,
+            "factorized",
+        )
+        self.assertEqual(
+            _without_paths(arm_plain, ignored),
+            _without_paths(baseline_plain, ignored),
+        )
+        self.assertEqual(
+            _without_paths(arm, ignored),
+            _without_paths(baseline, ignored),
+        )
+
+        baseline.model_config.cond_frames = baseline.input_frames
+        torch.manual_seed(baseline.seed)
+        baseline_model = MDM_ST(
+            8,
+            baseline.output_frames,
+            n_feats=3,
+            model_config=baseline.model_config,
+        )
+
+        arm.model_config.cond_frames = arm.input_frames
+        torch.manual_seed(arm.seed)
+        factorized_model = MDM_ST(
+            8,
+            arm.output_frames,
+            n_feats=3,
+            model_config=arm.model_config,
+        )
+
+        self.assertEqual(
+            sum(
+                parameter.numel()
+                for parameter in baseline_model.contact_encoder.parameters()
+            ),
+            1536,
+        )
+        self.assertEqual(
+            sum(
+                parameter.numel()
+                for parameter in factorized_model.contact_adapter.parameters()
+            ),
+            1537,
+        )
+
+    def test_factorized_vxyz_eval_changes_only_declared_fields(self):
+        baseline_plain = OmegaConf.load(
+            CONFIG_DIR / "eval_mm3_contact_vxyz_45k.yaml"
+        )
+        arm_plain = OmegaConf.load(
+            CONFIG_DIR / "eval_mm3_contact_vxyz_factorized_45k.yaml"
+        )
+        arm = _load_structured(
+            "eval_mm3_contact_vxyz_factorized_45k.yaml",
+            TestingConfig,
+        )
+        ignored = {
+            "resume",
+            "vis_dir",
+            "model_config.contact_injection_mode",
+        }
+
+        self.assertEqual(
+            arm.resume,
+            "outputs/mm3_contact_vxyz_factorized_8L/"
+            "checkpoint-45000/model.safetensors",
+        )
+        self.assertEqual(
+            arm.vis_dir,
+            "vis_results_mm3_contact_vxyz_factorized_45k",
+        )
+        self.assertEqual(arm.model_config.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            arm.model_config.contact_injection_mode,
+            "factorized",
+        )
+        self.assertEqual(
+            _without_paths(arm_plain, ignored),
+            _without_paths(baseline_plain, ignored),
+        )
+
+    def test_factorized_vxyz_eval_mirrors_resolved_training_config(self):
+        train = _load_structured(
+            "config_mm3_contact_vxyz_factorized.yaml",
+            TrainingConfig,
+        )
+        eval_cfg = _load_structured(
+            "eval_mm3_contact_vxyz_factorized_45k.yaml",
+            TestingConfig,
+        )
+
+        self.assertEqual(eval_cfg.input_frames, train.input_frames)
+        self.assertEqual(eval_cfg.output_frames, train.output_frames)
+        train.train_dataset.input_frames = train.input_frames
+        train.train_dataset.output_frames = train.output_frames
+        eval_cfg.train_dataset.input_frames = eval_cfg.input_frames
+        eval_cfg.train_dataset.output_frames = eval_cfg.output_frames
+        OmegaConf.resolve(train)
+        OmegaConf.resolve(eval_cfg)
+
+        self.assertEqual(
+            OmegaConf.to_container(eval_cfg.model_config, resolve=True),
+            OmegaConf.to_container(train.model_config, resolve=True),
+        )
         self.assertEqual(
             train.train_dataset.dataset_path,
             "mm3_data/mm3_train",
