@@ -78,16 +78,16 @@ class MaterialRecord:
     nu: float
 
 
-def build_parameter_derangement(
+def build_parameter_donor_mapping(
     records: list[MaterialRecord], seed: int
-) -> dict[str, tuple[float, float]]:
+) -> dict[str, MaterialRecord]:
     grouped: dict[int, list[MaterialRecord]] = {}
     for record in records:
         if record.mat_type not in (0, 1, 2):
             raise ValueError("mat_type expected one of 0, 1, 2")
         grouped.setdefault(record.mat_type, []).append(record)
 
-    assignments: dict[str, tuple[float, float]] = {}
+    assignments: dict[str, MaterialRecord] = {}
     for mat_type, group in grouped.items():
         ordered = sorted(group, key=lambda record: record.model)
         if len(ordered) < 2:
@@ -95,9 +95,17 @@ def build_parameter_derangement(
         rng = np.random.default_rng(seed + mat_type)
         shuffled = [ordered[index] for index in rng.permutation(len(ordered))]
         for index, record in enumerate(shuffled):
-            source = shuffled[(index + 1) % len(shuffled)]
-            assignments[record.model] = (source.log10_e, source.nu)
+            assignments[record.model] = shuffled[(index + 1) % len(shuffled)]
     return assignments
+
+
+def build_parameter_derangement(
+    records: list[MaterialRecord], seed: int
+) -> dict[str, tuple[float, float]]:
+    return {
+        model: (donor.log10_e, donor.nu)
+        for model, donor in build_parameter_donor_mapping(records, seed).items()
+    }
 
 
 def rotate_material_type(mat_type: int) -> int:
@@ -108,6 +116,12 @@ def rotate_material_type(mat_type: int) -> int:
 
 _METRICS = ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde")
 _MATERIAL_GROUPS = {0: "elastic", 1: "plasticine", 2: "sand"}
+MATERIAL_INTERVENTIONS = (
+    "shuffle_e",
+    "shuffle_nu",
+    "shuffle_params",
+    "shuffle_class",
+)
 
 
 def paired_bootstrap(
@@ -173,8 +187,10 @@ def summarize_rows(
     seed: int = 0,
 ) -> dict[str, dict[str, dict[str, float | str]]]:
     """Aggregate normal/counterfactual metrics overall and by material class."""
-    if intervention not in ("shuffle_params", "shuffle_class"):
-        raise ValueError("intervention must be shuffle_params or shuffle_class")
+    if intervention not in MATERIAL_INTERVENTIONS:
+        raise ValueError(
+            "intervention must be one of: " + ", ".join(MATERIAL_INTERVENTIONS)
+        )
 
     grouped_rows: dict[str, list[dict]] = {"overall": list(rows)}
     for mat_type, group_name in _MATERIAL_GROUPS.items():

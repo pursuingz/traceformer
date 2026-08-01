@@ -178,6 +178,11 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             row["shuffle_params_final_prediction_mse"] = 1.25
             row["shuffle_class_prediction_mse"] = 1.5
             row["shuffle_class_final_prediction_mse"] = 1.75
+            row["shuffle_e_prediction_mse"] = 0.5
+            row["shuffle_nu_prediction_mse"] = 0.75
+            for metric in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
+                row[f"shuffle_e_{metric}"] = row[f"normal_{metric}"] * 1.10
+                row[f"shuffle_nu_{metric}"] = row[f"normal_{metric}"] * 1.20
             row.update(
                 {
                     "true_log10_e": 3.0 + mat_type,
@@ -305,6 +310,53 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             for record in (r for r in records if r.model in group):
                 self.assertNotEqual(first[record.model], (record.log10_e, record.nu))
 
+    def test_component_interventions_share_one_same_material_derangement(self):
+        from src.utils.material_condition_diagnostics import (
+            MaterialRecord,
+            build_parameter_derangement,
+            build_parameter_donor_mapping,
+        )
+
+        records = [
+            MaterialRecord(f"elastic_{i}.h5", 0, 4.0 + i, 0.10 + i * 0.01)
+            for i in range(4)
+        ] + [
+            MaterialRecord(f"sand_{i}.h5", 2, 5.0 + i, 0.20 + i * 0.01)
+            for i in range(4)
+        ]
+        donors = build_parameter_donor_mapping(records, seed=7)
+        pairs = build_parameter_derangement(records, seed=7)
+        by_name = {record.model: record for record in records}
+
+        self.assertEqual(set(donors), set(by_name))
+        for model, donor in donors.items():
+            self.assertNotEqual(model, donor.model)
+            self.assertEqual(by_name[model].mat_type, donor.mat_type)
+            self.assertEqual(pairs[model], (donor.log10_e, donor.nu))
+
+    def test_parameter_donor_mapping_is_deterministic_per_seed(self):
+        from src.utils.material_condition_diagnostics import (
+            MaterialRecord,
+            build_parameter_donor_mapping,
+        )
+
+        records = [
+            MaterialRecord(f"elastic_{i}.h5", 0, 4.0 + i, 0.10 + i * 0.01)
+            for i in range(4)
+        ] + [
+            MaterialRecord(f"sand_{i}.h5", 2, 5.0 + i, 0.20 + i * 0.01)
+            for i in range(4)
+        ]
+
+        first = build_parameter_donor_mapping(records, seed=7)
+        repeated = build_parameter_donor_mapping(records, seed=7)
+        different_seed = build_parameter_donor_mapping(records, seed=8)
+
+        self.assertEqual(first, repeated)
+        self.assertTrue(
+            any(first[model].model != different_seed[model].model for model in first)
+        )
+
     def test_rotates_supported_material_classes(self):
         self.assertEqual([rotate_material_type(i) for i in (0, 1, 2)], [1, 2, 0])
 
@@ -391,6 +443,19 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(
             summary["overall"]["gm_mse"]["response_ratio_pct"], 17.0 / 14.0 * 100.0
         )
+
+    def test_summarize_rows_supports_component_interventions(self):
+        rows = self._summary_rows()
+
+        for intervention, counterfactual_mean, response_ratio_pct in (
+            ("shuffle_e", 2.2, 25.0),
+            ("shuffle_nu", 2.4, 37.5),
+        ):
+            with self.subTest(intervention=intervention):
+                summary = summarize_rows(rows, intervention, samples=100, seed=3)
+                overall = summary["overall"]["full_rollout_mse"]
+                self.assertAlmostEqual(overall["counterfactual_mean"], counterfactual_mean)
+                self.assertAlmostEqual(overall["response_ratio_pct"], response_ratio_pct)
 
     def test_load_material_records_uses_basename_and_dataset_log10_e(self):
         from src.diagnose_material_condition import load_material_records
