@@ -370,7 +370,9 @@ def _validate_b0_identity(
             use_default_when_missing=False,
         )
     resume = _normalized_path(args.resume)
-    if not resume.endswith(resolved_profile.resume_suffix):
+    if resume != resolved_profile.resume_suffix and not resume.endswith(
+        f"/{resolved_profile.resume_suffix}"
+    ):
         raise ValueError(
             "B0 checkpoint mismatch: "
             f"actual={resume!r}; expected={resolved_profile.resume_suffix!r}"

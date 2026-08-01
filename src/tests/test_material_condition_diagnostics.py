@@ -150,6 +150,17 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             ),
         )
 
+    def _factorized_b0_args(self):
+        args = self._b0_args()
+        args.resume = (
+            "outputs/mm3_contact_vxyz_factorized_8L/"
+            "checkpoint-90000/model.safetensors"
+        )
+        args.model_config.contact_velocity_mode = "xyz"
+        args.model_config.contact_injection_mode = "factorized"
+        args.model_config.contact_feature_mask = [1, 1, 1, 1, 1]
+        return args
+
     @staticmethod
     def _b0_records():
         return [
@@ -594,35 +605,21 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
     def test_b0_identity_accepts_legacy_and_registered_profiles(self):
         from src.diagnose_material_condition import _validate_b0_identity
 
-        factorized_args = self._b0_args()
-        factorized_args.resume = (
-            "outputs/mm3_contact_vxyz_factorized_8L/"
-            "checkpoint-90000/model.safetensors"
-        )
-        factorized_args.model_config.contact_velocity_mode = "xyz"
-        factorized_args.model_config.contact_injection_mode = "factorized"
-        factorized_args.model_config.contact_feature_mask = [1, 1, 1, 1, 1]
-
         _validate_b0_identity(self._b0_args(), self._b0_records(), profile=None)
         _validate_b0_identity(
             self._b0_args(), self._b0_records(), profile="contact_cond90"
         )
         _validate_b0_identity(
-            factorized_args, self._b0_records(), profile="factorized90"
+            self._factorized_b0_args(),
+            self._b0_records(),
+            profile="factorized90",
         )
 
     def test_b0_identity_rejects_crossed_and_unknown_profiles(self):
         from src.diagnose_material_condition import _validate_b0_identity
 
         contact_args = self._b0_args()
-        factorized_args = self._b0_args()
-        factorized_args.resume = (
-            "outputs/mm3_contact_vxyz_factorized_8L/"
-            "checkpoint-90000/model.safetensors"
-        )
-        factorized_args.model_config.contact_velocity_mode = "xyz"
-        factorized_args.model_config.contact_injection_mode = "factorized"
-        factorized_args.model_config.contact_feature_mask = [1, 1, 1, 1, 1]
+        factorized_args = self._factorized_b0_args()
 
         with self.assertRaisesRegex(ValueError, "mismatch"):
             _validate_b0_identity(
@@ -637,22 +634,42 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 contact_args, self._b0_records(), profile="not-registered"
             )
 
-    def test_factorized_profile_requires_exact_mask_and_injection_mode(self):
+    def test_b0_identity_requires_checkpoint_suffix_component_boundary(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        cases = (
+            (
+                "contact_cond90",
+                self._b0_args(),
+                "attackeroutputs/mm3_contact_cond_8L/"
+                "checkpoint-90000/model.safetensors",
+            ),
+            (
+                "factorized90",
+                self._factorized_b0_args(),
+                "attackeroutputs/mm3_contact_vxyz_factorized_8L/"
+                "checkpoint-90000/model.safetensors",
+            ),
+        )
+        for profile, args, malicious_resume in cases:
+            with self.subTest(profile=profile):
+                args.resume = malicious_resume
+                with self.assertRaisesRegex(ValueError, "checkpoint mismatch"):
+                    _validate_b0_identity(
+                        args, self._b0_records(), profile=profile
+                    )
+
+    def test_factorized_profile_requires_each_locked_model_default(self):
         from src.diagnose_material_condition import _validate_b0_identity
 
         for field, value in (
-            ("contact_feature_mask", [1, 1, 1]),
             ("contact_injection_mode", "separate"),
+            ("contact_velocity_mode", "vertical"),
+            ("contact_feature_mask", [1, 1, 1]),
+            ("contact_bias_scale", 0.5),
         ):
             with self.subTest(field=field):
-                args = self._b0_args()
-                args.resume = (
-                    "outputs/mm3_contact_vxyz_factorized_8L/"
-                    "checkpoint-90000/model.safetensors"
-                )
-                args.model_config.contact_velocity_mode = "xyz"
-                args.model_config.contact_injection_mode = "factorized"
-                args.model_config.contact_feature_mask = [1, 1, 1, 1, 1]
+                args = self._factorized_b0_args()
                 setattr(args.model_config, field, value)
 
                 with self.assertRaisesRegex(ValueError, field):
