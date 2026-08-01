@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 try:  # Supports both ``python src/...`` and ``import src....``.
+    from utils.contact import contact_feature_names
     from utils.material_condition_diagnostics import (
         MaterialRecord,
         build_parameter_derangement,
@@ -24,6 +25,7 @@ try:  # Supports both ``python src/...`` and ``import src....``.
         trajectory_metrics,
     )
 except ModuleNotFoundError:
+    from src.utils.contact import contact_feature_names
     from src.utils.material_condition_diagnostics import (
         MaterialRecord,
         build_parameter_derangement,
@@ -199,6 +201,11 @@ ALLOWED_TRAIN_DATASET_FIELDS = frozenset(
     set(EXPECTED_TRAIN_DATASET_CONFIG) | {"dataset_path"}
 )
 _MISSING = object()
+MDM_ST_RUNTIME_DEFAULTS = {
+    "contact_injection_mode": "separate",
+    "contact_velocity_mode": "vertical",
+    "contact_bias_scale": 1.0,
+}
 
 
 def _scalar_from_h5(handle: h5py.File, field: str, model: str) -> float:
@@ -257,6 +264,10 @@ def _normalized_path(value: str | Path) -> str:
     return os.path.normpath(str(value)).replace("\\", "/")
 
 
+def _path_matches_suffix(actual: str, expected: str) -> bool:
+    return actual == expected or actual.endswith(f"/{expected}")
+
+
 def _nested_config_value(config: Any, field: str) -> Any:
     value = config
     for part in field.split("."):
@@ -294,17 +305,26 @@ def _config_values_match(actual: Any, expected: Any) -> bool:
 
 
 def _validate_config_value(
-    args: Any, field: str, expected: Any, use_default_when_missing: bool
+    args: Any, field: str, expected: Any, missing_default: Any = _MISSING
 ) -> None:
     actual = _nested_config_value(args, field)
-    if actual is _MISSING and use_default_when_missing:
-        actual = expected
+    if actual is _MISSING and missing_default is not _MISSING:
+        actual = missing_default
     if actual is _MISSING or not _config_values_match(actual, expected):
         actual_repr = "<missing>" if actual is _MISSING else repr(actual)
         raise ValueError(
             f"B0 config mismatch for {field}: "
             f"actual={actual_repr}; expected={expected!r}"
         )
+
+
+def _model_runtime_default(model_config: Any, field: str) -> Any:
+    if field == "contact_feature_mask":
+        velocity_mode = _nested_config_value(model_config, "contact_velocity_mode")
+        if velocity_mode is _MISSING:
+            velocity_mode = MDM_ST_RUNTIME_DEFAULTS["contact_velocity_mode"]
+        return [1.0] * len(contact_feature_names(velocity_mode))
+    return MDM_ST_RUNTIME_DEFAULTS.get(field, _MISSING)
 
 
 def _config_field_names(config: Any) -> set[str]:
@@ -349,38 +369,34 @@ def _validate_b0_identity(
         args.train_dataset, "train_dataset", ALLOWED_TRAIN_DATASET_FIELDS
     )
     for field, expected in EXPECTED_TOP_LEVEL_CONFIG.items():
-        _validate_config_value(args, field, expected, use_default_when_missing=False)
+        _validate_config_value(args, field, expected)
     for field, expected in EXPECTED_MODEL_CONFIG.items():
         _validate_config_value(
             args,
             f"model_config.{field}",
             expected,
-            use_default_when_missing=False,
         )
     for field, expected in resolved_profile.model_defaults.items():
         _validate_config_value(
             args,
             f"model_config.{field}",
             expected,
-            use_default_when_missing=True,
+            missing_default=_model_runtime_default(args.model_config, field),
         )
     for field, expected in EXPECTED_TRAIN_DATASET_CONFIG.items():
         _validate_config_value(
             args,
             f"train_dataset.{field}",
             expected,
-            use_default_when_missing=False,
         )
     resume = _normalized_path(args.resume)
-    if resume != resolved_profile.resume_suffix and not resume.endswith(
-        f"/{resolved_profile.resume_suffix}"
-    ):
+    if not _path_matches_suffix(resume, resolved_profile.resume_suffix):
         raise ValueError(
             "B0 checkpoint mismatch: "
             f"actual={resume!r}; expected={resolved_profile.resume_suffix!r}"
         )
     dataset_path = _normalized_path(args.train_dataset.dataset_path)
-    if not dataset_path.endswith(EXPECTED_DATASET_SUFFIX):
+    if not _path_matches_suffix(dataset_path, EXPECTED_DATASET_SUFFIX):
         raise ValueError(
             "B0 dataset mismatch: "
             f"actual={dataset_path!r}; expected={EXPECTED_DATASET_SUFFIX!r}"

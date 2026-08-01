@@ -303,6 +303,22 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "input_frames"):
                     trajectory_metrics(pred, gt, input_frames=input_frames)
 
+    def test_trajectory_and_response_metrics_reject_non_finite_values(self):
+        pred, gt = self._trajectory()
+        pred[5, 0, 0] = np.nan
+        with self.assertRaises(ValueError) as trajectory_error:
+            trajectory_metrics(pred, gt, input_frames=5)
+        self.assertIn("non-finite", str(trajectory_error.exception))
+        self.assertIn("full_rollout_mse", str(trajectory_error.exception))
+
+        normal = np.zeros((25, 2, 3), dtype=np.float64)
+        counterfactual = np.ones_like(normal)
+        counterfactual[5, 0, 0] = np.inf
+        with self.assertRaises(ValueError) as response_error:
+            condition_response_metrics(normal, counterfactual, input_frames=5)
+        self.assertIn("non-finite", str(response_error.exception))
+        self.assertIn("prediction_mse", str(response_error.exception))
+
     def test_derangement_is_within_material_one_to_one_and_reproducible(self):
         records = [
             MaterialRecord("e0.h5", 0, 4.0, 0.1),
@@ -414,6 +430,21 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     paired_bootstrap(normal, counterfactual, samples=samples, seed=0)
 
+    def test_paired_bootstrap_rejects_nan_and_inf_inputs(self):
+        for non_finite, input_name in ((np.nan, "normal"), (np.inf, "counterfactual")):
+            with self.subTest(input_name=input_name):
+                normal = np.array([1.0, 2.0])
+                counterfactual = np.array([2.0, 3.0])
+                if input_name == "normal":
+                    normal[1] = non_finite
+                else:
+                    counterfactual[1] = non_finite
+
+                with self.assertRaises(ValueError) as error:
+                    paired_bootstrap(normal, counterfactual, samples=10, seed=0)
+                self.assertIn("non-finite", str(error.exception))
+                self.assertIn(input_name, str(error.exception))
+
     def test_dependency_label_applies_effect_ci_and_response_thresholds(self):
         self.assertEqual(dependency_label(5.0, 0.01, 0.2, 10.0), "used")
         self.assertEqual(dependency_label(5.0, 0.01, 0.2, 0.0), "used")
@@ -422,6 +453,22 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertEqual(dependency_label(1.9, -0.1, 0.1, 2.0), "ignored")
         self.assertEqual(dependency_label(4.0, 0.01, 0.2, 5.0), "ambiguous")
         self.assertEqual(dependency_label(-6.0, -0.3, -0.1, 10.0), "ambiguous")
+
+    def test_dependency_label_rejects_non_finite_inputs(self):
+        values = {
+            "relative_change_pct": 1.0,
+            "ci_low": -0.1,
+            "ci_high": 0.1,
+            "response_ratio_pct": 1.0,
+        }
+        for field, non_finite in (("ci_low", np.nan), ("response_ratio_pct", np.inf)):
+            with self.subTest(field=field):
+                invalid = dict(values)
+                invalid[field] = non_finite
+                with self.assertRaises(ValueError) as error:
+                    dependency_label(**invalid)
+                self.assertIn("non-finite", str(error.exception))
+                self.assertIn(field, str(error.exception))
 
     def test_summarize_rows_groups_metrics_and_uses_group_response_ratio(self):
         rows = []
@@ -467,6 +514,27 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                 overall = summary["overall"]["full_rollout_mse"]
                 self.assertAlmostEqual(overall["counterfactual_mean"], counterfactual_mean)
                 self.assertAlmostEqual(overall["response_ratio_pct"], response_ratio_pct)
+
+    def test_markdown_rejects_non_finite_metric_before_writing_report(self):
+        from src.diagnose_material_condition import _write_markdown
+
+        rows = self._summary_rows()
+        rows[0]["shuffle_e_fde"] = np.nan
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "diagnostics.md"
+            with self.assertRaises(ValueError) as error:
+                _write_markdown(
+                    report_path,
+                    rows,
+                    samples=10,
+                    seed=0,
+                    profile="factorized90",
+                )
+
+            self.assertFalse(report_path.exists())
+        message = str(error.exception)
+        for context in ("non-finite", "fde", "elastic.h5", "shuffle_e"):
+            self.assertIn(context, message)
 
     def test_load_material_records_uses_basename_and_dataset_log10_e(self):
         from src.diagnose_material_condition import load_material_records
@@ -659,6 +727,44 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                         args, self._b0_records(), profile=profile
                     )
 
+    def test_b0_identity_requires_dataset_suffix_component_boundary(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+
+        valid_cases = (
+            (None, self._b0_args(), "mm3_data/mm3_test"),
+            ("contact_cond90", self._b0_args(), "/srv/data/mm3_data/mm3_test"),
+            (
+                "factorized90",
+                self._factorized_b0_args(),
+                r"D:\datasets\mm3_data\mm3_test",
+            ),
+        )
+        for profile, args, dataset_path in valid_cases:
+            with self.subTest(profile=profile, dataset_path=dataset_path):
+                args.train_dataset.dataset_path = dataset_path
+                _validate_b0_identity(args, self._b0_records(), profile=profile)
+
+        invalid_cases = (
+            (None, self._b0_args(), "attacker_mm3_data/mm3_test"),
+            (
+                "contact_cond90",
+                self._b0_args(),
+                r"D:\datasets\attacker_mm3_data\mm3_test",
+            ),
+            (
+                "factorized90",
+                self._factorized_b0_args(),
+                "/srv/data/attacker_mm3_data/mm3_test",
+            ),
+        )
+        for profile, args, dataset_path in invalid_cases:
+            with self.subTest(profile=profile, dataset_path=dataset_path):
+                args.train_dataset.dataset_path = dataset_path
+                with self.assertRaisesRegex(ValueError, "dataset mismatch"):
+                    _validate_b0_identity(
+                        args, self._b0_records(), profile=profile
+                    )
+
     def test_factorized_profile_requires_each_locked_model_default(self):
         from src.diagnose_material_condition import _validate_b0_identity
 
@@ -676,6 +782,65 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
                     _validate_b0_identity(
                         args, self._b0_records(), profile="factorized90"
                     )
+
+    def test_profile_missing_fields_resolve_to_model_runtime_defaults(self):
+        from src.diagnose_material_condition import _validate_b0_identity
+        from src.options import TestingConfig
+
+        cases = (
+            (
+                "contact_cond90",
+                "eval_mm3_contact_cond.yaml",
+                {
+                    "contact_injection_mode": "separate",
+                    "contact_velocity_mode": "vertical",
+                    "contact_feature_mask": [1, 1, 1],
+                    "contact_bias_scale": 1.0,
+                },
+                {
+                    "contact_injection_mode": True,
+                    "contact_velocity_mode": True,
+                    "contact_feature_mask": True,
+                    "contact_bias_scale": True,
+                },
+            ),
+            (
+                "factorized90",
+                "eval_mm3_contact_vxyz_factorized_90k.yaml",
+                {
+                    "contact_injection_mode": "factorized",
+                    "contact_velocity_mode": "xyz",
+                    "contact_feature_mask": [1, 1, 1, 1, 1],
+                    "contact_bias_scale": 1.0,
+                },
+                {
+                    "contact_injection_mode": False,
+                    "contact_velocity_mode": False,
+                    "contact_feature_mask": True,
+                    "contact_bias_scale": True,
+                },
+            ),
+        )
+        for profile, config_name, explicit_fields, accepted_fields in cases:
+            config_path = PROJECT_ROOT / "src" / "configs" / config_name
+            for field, should_accept in accepted_fields.items():
+                with self.subTest(profile=profile, field=field):
+                    args = OmegaConf.merge(
+                        OmegaConf.structured(TestingConfig),
+                        OmegaConf.load(config_path),
+                    )
+                    args.model_config.update(explicit_fields)
+                    del args.model_config[field]
+
+                    if should_accept:
+                        _validate_b0_identity(
+                            args, self._b0_records(), profile=profile
+                        )
+                    else:
+                        with self.assertRaisesRegex(ValueError, field):
+                            _validate_b0_identity(
+                                args, self._b0_records(), profile=profile
+                            )
 
     def test_b0_identity_allows_only_declared_nonsemantic_runtime_fields(self):
         from src.diagnose_material_condition import _validate_b0_identity

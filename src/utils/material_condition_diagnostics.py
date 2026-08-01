@@ -10,6 +10,22 @@ def _to_numpy(value: np.ndarray) -> np.ndarray:
     return np.asarray(value, dtype=np.float64)
 
 
+def _validate_finite(
+    value: np.ndarray | float,
+    metric: str,
+    model: str | None = None,
+    intervention: str | None = None,
+) -> None:
+    if np.all(np.isfinite(np.asarray(value, dtype=np.float64))):
+        return
+    context = [f"metric={metric!r}"]
+    if model is not None:
+        context.append(f"model={model!r}")
+    if intervention is not None:
+        context.append(f"intervention={intervention!r}")
+    raise ValueError("non-finite diagnostic value: " + ", ".join(context))
+
+
 def _validate_trajectory_pair(
     first: np.ndarray,
     second: np.ndarray,
@@ -45,12 +61,15 @@ def trajectory_metrics(
     long_stop = min(pred_array.shape[0], 25)
     long_mse = prediction_mse[long_start - input_frames : long_stop - input_frames]
     gm_mse = np.exp(np.mean(np.log(np.maximum(prediction_mse, 1e-30))))
-    return {
+    metrics = {
         "full_rollout_mse": float(np.mean(squared_error)),
         "gm_mse": float(gm_mse),
         "long_seg_mse": float(np.mean(long_mse)) if long_mse.size else float("nan"),
         "fde": float(np.linalg.norm(pred_array[-1] - gt_array[-1], axis=-1).mean()),
     }
+    for metric, value in metrics.items():
+        _validate_finite(value, metric)
+    return metrics
 
 
 def condition_response_metrics(
@@ -64,10 +83,13 @@ def condition_response_metrics(
     )
     squared_difference = (counterfactual_array - normal_array) ** 2
     prediction_difference = squared_difference[input_frames:]
-    return {
+    metrics = {
         "prediction_mse": float(np.mean(prediction_difference)),
         "final_prediction_mse": float(np.mean(prediction_difference[-1])),
     }
+    for metric, value in metrics.items():
+        _validate_finite(value, metric)
+    return metrics
 
 
 @dataclass(frozen=True)
@@ -141,18 +163,24 @@ def paired_bootstrap(
         raise ValueError("paired bootstrap inputs must have equal lengths")
     if samples <= 0:
         raise ValueError("samples must be positive")
+    _validate_finite(normal_array, "paired_bootstrap.normal")
+    _validate_finite(counterfactual_array, "paired_bootstrap.counterfactual")
 
     normal_mean = float(normal_array.mean())
+    _validate_finite(normal_mean, "paired_bootstrap.normal_mean")
     if normal_mean <= 0:
         raise ValueError("normal mean must be positive")
     counterfactual_mean = float(counterfactual_array.mean())
+    _validate_finite(counterfactual_mean, "paired_bootstrap.counterfactual_mean")
     delta = counterfactual_array - normal_array
+    _validate_finite(delta, "paired_bootstrap.delta")
     rng = np.random.default_rng(seed)
     indices = rng.integers(0, delta.size, size=(samples, delta.size))
     bootstrap_means = delta[indices].mean(axis=1)
+    _validate_finite(bootstrap_means, "paired_bootstrap.bootstrap_means")
     ci_low, ci_high = np.percentile(bootstrap_means, (2.5, 97.5))
     mean_delta = float(delta.mean())
-    return {
+    stats = {
         "normal_mean": normal_mean,
         "counterfactual_mean": counterfactual_mean,
         "mean_delta": mean_delta,
@@ -160,6 +188,9 @@ def paired_bootstrap(
         "ci_low": float(ci_low),
         "ci_high": float(ci_high),
     }
+    for metric, value in stats.items():
+        _validate_finite(value, f"paired_bootstrap.{metric}")
+    return stats
 
 
 def dependency_label(
@@ -169,6 +200,13 @@ def dependency_label(
     response_ratio_pct: float,
 ) -> str:
     """Classify condition dependence from effect size, confidence interval, and response."""
+    for metric, value in (
+        ("relative_change_pct", relative_change_pct),
+        ("ci_low", ci_low),
+        ("ci_high", ci_high),
+        ("response_ratio_pct", response_ratio_pct),
+    ):
+        _validate_finite(value, metric)
     if relative_change_pct >= 5.0 and ci_low > 0.0:
         return "used"
     if (
@@ -178,6 +216,25 @@ def dependency_label(
     ):
         return "ignored"
     return "ambiguous"
+
+
+def _row_metric_values(
+    rows: list[dict],
+    key: str,
+    metric: str,
+    intervention: str,
+) -> np.ndarray:
+    values = []
+    for row in rows:
+        value = row[key]
+        _validate_finite(
+            value,
+            metric,
+            model=row.get("model"),
+            intervention=intervention,
+        )
+        values.append(value)
+    return np.asarray(values, dtype=np.float64)
 
 
 def summarize_rows(
@@ -200,18 +257,41 @@ def summarize_rows(
     for group_name, group_rows in grouped_rows.items():
         if not group_rows:
             raise ValueError(f"{group_name} group must not be empty")
-        normal_rollout = np.asarray(
-            [row["normal_full_rollout_mse"] for row in group_rows], dtype=np.float64
+        normal_rollout = _row_metric_values(
+            group_rows,
+            "normal_full_rollout_mse",
+            "full_rollout_mse",
+            "normal",
         )
-        prediction_mse = np.asarray(
-            [row[f"{intervention}_prediction_mse"] for row in group_rows], dtype=np.float64
+        prediction_mse = _row_metric_values(
+            group_rows,
+            f"{intervention}_prediction_mse",
+            "prediction_mse",
+            intervention,
         )
         response_ratio_pct = float(prediction_mse.mean() / normal_rollout.mean() * 100.0)
+        _validate_finite(
+            response_ratio_pct,
+            "response_ratio_pct",
+            intervention=intervention,
+        )
         summary[group_name] = {}
         for metric in _METRICS:
+            normal_values = _row_metric_values(
+                group_rows,
+                f"normal_{metric}",
+                metric,
+                "normal",
+            )
+            counterfactual_values = _row_metric_values(
+                group_rows,
+                f"{intervention}_{metric}",
+                metric,
+                intervention,
+            )
             stats = paired_bootstrap(
-                np.asarray([row[f"normal_{metric}"] for row in group_rows]),
-                np.asarray([row[f"{intervention}_{metric}"] for row in group_rows]),
+                normal_values,
+                counterfactual_values,
                 samples=samples,
                 seed=seed,
             )
