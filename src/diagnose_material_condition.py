@@ -17,6 +17,7 @@ try:  # Supports both ``python src/...`` and ``import src....``.
     from utils.material_condition_diagnostics import (
         MaterialRecord,
         build_parameter_derangement,
+        build_parameter_donor_mapping,
         condition_response_metrics,
         rotate_material_type,
         summarize_rows,
@@ -26,6 +27,7 @@ except ModuleNotFoundError:
     from src.utils.material_condition_diagnostics import (
         MaterialRecord,
         build_parameter_derangement,
+        build_parameter_donor_mapping,
         condition_response_metrics,
         rotate_material_type,
         summarize_rows,
@@ -561,6 +563,45 @@ def rollout_counterfactuals(
     return normal, shuffled_params, shuffled_class
 
 
+B01_INTERVENTIONS = (
+    "shuffle_e",
+    "shuffle_nu",
+    "shuffle_params",
+    "shuffle_class",
+)
+LEGACY_INTERVENTIONS = ("shuffle_params", "shuffle_class")
+
+
+def _interventions_for_profile(profile: str | None) -> tuple[str, ...]:
+    return LEGACY_INTERVENTIONS if profile is None else B01_INTERVENTIONS
+
+
+def rollout_b01_conditions(
+    pipeline: Any,
+    batch: dict[str, Any],
+    args: Any,
+    record: MaterialRecord,
+    donor: MaterialRecord,
+) -> dict[str, torch.Tensor]:
+    _validate_normal_material_condition(batch, record)
+    conditions = {
+        "normal": (record.log10_e, record.nu, record.mat_type),
+        "shuffle_e": (donor.log10_e, record.nu, record.mat_type),
+        "shuffle_nu": (record.log10_e, donor.nu, record.mat_type),
+        "shuffle_params": (donor.log10_e, donor.nu, record.mat_type),
+        "shuffle_class": (
+            record.log10_e,
+            record.nu,
+            rotate_material_type(record.mat_type),
+        ),
+    }
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        return {
+            name: rollout_condition(pipeline, batch, args, *condition)
+            for name, condition in conditions.items()
+        }
+
+
 def _build_raw_reference(batch: dict[str, Any], dataset_cfg: Any) -> torch.Tensor:
     interval = int(dataset_cfg.get("n_frames_interval", 1))
     sequences = []
@@ -608,8 +649,14 @@ def _write_markdown(
     rows: list[dict[str, Any],],
     samples: int,
     seed: int,
+    profile: str | None = None,
 ) -> None:
-    lines = ["# B0 Material-Condition Diagnostics", ""]
+    title = (
+        "# B0 Material-Condition Diagnostics"
+        if profile is None
+        else f"# B0.1 Material-Condition Diagnostics ({profile})"
+    )
+    lines = [title, ""]
     model_names = sorted(str(row["model"]) for row in rows)
     if len(model_names) != len(set(model_names)):
         raise ValueError("diagnostics report contains duplicate model names")
@@ -623,7 +670,7 @@ def _write_markdown(
             "",
         ]
     )
-    for intervention in ("shuffle_params", "shuffle_class"):
+    for intervention in _interventions_for_profile(profile):
         summary = summarize_rows(rows, intervention, samples=samples, seed=seed)
         lines.extend([f"## {intervention}", ""])
         if intervention == "shuffle_class":
@@ -654,8 +701,16 @@ def _write_markdown(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _output_paths(output_dir: Path, permutation_seed: int) -> tuple[Path, Path]:
-    stem = f"material_condition_b0_seed{permutation_seed}"
+def _output_paths(
+    output_dir: Path,
+    permutation_seed: int,
+    profile: str | None = None,
+) -> tuple[Path, Path]:
+    stem = (
+        f"material_condition_b0_seed{permutation_seed}"
+        if profile is None
+        else f"material_condition_b01_{profile}_seed{permutation_seed}"
+    )
     return output_dir / f"{stem}.csv", output_dir / f"{stem}.md"
 
 
@@ -668,12 +723,15 @@ def _print_completion(
     permutation_seed: int,
     rows: list[dict[str, Any]],
     samples: int,
+    profile: str | None = None,
 ) -> None:
-    csv_path, markdown_path = _output_paths(output_dir, permutation_seed)
+    csv_path, markdown_path = _output_paths(
+        output_dir, permutation_seed, profile=profile
+    )
     print(f"CSV: {csv_path.resolve()}")
     print(f"Markdown: {markdown_path.resolve()}")
     print("Overall summary:")
-    for intervention in ("shuffle_params", "shuffle_class"):
+    for intervention in _interventions_for_profile(profile):
         overall = summarize_rows(
             rows, intervention, samples=samples, seed=permutation_seed
         )["overall"]
@@ -686,7 +744,13 @@ def _print_completion(
             )
 
 
-def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstrap_samples: int) -> list[dict[str, Any]]:
+def run_diagnostics(
+    args: Any,
+    output_dir: Path,
+    permutation_seed: int,
+    bootstrap_samples: int,
+    profile: str | None = None,
+) -> list[dict[str, Any]]:
     """Load the model once, evaluate each test model's start-0 window once, and write rows."""
     from diffusers import DDIMScheduler
     from safetensors.torch import load_file
@@ -700,7 +764,7 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         from src.model.spacetime import MDM_ST
         from src.pipeline_traj import TrajPipeline
 
-    _validate_b0_identity(args)
+    _validate_b0_identity(args, profile=profile)
     input_frames = int(args.input_frames)
     output_frames = int(args.output_frames)
     args.train_dataset.input_frames = input_frames
@@ -714,12 +778,19 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
 
     dataset = TrajDataset("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
-    _validate_b0_identity(args, records)
+    _validate_b0_identity(args, records, profile=profile)
     args.model_config.cond_frames = input_frames
     if len(records) != EXPECTED_MODEL_COUNT:
         raise ValueError(f"expected {EXPECTED_MODEL_COUNT} material records, got {len(records)}")
     records_by_model = {record.model: record for record in records}
-    parameter_derangement = build_parameter_derangement(records, permutation_seed)
+    if profile is None:
+        parameter_derangement = build_parameter_derangement(
+            records, permutation_seed
+        )
+        parameter_donors = None
+    else:
+        parameter_derangement = None
+        parameter_donors = build_parameter_donor_mapping(records, permutation_seed)
 
     device = "cuda"
     model = MDM_ST(args.pc_size, output_frames, n_feats=3, model_config=args.model_config).to(device)
@@ -757,29 +828,82 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
         if record is None:
             raise ValueError(f"{model_name}: missing material metadata")
         gt = _build_raw_reference(batch, args.train_dataset)
-        shuffled_e, shuffled_nu = parameter_derangement[model_name]
         shuffled_class_type = rotate_material_type(record.mat_type)
-        normal, shuffled_params, shuffled_class = rollout_counterfactuals(
-            pipeline,
-            batch,
-            args,
-            record,
-            (shuffled_e, shuffled_nu),
-        )
-        row: dict[str, Any] = {
-            "model": model_name,
-            "mat_type": record.mat_type,
-            "true_log10_e": record.log10_e,
-            "true_nu": record.nu,
-            "shuffled_log10_e": shuffled_e,
-            "shuffled_nu": shuffled_nu,
-            "shuffled_mat_type": shuffled_class_type,
-        }
-        row.update(_metric_row("normal", normal[0], gt[0], input_frames))
-        row.update(_metric_row("shuffle_params", shuffled_params[0], gt[0], input_frames))
-        row.update(_metric_row("shuffle_class", shuffled_class[0], gt[0], input_frames))
-        row.update(_response_row("shuffle_params", normal[0], shuffled_params[0], input_frames))
-        row.update(_response_row("shuffle_class", normal[0], shuffled_class[0], input_frames))
+        if profile is None:
+            shuffled_e, shuffled_nu = parameter_derangement[model_name]
+            normal, shuffled_params, shuffled_class = rollout_counterfactuals(
+                pipeline,
+                batch,
+                args,
+                record,
+                (shuffled_e, shuffled_nu),
+            )
+            row: dict[str, Any] = {
+                "model": model_name,
+                "mat_type": record.mat_type,
+                "true_log10_e": record.log10_e,
+                "true_nu": record.nu,
+                "shuffled_log10_e": shuffled_e,
+                "shuffled_nu": shuffled_nu,
+                "shuffled_mat_type": shuffled_class_type,
+            }
+            row.update(_metric_row("normal", normal[0], gt[0], input_frames))
+            row.update(
+                _metric_row(
+                    "shuffle_params", shuffled_params[0], gt[0], input_frames
+                )
+            )
+            row.update(
+                _metric_row(
+                    "shuffle_class", shuffled_class[0], gt[0], input_frames
+                )
+            )
+            row.update(
+                _response_row(
+                    "shuffle_params", normal[0], shuffled_params[0], input_frames
+                )
+            )
+            row.update(
+                _response_row(
+                    "shuffle_class", normal[0], shuffled_class[0], input_frames
+                )
+            )
+        else:
+            donor = parameter_donors[model_name]
+            outputs = rollout_b01_conditions(
+                pipeline,
+                batch,
+                args,
+                record,
+                donor,
+            )
+            normal = outputs["normal"]
+            row = {
+                "model": model_name,
+                "mat_type": record.mat_type,
+                "true_log10_e": record.log10_e,
+                "true_nu": record.nu,
+                "donor_model": donor.model,
+                "shuffled_log10_e": donor.log10_e,
+                "shuffled_nu": donor.nu,
+                "shuffled_mat_type": shuffled_class_type,
+            }
+            row.update(_metric_row("normal", normal[0], gt[0], input_frames))
+            for intervention in B01_INTERVENTIONS:
+                counterfactual = outputs[intervention]
+                row.update(
+                    _metric_row(
+                        intervention, counterfactual[0], gt[0], input_frames
+                    )
+                )
+                row.update(
+                    _response_row(
+                        intervention,
+                        normal[0],
+                        counterfactual[0],
+                        input_frames,
+                    )
+                )
         rows.append(row)
         evaluated_models.add(model_name)
         _print_model_progress(len(evaluated_models), EXPECTED_MODEL_COUNT, model_name)
@@ -795,13 +919,16 @@ def run_diagnostics(args: Any, output_dir: Path, permutation_seed: int, bootstra
 
     rows.sort(key=lambda row: str(row["model"]))
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path, markdown_path = _output_paths(output_dir, permutation_seed)
+    csv_path, markdown_path = _output_paths(
+        output_dir, permutation_seed, profile=profile
+    )
     _write_csv(csv_path, rows)
     _write_markdown(
         markdown_path,
         rows,
         samples=bootstrap_samples,
         seed=permutation_seed,
+        profile=profile,
     )
     return rows
 
@@ -816,6 +943,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--permutation-seed", type=int, default=0)
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(B01_PROFILES),
+        default=None,
+        help="Explicit B0.1 profile; omit to preserve legacy B0 behavior.",
+    )
     return parser.parse_args()
 
 
@@ -837,12 +970,14 @@ def main() -> None:
         output_dir=Path(cli_args.output_dir),
         permutation_seed=cli_args.permutation_seed,
         bootstrap_samples=cli_args.bootstrap_samples,
+        profile=cli_args.profile,
     )
     _print_completion(
         Path(cli_args.output_dir),
         permutation_seed=cli_args.permutation_seed,
         rows=rows,
         samples=cli_args.bootstrap_samples,
+        profile=cli_args.profile,
     )
 
 

@@ -879,6 +879,57 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         torch.testing.assert_close(shuffled_params, torch.tensor([0]))
         torch.testing.assert_close(shuffled_class, torch.tensor([1]))
 
+    def test_b01_rollout_uses_one_donor_for_all_component_interventions(self):
+        from src.diagnose_material_condition import rollout_b01_conditions
+
+        pipeline = object()
+        batch = {
+            "E": torch.tensor([[3.0]]),
+            "nu": torch.tensor([[0.2]]),
+            "mat_type": torch.tensor([1]),
+        }
+        args = SimpleNamespace()
+        record = MaterialRecord("target.h5", 1, 3.0, 0.2)
+        donor = MaterialRecord("donor.h5", 1, 4.5, 0.35)
+
+        def fake_rollout(pipeline, batch, args, e_value, nu_value, mat_type):
+            return torch.tensor([e_value, nu_value, mat_type])
+
+        with mock.patch(
+            "src.diagnose_material_condition.torch.autocast"
+        ) as autocast, mock.patch(
+            "src.diagnose_material_condition.rollout_condition",
+            side_effect=fake_rollout,
+        ) as rollout:
+            outputs = rollout_b01_conditions(pipeline, batch, args, record, donor)
+
+        autocast.assert_called_once_with("cuda", dtype=torch.bfloat16)
+        self.assertEqual(
+            tuple(outputs),
+            (
+                "normal",
+                "shuffle_e",
+                "shuffle_nu",
+                "shuffle_params",
+                "shuffle_class",
+            ),
+        )
+        self.assertEqual(
+            rollout.call_args_list,
+            [
+                mock.call(pipeline, batch, args, 3.0, 0.2, 1),
+                mock.call(pipeline, batch, args, 4.5, 0.2, 1),
+                mock.call(pipeline, batch, args, 3.0, 0.35, 1),
+                mock.call(pipeline, batch, args, 4.5, 0.35, 1),
+                mock.call(pipeline, batch, args, 3.0, 0.2, 2),
+            ],
+        )
+        torch.testing.assert_close(outputs["shuffle_e"], torch.tensor([4.5, 0.2, 1.0]))
+        torch.testing.assert_close(outputs["shuffle_nu"], torch.tensor([3.0, 0.35, 1.0]))
+        torch.testing.assert_close(
+            outputs["shuffle_params"], torch.tensor([4.5, 0.35, 1.0])
+        )
+
     def test_rollout_condition_isolates_intervention_without_mutating_batch(self):
         from src.diagnose_material_condition import rollout_condition
 
@@ -1005,6 +1056,55 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertLess(markdown.index("`a.h5`"), markdown.index("`m.h5`"))
         self.assertLess(markdown.index("`m.h5`"), markdown.index("`z.h5`"))
 
+    def test_profile_output_paths_preserve_legacy_and_namespace_b01_artifacts(self):
+        from src.diagnose_material_condition import _output_paths
+
+        self.assertEqual(
+            _output_paths(Path("out"), 3, profile=None),
+            (
+                Path("out/material_condition_b0_seed3.csv"),
+                Path("out/material_condition_b0_seed3.md"),
+            ),
+        )
+        self.assertEqual(
+            _output_paths(Path("out"), 3, profile="factorized90"),
+            (
+                Path("out/material_condition_b01_factorized90_seed3.csv"),
+                Path("out/material_condition_b01_factorized90_seed3.md"),
+            ),
+        )
+
+    def test_profile_markdown_adds_component_interventions_without_changing_legacy(self):
+        from src.diagnose_material_condition import _write_markdown
+
+        rows = self._summary_rows()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_path = root / "legacy.md"
+            profile_path = root / "profile.md"
+            _write_markdown(legacy_path, rows, samples=10, seed=0, profile=None)
+            _write_markdown(
+                profile_path,
+                rows,
+                samples=10,
+                seed=0,
+                profile="factorized90",
+            )
+            legacy = legacy_path.read_text(encoding="utf-8")
+            profile = profile_path.read_text(encoding="utf-8")
+
+        self.assertTrue(legacy.startswith("# B0 Material-Condition Diagnostics"))
+        self.assertNotIn("## shuffle_e", legacy)
+        self.assertNotIn("## shuffle_nu", legacy)
+        self.assertTrue(profile.startswith("# B0.1 Material-Condition Diagnostics"))
+        for intervention in (
+            "shuffle_e",
+            "shuffle_nu",
+            "shuffle_params",
+            "shuffle_class",
+        ):
+            self.assertIn(f"## {intervention}", profile)
+
     def test_csv_contains_key_columns_and_sorts_models(self):
         from src.diagnose_material_condition import _write_csv
 
@@ -1084,12 +1184,22 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         model_package.__path__ = []
         pipeline_module = ModuleType("pipeline_traj")
         pipeline_module.TrajPipeline = pipeline_constructor
+        diffusers_module = ModuleType("diffusers")
+        diffusers_module.DDIMScheduler = mock.Mock()
+        safetensors_package = ModuleType("safetensors")
+        safetensors_package.__path__ = []
+        safetensors_torch_module = ModuleType("safetensors.torch")
+        safetensors_torch_module.load_file = mock.Mock()
+        safetensors_package.torch = safetensors_torch_module
         imported_modules = {
             "dataset": dataset_package,
             "dataset.traj_dataset": dataset_module,
+            "diffusers": diffusers_module,
             "model": model_package,
             "model.spacetime": model_module,
             "pipeline_traj": pipeline_module,
+            "safetensors": safetensors_package,
+            "safetensors.torch": safetensors_torch_module,
         }
 
         def fake_rollouts(pipeline, batch, args, record, shuffled_parameters):
@@ -1181,11 +1291,44 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             csv_path = output_dir / "material_condition_b0_seed3.csv"
             markdown_path = output_dir / "material_condition_b0_seed3.md"
             with csv_path.open("r", encoding="utf-8", newline="") as handle:
-                csv_rows = list(csv.DictReader(handle))
+                reader = csv.DictReader(handle)
+                csv_rows = list(reader)
+                csv_fields = reader.fieldnames
             markdown = markdown_path.read_text(encoding="utf-8")
 
         self.assertEqual([row["model"] for row in rows], sorted(model_names))
         self.assertEqual([row["model"] for row in csv_rows], sorted(model_names))
+        expected_legacy_fields = [
+            "model",
+            "mat_type",
+            "true_log10_e",
+            "true_nu",
+            "shuffled_log10_e",
+            "shuffled_nu",
+            "shuffled_mat_type",
+            "normal_full_rollout_mse",
+            "normal_gm_mse",
+            "normal_long_seg_mse",
+            "normal_fde",
+            "shuffle_params_full_rollout_mse",
+            "shuffle_params_gm_mse",
+            "shuffle_params_long_seg_mse",
+            "shuffle_params_fde",
+            "shuffle_class_full_rollout_mse",
+            "shuffle_class_gm_mse",
+            "shuffle_class_long_seg_mse",
+            "shuffle_class_fde",
+            "shuffle_params_prediction_mse",
+            "shuffle_params_final_prediction_mse",
+            "shuffle_class_prediction_mse",
+            "shuffle_class_final_prediction_mse",
+        ]
+        self.assertEqual(list(rows[0]), expected_legacy_fields)
+        self.assertEqual(csv_fields, expected_legacy_fields)
+        self.assertNotIn("shuffle_e_full_rollout_mse", rows[0])
+        self.assertNotIn("shuffle_nu_full_rollout_mse", rows[0])
+        self.assertNotIn("shuffle_e_full_rollout_mse", csv_rows[0])
+        self.assertNotIn("shuffle_nu_full_rollout_mse", csv_rows[0])
         self.assertEqual(rollout.call_count, len(model_names))
         self.assertEqual(
             {call.args[3].model for call in rollout.call_args_list},
@@ -1214,6 +1357,279 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             num_workers=4,
         )
 
+    def test_run_diagnostics_profile_writes_five_condition_report_with_one_load(self):
+        import src.diagnose_material_condition as diagnostic
+
+        model_names = (
+            "10000_000.h5",
+            "10001_000.h5",
+            "20000_001.h5",
+            "20001_001.h5",
+            "30000_002.h5",
+            "30001_002.h5",
+        )
+        expected_donors = {
+            "10000_000.h5": "10001_000.h5",
+            "10001_000.h5": "10000_000.h5",
+            "20000_001.h5": "20001_001.h5",
+            "20001_001.h5": "20000_001.h5",
+            "30000_002.h5": "30001_002.h5",
+            "30001_002.h5": "30000_002.h5",
+        }
+        dataset_calls = []
+
+        class FakeDataset:
+            def __init__(self, split, config):
+                dataset_calls.append((split, config))
+                self.split_lst_save = list(model_names)
+
+        class FakeModel:
+            def __init__(self):
+                self.loaded_strict = None
+                self.requires_grad = None
+
+            def to(self, device):
+                self.device = device
+                return self
+
+            def load_state_dict(self, checkpoint, strict):
+                self.loaded_strict = strict
+
+            def eval(self):
+                return self
+
+            def requires_grad_(self, enabled):
+                self.requires_grad = enabled
+                return self
+
+        fake_model = FakeModel()
+        model_constructor = mock.Mock(return_value=fake_model)
+        fake_pipeline = object()
+        pipeline_constructor = mock.Mock(return_value=fake_pipeline)
+        dataset_module = ModuleType("dataset.traj_dataset")
+        dataset_module.TrajDataset = FakeDataset
+        dataset_package = ModuleType("dataset")
+        dataset_package.__path__ = []
+        model_module = ModuleType("model.spacetime")
+        model_module.MDM_ST = model_constructor
+        model_package = ModuleType("model")
+        model_package.__path__ = []
+        pipeline_module = ModuleType("pipeline_traj")
+        pipeline_module.TrajPipeline = pipeline_constructor
+        diffusers_module = ModuleType("diffusers")
+        diffusers_module.DDIMScheduler = mock.Mock()
+        safetensors_package = ModuleType("safetensors")
+        safetensors_package.__path__ = []
+        safetensors_torch_module = ModuleType("safetensors.torch")
+        safetensors_torch_module.load_file = mock.Mock()
+        safetensors_package.torch = safetensors_torch_module
+        imported_modules = {
+            "dataset": dataset_package,
+            "dataset.traj_dataset": dataset_module,
+            "diffusers": diffusers_module,
+            "model": model_package,
+            "model.spacetime": model_module,
+            "pipeline_traj": pipeline_module,
+            "safetensors": safetensors_package,
+            "safetensors.torch": safetensors_torch_module,
+        }
+
+        def fake_rollouts(pipeline, batch, args, record, donor):
+            self.assertIs(pipeline, fake_pipeline)
+            self.assertEqual(donor.model, expected_donors[record.model])
+            baseline = torch.full((1, 25, 1, 3), -2.5)
+            outputs = {}
+            for name, delta in (
+                ("normal", 0.1),
+                ("shuffle_e", 0.2),
+                ("shuffle_nu", 0.3),
+                ("shuffle_params", 0.4),
+                ("shuffle_class", 0.5),
+            ):
+                trajectory = baseline.clone()
+                trajectory[:, 5:] += delta
+                outputs[name] = trajectory
+            return outputs
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = (
+                root
+                / "outputs"
+                / "mm3_contact_vxyz_factorized_8L"
+                / "checkpoint-90000"
+                / "model.safetensors"
+            )
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.touch()
+            dataset_root = root / "mm3_data" / "mm3_test"
+            dataset_root.mkdir(parents=True)
+            for index, model_name in enumerate(model_names):
+                mat_type = int(Path(model_name).stem.rsplit("_", 1)[1])
+                with h5py.File(dataset_root / model_name, "w") as handle:
+                    handle["E"] = 10.0 ** (3.0 + index / 10.0)
+                    handle["nu"] = 0.2 + index / 100.0
+                    handle["mat_type"] = mat_type
+                    handle["x"] = np.zeros((25, 1, 3), dtype=np.float32)
+
+            dataloader = [
+                (
+                    {
+                        "model": [model_name],
+                        "start_idx": torch.tensor([0]),
+                        "point_indices": torch.tensor([[0]]),
+                    },
+                    {},
+                )
+                for model_name in reversed(model_names)
+            ]
+            from src.options import TestingConfig
+
+            config_path = (
+                PROJECT_ROOT
+                / "src"
+                / "configs"
+                / "eval_mm3_contact_vxyz_factorized_90k.yaml"
+            )
+            args = OmegaConf.merge(
+                OmegaConf.structured(TestingConfig),
+                OmegaConf.load(config_path),
+            )
+            args.resume = str(checkpoint)
+            args.train_dataset.dataset_path = str(dataset_root)
+            output_dir = root / "reports"
+
+            with mock.patch.dict(sys.modules, imported_modules), mock.patch(
+                "safetensors.torch.load_file", return_value={"weight": 1}
+            ) as checkpoint_loader, mock.patch.object(
+                diagnostic.torch, "compile", side_effect=lambda model: model
+            ), mock.patch.object(
+                diagnostic.torch.utils.data,
+                "DataLoader",
+                return_value=dataloader,
+            ) as dataloader_constructor, mock.patch.object(
+                diagnostic,
+                "rollout_b01_conditions",
+                side_effect=fake_rollouts,
+            ) as rollout, mock.patch.object(
+                diagnostic, "rollout_counterfactuals"
+            ) as legacy_rollout, mock.patch.object(
+                diagnostic, "EXPECTED_MODEL_COUNT", len(model_names)
+            ), mock.patch.object(
+                diagnostic,
+                "EXPECTED_MATERIAL_COUNTS",
+                {0: 2, 1: 2, 2: 2},
+            ), mock.patch.object(
+                diagnostic, "EXPECTED_MODEL_NAMES", frozenset(model_names)
+            ), io.StringIO() as progress, redirect_stdout(progress):
+                rows = diagnostic.run_diagnostics(
+                    args,
+                    output_dir=output_dir,
+                    permutation_seed=3,
+                    bootstrap_samples=20,
+                    profile="factorized90",
+                )
+
+            csv_path = (
+                output_dir / "material_condition_b01_factorized90_seed3.csv"
+            )
+            markdown_path = (
+                output_dir / "material_condition_b01_factorized90_seed3.md"
+            )
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                csv_rows = list(reader)
+                csv_fields = reader.fieldnames
+            markdown = markdown_path.read_text(encoding="utf-8")
+
+        self.assertEqual([row["model"] for row in rows], sorted(model_names))
+        self.assertEqual([row["model"] for row in csv_rows], sorted(model_names))
+        self.assertEqual(rollout.call_count, len(model_names))
+        legacy_rollout.assert_not_called()
+        self.assertEqual(len(dataset_calls), 1)
+        checkpoint_loader.assert_called_once_with(str(checkpoint), device="cpu")
+        model_constructor.assert_called_once_with(
+            2048,
+            1,
+            n_feats=3,
+            model_config=args.model_config,
+        )
+        pipeline_constructor.assert_called_once_with(model=fake_model, scheduler=None)
+        dataloader_constructor.assert_called_once_with(
+            mock.ANY,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+        )
+        self.assertTrue(fake_model.loaded_strict)
+        self.assertFalse(fake_model.requires_grad)
+
+        expected_fields = [
+            "model",
+            "mat_type",
+            "true_log10_e",
+            "true_nu",
+            "donor_model",
+            "shuffled_log10_e",
+            "shuffled_nu",
+            "shuffled_mat_type",
+            "normal_full_rollout_mse",
+            "normal_gm_mse",
+            "normal_long_seg_mse",
+            "normal_fde",
+            "shuffle_e_full_rollout_mse",
+            "shuffle_e_gm_mse",
+            "shuffle_e_long_seg_mse",
+            "shuffle_e_fde",
+            "shuffle_e_prediction_mse",
+            "shuffle_e_final_prediction_mse",
+            "shuffle_nu_full_rollout_mse",
+            "shuffle_nu_gm_mse",
+            "shuffle_nu_long_seg_mse",
+            "shuffle_nu_fde",
+            "shuffle_nu_prediction_mse",
+            "shuffle_nu_final_prediction_mse",
+            "shuffle_params_full_rollout_mse",
+            "shuffle_params_gm_mse",
+            "shuffle_params_long_seg_mse",
+            "shuffle_params_fde",
+            "shuffle_params_prediction_mse",
+            "shuffle_params_final_prediction_mse",
+            "shuffle_class_full_rollout_mse",
+            "shuffle_class_gm_mse",
+            "shuffle_class_long_seg_mse",
+            "shuffle_class_fde",
+            "shuffle_class_prediction_mse",
+            "shuffle_class_final_prediction_mse",
+        ]
+        self.assertEqual(list(rows[0]), expected_fields)
+        self.assertEqual(csv_fields, expected_fields)
+        for row in rows:
+            self.assertEqual(row["donor_model"], expected_donors[row["model"]])
+        self.assertAlmostEqual(rows[0]["true_log10_e"], 3.0)
+        self.assertAlmostEqual(rows[0]["true_nu"], 0.2)
+        self.assertEqual(rows[0]["donor_model"], "10001_000.h5")
+        self.assertAlmostEqual(rows[0]["shuffled_log10_e"], 3.1)
+        self.assertAlmostEqual(rows[0]["shuffled_nu"], 0.21)
+        self.assertEqual(rows[0]["shuffled_mat_type"], 1)
+        self.assertAlmostEqual(rows[0]["normal_full_rollout_mse"], 0.008, places=6)
+        self.assertAlmostEqual(rows[0]["shuffle_e_full_rollout_mse"], 0.032, places=6)
+        self.assertAlmostEqual(rows[0]["shuffle_nu_full_rollout_mse"], 0.072, places=6)
+        self.assertAlmostEqual(
+            rows[0]["shuffle_params_full_rollout_mse"], 0.128, places=6
+        )
+        self.assertAlmostEqual(rows[0]["shuffle_class_full_rollout_mse"], 0.2, places=6)
+        chapter_positions = [
+            markdown.index(f"## {intervention}")
+            for intervention in (
+                "shuffle_e",
+                "shuffle_nu",
+                "shuffle_params",
+                "shuffle_class",
+            )
+        ]
+        self.assertEqual(chapter_positions, sorted(chapter_positions))
+
     def test_progress_and_completion_output_are_concise_and_include_artifacts(self):
         from src.diagnose_material_condition import (
             _print_completion,
@@ -1221,11 +1637,21 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         )
 
         rows = self._summary_rows()
-        with tempfile.TemporaryDirectory() as directory, io.StringIO() as output:
-            with redirect_stdout(output):
+        with tempfile.TemporaryDirectory() as directory, io.StringIO() as legacy_output:
+            with redirect_stdout(legacy_output):
                 _print_model_progress(2, 41, "model.h5")
                 _print_completion(Path(directory), permutation_seed=7, rows=rows, samples=10)
-            rendered = output.getvalue()
+            rendered = legacy_output.getvalue()
+
+            with io.StringIO() as profile_output, redirect_stdout(profile_output):
+                _print_completion(
+                    Path(directory),
+                    permutation_seed=7,
+                    rows=rows,
+                    samples=10,
+                    profile="factorized90",
+                )
+                profile_rendered = profile_output.getvalue()
 
         self.assertIn("[2/41] model.h5 complete", rendered)
         self.assertIn("material_condition_b0_seed7.csv", rendered)
@@ -1233,6 +1659,17 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         self.assertIn("Overall summary", rendered)
         self.assertIn("shuffle_params", rendered)
         self.assertIn("shuffle_class", rendered)
+        self.assertNotIn("shuffle_e", rendered)
+        self.assertNotIn("shuffle_nu", rendered)
+        self.assertIn("material_condition_b01_factorized90_seed7.csv", profile_rendered)
+        self.assertIn("material_condition_b01_factorized90_seed7.md", profile_rendered)
+        for intervention in (
+            "shuffle_e",
+            "shuffle_nu",
+            "shuffle_params",
+            "shuffle_class",
+        ):
+            self.assertIn(intervention, profile_rendered)
 
     def test_main_prints_completion_after_diagnostics_finish(self):
         import src.diagnose_material_condition as diagnostic
@@ -1242,6 +1679,7 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             output_dir="results/b0",
             permutation_seed=7,
             bootstrap_samples=10,
+            profile="factorized90",
         )
         config = self._b0_args()
         rows = self._summary_rows()
@@ -1271,12 +1709,14 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             output_dir=Path("results/b0"),
             permutation_seed=7,
             bootstrap_samples=10,
+            profile="factorized90",
         )
         completion.assert_called_once_with(
             Path("results/b0"),
             permutation_seed=7,
             rows=rows,
             samples=10,
+            profile="factorized90",
         )
 
     def test_diagnose_cli_help_requires_no_runtime_inputs(self):
@@ -1290,7 +1730,15 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        for option in ("--config", "--output-dir", "--permutation-seed", "--bootstrap-samples"):
+        for option in (
+            "--config",
+            "--output-dir",
+            "--permutation-seed",
+            "--bootstrap-samples",
+            "--profile",
+            "contact_cond90",
+            "factorized90",
+        ):
             self.assertIn(option, result.stdout)
 
 
