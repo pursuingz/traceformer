@@ -634,18 +634,42 @@ def _build_raw_reference(batch: dict[str, Any], dataset_cfg: Any) -> torch.Tenso
     return torch.stack(sequences, dim=0)
 
 
-def _metric_row(prefix: str, pred: torch.Tensor, gt: torch.Tensor, input_frames: int) -> dict[str, float]:
+def _metric_row(
+    prefix: str,
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    input_frames: int,
+    *,
+    model_name: str,
+) -> dict[str, float]:
     return {
         f"{prefix}_{name}": value
-        for name, value in trajectory_metrics(pred, gt, input_frames).items()
+        for name, value in trajectory_metrics(
+            pred,
+            gt,
+            input_frames,
+            model=model_name,
+            intervention=prefix,
+        ).items()
     }
 
 
-def _response_row(prefix: str, normal: torch.Tensor, counterfactual: torch.Tensor, input_frames: int) -> dict[str, float]:
+def _response_row(
+    prefix: str,
+    normal: torch.Tensor,
+    counterfactual: torch.Tensor,
+    input_frames: int,
+    *,
+    model_name: str,
+) -> dict[str, float]:
     return {
         f"{prefix}_{name}": value
         for name, value in condition_response_metrics(
-            normal, counterfactual, input_frames
+            normal,
+            counterfactual,
+            input_frames,
+            model=model_name,
+            intervention=prefix,
         ).items()
     }
 
@@ -863,25 +887,49 @@ def run_diagnostics(
                 "shuffled_nu": shuffled_nu,
                 "shuffled_mat_type": shuffled_class_type,
             }
-            row.update(_metric_row("normal", normal[0], gt[0], input_frames))
             row.update(
                 _metric_row(
-                    "shuffle_params", shuffled_params[0], gt[0], input_frames
+                    "normal",
+                    normal[0],
+                    gt[0],
+                    input_frames,
+                    model_name=model_name,
                 )
             )
             row.update(
                 _metric_row(
-                    "shuffle_class", shuffled_class[0], gt[0], input_frames
+                    "shuffle_params",
+                    shuffled_params[0],
+                    gt[0],
+                    input_frames,
+                    model_name=model_name,
+                )
+            )
+            row.update(
+                _metric_row(
+                    "shuffle_class",
+                    shuffled_class[0],
+                    gt[0],
+                    input_frames,
+                    model_name=model_name,
                 )
             )
             row.update(
                 _response_row(
-                    "shuffle_params", normal[0], shuffled_params[0], input_frames
+                    "shuffle_params",
+                    normal[0],
+                    shuffled_params[0],
+                    input_frames,
+                    model_name=model_name,
                 )
             )
             row.update(
                 _response_row(
-                    "shuffle_class", normal[0], shuffled_class[0], input_frames
+                    "shuffle_class",
+                    normal[0],
+                    shuffled_class[0],
+                    input_frames,
+                    model_name=model_name,
                 )
             )
         else:
@@ -904,12 +952,24 @@ def run_diagnostics(
                 "shuffled_nu": donor.nu,
                 "shuffled_mat_type": shuffled_class_type,
             }
-            row.update(_metric_row("normal", normal[0], gt[0], input_frames))
+            row.update(
+                _metric_row(
+                    "normal",
+                    normal[0],
+                    gt[0],
+                    input_frames,
+                    model_name=model_name,
+                )
+            )
             for intervention in B01_INTERVENTIONS:
                 counterfactual = outputs[intervention]
                 row.update(
                     _metric_row(
-                        intervention, counterfactual[0], gt[0], input_frames
+                        intervention,
+                        counterfactual[0],
+                        gt[0],
+                        input_frames,
+                        model_name=model_name,
                     )
                 )
                 row.update(
@@ -918,6 +978,7 @@ def run_diagnostics(
                         normal[0],
                         counterfactual[0],
                         input_frames,
+                        model_name=model_name,
                     )
                 )
         rows.append(row)

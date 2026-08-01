@@ -11,12 +11,12 @@ def _to_numpy(value: np.ndarray) -> np.ndarray:
 
 
 def _validate_finite(
-    value: np.ndarray | float,
+    value: np.ndarray | torch.Tensor | float,
     metric: str,
     model: str | None = None,
     intervention: str | None = None,
 ) -> None:
-    if np.all(np.isfinite(np.asarray(value, dtype=np.float64))):
+    if np.all(np.isfinite(_to_numpy(value))):
         return
     context = [f"metric={metric!r}"]
     if model is not None:
@@ -52,6 +52,9 @@ def trajectory_metrics(
     pred: np.ndarray,
     gt: np.ndarray,
     input_frames: int = 5,
+    *,
+    model: str | None = None,
+    intervention: str | None = None,
 ) -> dict[str, float]:
     """Compute per-trajectory rollout diagnostics for a ``(T,N,3)`` trajectory."""
     pred_array, gt_array = _validate_trajectory_pair(pred, gt, input_frames)
@@ -68,7 +71,7 @@ def trajectory_metrics(
         "fde": float(np.linalg.norm(pred_array[-1] - gt_array[-1], axis=-1).mean()),
     }
     for metric, value in metrics.items():
-        _validate_finite(value, metric)
+        _validate_finite(value, metric, model=model, intervention=intervention)
     return metrics
 
 
@@ -76,6 +79,9 @@ def condition_response_metrics(
     normal: np.ndarray,
     counterfactual: np.ndarray,
     input_frames: int = 5,
+    *,
+    model: str | None = None,
+    intervention: str | None = None,
 ) -> dict[str, float]:
     """Measure counterfactual response only on frames after the shared condition."""
     normal_array, counterfactual_array = _validate_trajectory_pair(
@@ -88,7 +94,7 @@ def condition_response_metrics(
         "final_prediction_mse": float(np.mean(prediction_difference[-1])),
     }
     for metric, value in metrics.items():
-        _validate_finite(value, metric)
+        _validate_finite(value, metric, model=model, intervention=intervention)
     return metrics
 
 

@@ -247,6 +247,39 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["full_rollout_mse"], 0.8)
 
+    def test_validate_finite_accepts_direct_torch_bfloat16(self):
+        from src.utils.material_condition_diagnostics import _validate_finite
+
+        cases = (
+            ("finite", torch.tensor([1.0, 2.0], dtype=torch.bfloat16), None),
+            (
+                "non_finite",
+                torch.tensor([1.0, float("inf")], dtype=torch.bfloat16),
+                ValueError,
+            ),
+        )
+        for name, value, expected_error in cases:
+            with self.subTest(name=name):
+                try:
+                    _validate_finite(
+                        value,
+                        "fde",
+                        model="bfloat16.h5",
+                        intervention="shuffle_e",
+                    )
+                except Exception as error:
+                    captured = error
+                else:
+                    captured = None
+
+                if expected_error is None:
+                    self.assertIsNone(captured, str(captured))
+                else:
+                    self.assertIsInstance(captured, expected_error, str(captured))
+                    message = str(captured)
+                    for context in ("fde", "bfloat16.h5", "shuffle_e"):
+                        self.assertIn(context, message)
+
     def test_torch_conversion_path_does_not_pass_original_tensor_to_numpy(self):
         pred, gt = self._trajectory()
 
@@ -318,6 +351,92 @@ class MaterialConditionDiagnosticsTest(unittest.TestCase):
             condition_response_metrics(normal, counterfactual, input_frames=5)
         self.assertIn("non-finite", str(response_error.exception))
         self.assertIn("prediction_mse", str(response_error.exception))
+
+    def test_metric_rows_include_rollout_context_on_non_finite_failure(self):
+        from src.diagnose_material_condition import _metric_row, _response_row
+
+        gt = torch.zeros((25, 2, 3), dtype=torch.float32)
+        pred = gt.clone()
+        pred[5, 0, 0] = torch.nan
+        cases = (
+            (
+                "full_rollout_mse",
+                lambda: _metric_row(
+                    "shuffle_e",
+                    pred,
+                    gt,
+                    input_frames=5,
+                    model_name="broken.h5",
+                ),
+            ),
+            (
+                "prediction_mse",
+                lambda: _response_row(
+                    "shuffle_e",
+                    gt,
+                    pred,
+                    input_frames=5,
+                    model_name="broken.h5",
+                ),
+            ),
+        )
+        for metric, operation in cases:
+            with self.subTest(metric=metric):
+                try:
+                    operation()
+                except Exception as error:
+                    captured = error
+                else:
+                    captured = None
+
+                self.assertIsInstance(captured, ValueError, str(captured))
+                message = str(captured)
+                for context in (metric, "broken.h5", "shuffle_e"):
+                    self.assertIn(context, message)
+
+    def test_metric_rows_preserve_finite_key_schema(self):
+        from src.diagnose_material_condition import _metric_row, _response_row
+
+        trajectory = torch.zeros((25, 2, 3), dtype=torch.float32)
+        try:
+            metric_row = _metric_row(
+                "normal",
+                trajectory,
+                trajectory,
+                input_frames=5,
+                model_name="finite.h5",
+            )
+            response_row = _response_row(
+                "shuffle_e",
+                trajectory,
+                trajectory,
+                input_frames=5,
+                model_name="finite.h5",
+            )
+        except Exception as error:
+            captured = error
+            metric_row = {}
+            response_row = {}
+        else:
+            captured = None
+
+        self.assertIsNone(captured, str(captured))
+        self.assertEqual(
+            set(metric_row),
+            {
+                "normal_full_rollout_mse",
+                "normal_gm_mse",
+                "normal_long_seg_mse",
+                "normal_fde",
+            },
+        )
+        self.assertEqual(
+            set(response_row),
+            {
+                "shuffle_e_prediction_mse",
+                "shuffle_e_final_prediction_mse",
+            },
+        )
 
     def test_derangement_is_within_material_one_to_one_and_reproducible(self):
         records = [
