@@ -5,6 +5,7 @@ import csv
 import math
 import os
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,6 @@ except ModuleNotFoundError:
 
 ROLLOUT_HORIZON = 20
 EXPECTED_MODEL_COUNT = 41
-EXPECTED_RESUME_SUFFIX = "outputs/mm3_contact_cond_8L/checkpoint-90000/model.safetensors"
 EXPECTED_DATASET_SUFFIX = "mm3_data/mm3_test"
 EXPECTED_MATERIAL_COUNTS = {0: 13, 1: 14, 2: 14}
 EXPECTED_MODEL_NAMES = frozenset(
@@ -114,12 +114,47 @@ EXPECTED_MODEL_CONFIG = {
     "contact_particle_cond": True,
     "contact_feature_sigma": 0.04,
 }
-EXPECTED_MODEL_DEFAULT_VALUES = {
-    "contact_injection_mode": "separate",
-    "contact_velocity_mode": "vertical",
-    "contact_feature_mask": [1, 1, 1],
-    "contact_bias_scale": 1.0,
+
+
+@dataclass(frozen=True)
+class DiagnosticProfile:
+    name: str
+    resume_suffix: str
+    model_defaults: dict[str, Any]
+
+
+B01_PROFILES = {
+    "contact_cond90": DiagnosticProfile(
+        name="contact_cond90",
+        resume_suffix=(
+            "outputs/mm3_contact_cond_8L/"
+            "checkpoint-90000/model.safetensors"
+        ),
+        model_defaults={
+            "contact_injection_mode": "separate",
+            "contact_velocity_mode": "vertical",
+            "contact_feature_mask": [1, 1, 1],
+            "contact_bias_scale": 1.0,
+        },
+    ),
+    "factorized90": DiagnosticProfile(
+        name="factorized90",
+        resume_suffix=(
+            "outputs/mm3_contact_vxyz_factorized_8L/"
+            "checkpoint-90000/model.safetensors"
+        ),
+        model_defaults={
+            "contact_injection_mode": "factorized",
+            "contact_velocity_mode": "xyz",
+            "contact_feature_mask": [1, 1, 1, 1, 1],
+            "contact_bias_scale": 1.0,
+        },
+    ),
 }
+# Compatibility aliases for legacy callers and tests. Identity validation resolves
+# these values through B01_PROFILES below.
+EXPECTED_RESUME_SUFFIX = B01_PROFILES["contact_cond90"].resume_suffix
+EXPECTED_MODEL_DEFAULT_VALUES = B01_PROFILES["contact_cond90"].model_defaults
 EXPECTED_TRAIN_DATASET_CONFIG = {
     "category": "hf-objaverse-v1",
     "dataset_list": "DATASET_ITEM_LIST",
@@ -286,7 +321,24 @@ def _validate_allowed_fields(config: Any, section: str, allowed: frozenset[str])
         raise ValueError(f"B0 config has unexpected {section} field(s): {unexpected}")
 
 
-def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None) -> None:
+def _resolve_profile(profile: str | None) -> DiagnosticProfile:
+    if profile is None:
+        return B01_PROFILES["contact_cond90"]
+    try:
+        return B01_PROFILES[profile]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown B0 diagnostic profile {profile!r}; "
+            f"expected one of {sorted(B01_PROFILES)}"
+        ) from error
+
+
+def _validate_b0_identity(
+    args: Any,
+    records: list[MaterialRecord] | None = None,
+    profile: str | None = None,
+) -> None:
+    resolved_profile = _resolve_profile(profile)
     _validate_allowed_fields(args, "top-level", ALLOWED_TOP_LEVEL_FIELDS)
     _validate_allowed_fields(
         args.model_config, "model_config", ALLOWED_MODEL_CONFIG_FIELDS
@@ -303,7 +355,7 @@ def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None
             expected,
             use_default_when_missing=False,
         )
-    for field, expected in EXPECTED_MODEL_DEFAULT_VALUES.items():
+    for field, expected in resolved_profile.model_defaults.items():
         _validate_config_value(
             args,
             f"model_config.{field}",
@@ -318,10 +370,10 @@ def _validate_b0_identity(args: Any, records: list[MaterialRecord] | None = None
             use_default_when_missing=False,
         )
     resume = _normalized_path(args.resume)
-    if not resume.endswith(EXPECTED_RESUME_SUFFIX):
+    if not resume.endswith(resolved_profile.resume_suffix):
         raise ValueError(
             "B0 checkpoint mismatch: "
-            f"actual={resume!r}; expected={EXPECTED_RESUME_SUFFIX!r}"
+            f"actual={resume!r}; expected={resolved_profile.resume_suffix!r}"
         )
     dataset_path = _normalized_path(args.train_dataset.dataset_path)
     if not dataset_path.endswith(EXPECTED_DATASET_SUFFIX):

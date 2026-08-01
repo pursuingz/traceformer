@@ -498,6 +498,42 @@ class ContactAblationConfigTests(unittest.TestCase):
             _without_paths(train.train_dataset, ignored),
         )
 
+    def test_factorized_90k_eval_mirrors_factorized_training_config(self):
+        train = _load_structured(
+            "config_mm3_contact_vxyz_factorized.yaml", TrainingConfig
+        )
+        eval_cfg = _load_structured(
+            "eval_mm3_contact_vxyz_factorized_90k.yaml", TestingConfig
+        )
+
+        self.assertEqual(
+            eval_cfg.resume,
+            "outputs/mm3_contact_vxyz_factorized_8L/"
+            "checkpoint-90000/model.safetensors",
+        )
+        self.assertEqual(
+            eval_cfg.vis_dir, "vis_results_mm3_contact_vxyz_factorized_90k"
+        )
+        self.assertEqual(eval_cfg.model_config.contact_velocity_mode, "xyz")
+        self.assertEqual(
+            eval_cfg.model_config.contact_injection_mode, "factorized"
+        )
+
+        train.train_dataset.input_frames = train.input_frames
+        train.train_dataset.output_frames = train.output_frames
+        eval_cfg.train_dataset.input_frames = eval_cfg.input_frames
+        eval_cfg.train_dataset.output_frames = eval_cfg.output_frames
+        OmegaConf.resolve(train)
+        OmegaConf.resolve(eval_cfg)
+        self.assertEqual(
+            OmegaConf.to_container(eval_cfg.model_config, resolve=True),
+            OmegaConf.to_container(train.model_config, resolve=True),
+        )
+        self.assertEqual(
+            _without_paths(eval_cfg.train_dataset, {"dataset_path"}),
+            _without_paths(train.train_dataset, {"dataset_path"}),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
