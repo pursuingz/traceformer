@@ -178,6 +178,11 @@ class V11aContactIntegrationTests(unittest.TestCase):
     def test_zero_gate_load_from_contact_anchor_preserves_output_bits(self):
         torch.manual_seed(101)
         contact = self.build_from_config("SpatialTemporalTransformerBlock").eval()
+        with torch.no_grad():
+            contact.contact_encoder.weight.fill_(0.125)
+            contact.contact_encoder.bias.fill_(-0.25)
+        self.assertGreater(torch.count_nonzero(contact.contact_encoder.weight).item(), 0)
+        self.assertGreater(torch.count_nonzero(contact.contact_encoder.bias).item(), 0)
         torch.manual_seed(202)
         combined = self.build_from_config(
             "SpatialTemporalTransformerBlockv11a"
@@ -202,6 +207,33 @@ class V11aContactIntegrationTests(unittest.TestCase):
             contact_output = contact(**inputs)
             combined_output = combined(**inputs)
         torch.testing.assert_close(combined_output, contact_output, rtol=0, atol=0)
+
+    def test_contact_conditioned_forward_calls_exchange_at_each_v11a_stage(self):
+        model = self.build_from_config("SpatialTemporalTransformerBlockv11a").eval()
+        exchange = model.dit.hybrid_state_exchange
+        calls = []
+
+        def record_call(module, args, kwargs):
+            calls.append(
+                (
+                    id(module),
+                    kwargs["stage_index"],
+                    kwargs["history_start"],
+                    kwargs["prediction_index"],
+                )
+            )
+
+        handle = exchange.register_forward_pre_hook(record_call, with_kwargs=True)
+        try:
+            with torch.no_grad():
+                model(**self.inputs())
+        finally:
+            handle.remove()
+
+        self.assertEqual(
+            calls,
+            [(id(exchange), stage, 1, 6) for stage in range(4)],
+        )
 
     def test_contact_encoder_and_exchange_gate_receive_gradients(self):
         torch.manual_seed(303)
