@@ -2227,13 +2227,15 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if sample_frames - cond_seq_length_t != 1:
                 raise ValueError("v11a requires exactly one output frame")
             self.hybrid_state_interval = hybrid_state_interval
-            self.hybrid_state_exchange = HybridStateExchange(
-                particle_dim=inner_dim,
-                state_dim=hybrid_state_dim,
-                num_heads=hybrid_state_heads,
-                history_frames=history_frames,
-                num_stages=num_layers // hybrid_state_interval,
-            )
+            # Keep this arm's extra initialization from shifting shared CPU RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.hybrid_state_exchange = HybridStateExchange(
+                    particle_dim=inner_dim,
+                    state_dim=hybrid_state_dim,
+                    num_heads=hybrid_state_heads,
+                    history_frames=history_frames,
+                    num_stages=num_layers // hybrid_state_interval,
+                )
         self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
 
         # 4. Output blocks

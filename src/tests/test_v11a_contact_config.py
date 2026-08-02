@@ -175,6 +175,57 @@ class V11aContactIntegrationTests(unittest.TestCase):
         self.assertEqual(exchanges, [model.dit.hybrid_state_exchange])
         self.assertEqual(model.dit.hybrid_state_interval, 2)
 
+    def test_same_seed_fresh_models_keep_all_common_state_tensors_bitwise_equal(self):
+        torch.manual_seed(4242)
+        contact = self.build_from_config("SpatialTemporalTransformerBlock")
+        torch.manual_seed(4242)
+        combined = self.build_from_config("SpatialTemporalTransformerBlockv11a")
+
+        contact_state = contact.state_dict()
+        combined_state = combined.state_dict()
+        exchange_keys = {
+            key for key in combined_state
+            if key.startswith("dit.hybrid_state_exchange.")
+        }
+        self.assertTrue(exchange_keys)
+        self.assertEqual(set(contact_state), set(combined_state) - exchange_keys)
+        mismatched = [
+            key for key, tensor in contact_state.items()
+            if not torch.equal(tensor, combined_state[key])
+        ]
+        self.assertEqual(mismatched, [])
+
+    def test_same_seed_fresh_models_leave_cpu_rng_state_bitwise_equal(self):
+        torch.manual_seed(4242)
+        self.build_from_config("SpatialTemporalTransformerBlock")
+        contact_rng_state = torch.get_rng_state().clone()
+        torch.manual_seed(4242)
+        self.build_from_config("SpatialTemporalTransformerBlockv11a")
+        combined_rng_state = torch.get_rng_state().clone()
+
+        self.assertTrue(torch.equal(combined_rng_state, contact_rng_state))
+
+    def test_same_seed_zero_gate_fresh_models_preserve_output_bits(self):
+        torch.manual_seed(4242)
+        contact = self.build_from_config("SpatialTemporalTransformerBlock").eval()
+        torch.manual_seed(4242)
+        combined = self.build_from_config(
+            "SpatialTemporalTransformerBlockv11a"
+        ).eval()
+        self.assertTrue(
+            torch.equal(
+                combined.dit.hybrid_state_exchange.feedback_gates,
+                torch.zeros(4),
+            )
+        )
+
+        torch.manual_seed(999)
+        inputs = self.inputs()
+        with torch.no_grad():
+            contact_output = contact(**inputs)
+            combined_output = combined(**inputs)
+        torch.testing.assert_close(combined_output, contact_output, rtol=0, atol=0)
+
     def test_zero_gate_load_from_contact_anchor_preserves_output_bits(self):
         torch.manual_seed(101)
         contact = self.build_from_config("SpatialTemporalTransformerBlock").eval()
@@ -211,28 +262,59 @@ class V11aContactIntegrationTests(unittest.TestCase):
     def test_contact_conditioned_forward_calls_exchange_at_each_v11a_stage(self):
         model = self.build_from_config("SpatialTemporalTransformerBlockv11a").eval()
         exchange = model.dit.hybrid_state_exchange
-        calls = []
+        events = []
 
-        def record_call(module, args, kwargs):
-            calls.append(
+        def record_block(block_index):
+            def hook(module, args, kwargs):
+                events.append((f"block{block_index}", id(module), None, None))
+            return hook
+
+        def record_exchange(module, args, kwargs):
+            events.append(
                 (
+                    f"exchange{kwargs['stage_index']}",
                     id(module),
-                    kwargs["stage_index"],
                     kwargs["history_start"],
                     kwargs["prediction_index"],
                 )
             )
 
-        handle = exchange.register_forward_pre_hook(record_call, with_kwargs=True)
+        handles = [
+            block.register_forward_pre_hook(
+                record_block(block_index),
+                with_kwargs=True,
+            )
+            for block_index, block in enumerate(
+                model.dit.transformer_blocks,
+                start=1,
+            )
+        ]
+        handles.append(
+            exchange.register_forward_pre_hook(record_exchange, with_kwargs=True)
+        )
         try:
             with torch.no_grad():
                 model(**self.inputs())
         finally:
-            handle.remove()
+            for handle in handles:
+                handle.remove()
 
         self.assertEqual(
-            calls,
-            [(id(exchange), stage, 1, 6) for stage in range(4)],
+            events,
+            [
+                ("block1", id(model.dit.transformer_blocks[0]), None, None),
+                ("block2", id(model.dit.transformer_blocks[1]), None, None),
+                ("exchange0", id(exchange), 1, 6),
+                ("block3", id(model.dit.transformer_blocks[2]), None, None),
+                ("block4", id(model.dit.transformer_blocks[3]), None, None),
+                ("exchange1", id(exchange), 1, 6),
+                ("block5", id(model.dit.transformer_blocks[4]), None, None),
+                ("block6", id(model.dit.transformer_blocks[5]), None, None),
+                ("exchange2", id(exchange), 1, 6),
+                ("block7", id(model.dit.transformer_blocks[6]), None, None),
+                ("block8", id(model.dit.transformer_blocks[7]), None, None),
+                ("exchange3", id(exchange), 1, 6),
+            ],
         )
 
     def test_contact_encoder_and_exchange_gate_receive_gradients(self):
