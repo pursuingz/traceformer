@@ -80,7 +80,11 @@ def load_plain(path):
 
 
 class V11aContactConfigTests(unittest.TestCase):
+    def assert_config_exists(self, path):
+        self.assertTrue(path.is_file(), f"missing config: {path}")
+
     def assert_isolated_arm(self, baseline_path, arm_path, allowed_top_level):
+        self.assert_config_exists(arm_path)
         baseline = copy.deepcopy(load_plain(baseline_path))
         arm = copy.deepcopy(load_plain(arm_path))
 
@@ -168,7 +172,7 @@ if __name__ == "__main__":
 D:/miniconda3/envs/physctrl/python.exe -m unittest src.tests.test_v11a_contact_config.V11aContactConfigTests -v
 ```
 
-Expected: FAIL，错误指向 `config_mm3_v11a_contact_cond_8L.yaml` 不存在；不得是 import 或环境错误。
+Expected: FAIL，断言信息为 `missing config: ...config_mm3_v11a_contact_cond_8L.yaml`；不得是 `FileNotFoundError`、import 或环境错误。
 
 - [ ] **Step 3: 创建训练配置，只应用预注册差异**
 
