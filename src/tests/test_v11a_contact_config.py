@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
 from omegaconf import OmegaConf
 
 SRC_DIR = Path(__file__).resolve().parents[1]
@@ -10,6 +11,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from options import TestingConfig, TrainingConfig
+from count_params import build_mm3, validate_v11a_parameter_budget
+from model.hybrid_state import HybridStateExchange
+from model.spacetime import MDM_ST, SpatialTemporalTransformerBlock
 
 
 CONFIG_DIR = SRC_DIR / "configs"
@@ -116,6 +120,124 @@ class V11aContactConfigTests(unittest.TestCase):
         self.assertEqual(evaluation.num_inference_steps, 1)
         self.assertEqual(evaluation.output_frames, 1)
         self.assertTrue(evaluation.model_config.contact_particle_cond)
+
+
+class V11aContactIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def build_from_config(transformer_block):
+        cfg = OmegaConf.load(TRAIN_ARM)
+        cfg.model_config.cond_frames = cfg.get("input_frames", 5)
+        cfg.model_config.transformer_block = transformer_block
+        if transformer_block == "SpatialTemporalTransformerBlock":
+            for key in HYBRID_CONFIG:
+                cfg.model_config.pop(key, None)
+        return MDM_ST(
+            n_points=8,
+            n_frame=1,
+            n_feats=3,
+            model_config=cfg.model_config,
+        )
+
+    @staticmethod
+    def inputs(batch_size=1, point_count=8):
+        return {
+            "x": torch.randn(batch_size, 1, point_count, 3),
+            "timesteps": torch.zeros(batch_size, dtype=torch.long),
+            "init_pc": torch.randn(batch_size, 5, point_count, 3),
+            "force": torch.randn(batch_size, 3),
+            "E": torch.full((batch_size, 1), 6.0),
+            "nu": torch.full((batch_size, 1), 0.35),
+            "drag_mask": torch.zeros(batch_size, 1, point_count, 1),
+            "drag_point": torch.zeros(batch_size, 4),
+            "floor_height": torch.full((batch_size, 1), -2.0),
+            "gravity_label": torch.ones(batch_size, 1, dtype=torch.long),
+            "y": torch.ones(batch_size, dtype=torch.long),
+            "start_vel": torch.zeros(batch_size, point_count, 3),
+        }
+
+    def test_combined_model_keeps_original_serial_blocks_and_both_modules(self):
+        model = self.build_from_config("SpatialTemporalTransformerBlockv11a")
+
+        self.assertTrue(model.contact_particle_cond)
+        self.assertEqual(model.contact_injection_mode, "separate")
+        self.assertEqual(model.contact_encoder.in_features, 3)
+        self.assertEqual(model.contact_encoder.out_features, 256)
+        self.assertTrue(
+            all(
+                type(block) is SpatialTemporalTransformerBlock
+                for block in model.dit.transformer_blocks
+            )
+        )
+        exchanges = [
+            module for module in model.modules()
+            if isinstance(module, HybridStateExchange)
+        ]
+        self.assertEqual(exchanges, [model.dit.hybrid_state_exchange])
+        self.assertEqual(model.dit.hybrid_state_interval, 2)
+
+    def test_zero_gate_load_from_contact_anchor_preserves_output_bits(self):
+        torch.manual_seed(101)
+        contact = self.build_from_config("SpatialTemporalTransformerBlock").eval()
+        torch.manual_seed(202)
+        combined = self.build_from_config(
+            "SpatialTemporalTransformerBlockv11a"
+        ).eval()
+
+        incompatible = combined.load_state_dict(contact.state_dict(), strict=False)
+        expected_missing = {
+            key for key in combined.state_dict()
+            if key.startswith("dit.hybrid_state_exchange.")
+        }
+        self.assertEqual(set(incompatible.missing_keys), expected_missing)
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertTrue(
+            torch.equal(
+                combined.dit.hybrid_state_exchange.feedback_gates,
+                torch.zeros(4),
+            )
+        )
+
+        inputs = self.inputs()
+        with torch.no_grad():
+            contact_output = contact(**inputs)
+            combined_output = combined(**inputs)
+        torch.testing.assert_close(combined_output, contact_output, rtol=0, atol=0)
+
+    def test_contact_encoder_and_exchange_gate_receive_gradients(self):
+        torch.manual_seed(303)
+        model = self.build_from_config(
+            "SpatialTemporalTransformerBlockv11a"
+        ).train()
+        output = model(**self.inputs())
+        output.square().mean().backward()
+
+        contact_grad = model.contact_encoder.weight.grad
+        gate_grad = model.dit.hybrid_state_exchange.feedback_gates.grad
+        self.assertIsNotNone(contact_grad)
+        self.assertIsNotNone(gate_grad)
+        self.assertTrue(torch.isfinite(contact_grad).all())
+        self.assertTrue(torch.isfinite(gate_grad).all())
+        self.assertGreater(torch.count_nonzero(contact_grad).item(), 0)
+        self.assertTrue(torch.all(gate_grad != 0))
+
+    def test_combination_adds_only_the_existing_v11a_exchange_budget(self):
+        contact = build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+        )
+        combined = build_mm3(
+            "SpatialTemporalTransformerBlockv11a",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+        )
+        report = validate_v11a_parameter_budget(contact, combined)
+
+        self.assertEqual(report["signed_delta"], 160_773)
+        self.assertLess(report["delta_percent"], 1.0)
+        self.assertEqual(report["block_count"], 8)
+        self.assertEqual(report["exchange_count"], 1)
+        self.assertEqual(report["exchange_calls"], 4)
 
 
 if __name__ == "__main__":
