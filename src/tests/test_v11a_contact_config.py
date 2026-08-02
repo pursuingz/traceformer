@@ -31,7 +31,8 @@ def load_plain(path):
 
 class V11aContactConfigTests(unittest.TestCase):
     def assert_config_exists(self, path):
-        self.assertTrue(path.is_file(), f"missing config: {path}")
+        if not path.is_file():
+            raise AssertionError(f"missing config: {path}")
 
     def assert_isolated_arm(self, baseline_path, arm_path, allowed_top_level):
         self.assert_config_exists(arm_path)
@@ -87,7 +88,14 @@ class V11aContactConfigTests(unittest.TestCase):
             },
         )
 
+    def test_missing_config_is_rejected_before_loading(self):
+        missing_path = CONFIG_DIR / "__missing_v11a_contact_config__.yaml"
+        with self.assertRaisesRegex(AssertionError, r"^missing config:"):
+            self.assert_config_exists(missing_path)
+
     def test_configs_merge_and_keep_screening_contract(self):
+        self.assert_config_exists(TRAIN_ARM)
+        self.assert_config_exists(EVAL_ARM)
         train = OmegaConf.merge(
             OmegaConf.structured(TrainingConfig), OmegaConf.load(TRAIN_ARM)
         )
