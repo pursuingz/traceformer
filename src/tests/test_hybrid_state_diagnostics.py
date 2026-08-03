@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -53,6 +54,14 @@ class FeedbackDecompositionTests(unittest.TestCase):
             stats["global_energy_fraction"],
             torch.zeros(2),
         )
+
+    def test_decompose_feedback_zeroes_all_nonfinite_feedback_values(self):
+        feedback = torch.tensor([[[float("nan"), float("inf"), float("-inf")]]])
+
+        stats = decompose_feedback(feedback, gate=1.0)
+
+        for key in stats:
+            torch.testing.assert_close(stats[key], torch.zeros(1))
 
 
 class HybridStateFeedbackRecorderTests(unittest.TestCase):
@@ -168,6 +177,25 @@ class HybridStateFeedbackRecorderTests(unittest.TestCase):
                     torch.randn(1, 3, 8),
                     encoder_hidden_states=torch.randn(1, 5, 8),
                 )
+
+    def test_recorder_zeroes_nonfinite_feedback_from_real_hook(self):
+        nonfinite_feedback = torch.tensor(
+            [[[float("nan"), float("inf"), float("-inf"), 0.0, 0.0, 0.0, 0.0, 0.0]]]
+        )
+        hidden = self.hidden
+        with patch.object(
+            self.exchange.feedback_attention,
+            "forward",
+            return_value=nonfinite_feedback,
+        ):
+            with HybridStateFeedbackRecorder(self.exchange) as recorder:
+                for stage in range(4):
+                    state, hidden = self._forward(stage, hidden=hidden)
+
+        records = recorder.finalize(expected_rollout_steps=1)
+        for row in records:
+            self.assertEqual(row["feedback_energy"], 0.0)
+            self.assertEqual(row["global_energy_fraction"], 0.0)
 
 
 if __name__ == "__main__":

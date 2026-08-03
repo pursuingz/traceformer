@@ -22,7 +22,12 @@ def decompose_feedback(
     if not torch.isfinite(gate_tensor).all():
         raise ValueError("gate must be finite")
 
-    delta = torch.nan_to_num(feedback.detach().float()) * gate_tensor
+    delta = torch.nan_to_num(
+        feedback.detach().float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ) * gate_tensor
     if not torch.isfinite(delta).all():
         raise ValueError("applied feedback must be finite")
 
