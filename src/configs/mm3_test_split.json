@@ -2,5 +2,10 @@
   "_comment": "mm3 held-out test split, frozen 2026-07-18. Drawn with random.Random(0).sample from each material's successful h5 idx list (local generation, segments: plasticine 40000-45000, sand 45000-50000, ~5% glb coverage). Elastic test = existing 2048_test 13 objects (39xxx segment), unchanged. These idx must be EXCLUDED from mm3_train for their material. n=14 per new material (meets n>=14 line); elastic n=13 (below line, annotate).",
   "plasticine_test": [40481, 41341, 42107, 42473, 42798, 43014, 43393, 43624, 43739, 43941, 44431, 44503, 44732, 44774],
   "sand_test": [45583, 45752, 45767, 45790, 46081, 46213, 46809, 47458, 47570, 47781, 47956, 48721, 49196, 49860],
+  "frozen_test_models": {
+    "elastic": ["39478_000.h5", "39511_000.h5", "39560_000.h5", "39586_000.h5", "39653_000.h5", "39659_000.h5", "39714_000.h5", "39726_000.h5", "39746_000.h5", "39764_000.h5", "39959_000.h5", "39973_000.h5", "39999_000.h5"],
+    "plasticine": ["40481_001.h5", "41341_001.h5", "42107_001.h5", "42473_001.h5", "42798_001.h5", "43014_001.h5", "43393_001.h5", "43624_001.h5", "43739_001.h5", "43941_001.h5", "44431_001.h5", "44503_001.h5", "44732_001.h5", "44774_001.h5"],
+    "sand": ["45583_002.h5", "45752_002.h5", "45767_002.h5", "45790_002.h5", "46081_002.h5", "46213_002.h5", "46809_002.h5", "47458_002.h5", "47570_002.h5", "47781_002.h5", "47956_002.h5", "48721_002.h5", "49196_002.h5", "49860_002.h5"]
+  },
   "train_counts_after_exclusion": {"elastic": 254, "plasticine": 263, "sand": 265}
 }

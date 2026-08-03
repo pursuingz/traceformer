@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -24,6 +24,7 @@ from utils.hybrid_state_diagnostics import (
     write_feedback_report,
 )
 from utils.eval_metrics import per_window_metrics
+import src.diagnose_hybrid_state_feedback as diagnostic
 from src.diagnose_hybrid_state_feedback import (
     _output_paths,
     build_parser,
@@ -39,17 +40,57 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
     return SimpleNamespace(
         pc_size=2048,
         eval_batch_size=1,
-        dataloader_num_workers=0,
+        dataloader_num_workers=4,
         seed=0,
         use_diffusion=False,
         num_inference_steps=1,
         input_frames=5,
         output_frames=1,
+        pred_offset=True,
+        model_type="dit_st",
         model_config=SimpleNamespace(
+            n_layers=8,
+            latent_dim=256,
+            frame_cond=True,
+            point_embed=True,
+            mask_cond=True,
+            pred_offset=True,
+            num_neighbors=-1,
+            floor_cond=True,
+            max_num_forces=1,
+            force_as_token=False,
+            force_as_latent=False,
+            gravity_emb=True,
+            coeff_cond=False,
+            num_mat=4,
+            class_token=True,
             transformer_block="SpatialTemporalTransformerBlockv11a",
+            hybrid_state_dim=64,
+            hybrid_state_heads=4,
+            hybrid_state_interval=2,
             contact_particle_cond=True,
+            contact_feature_sigma=0.04,
         ),
-        train_dataset=SimpleNamespace(dataset_path=dataset_path),
+        train_dataset=SimpleNamespace(
+            category="hf-objaverse-v1",
+            dataset_path=dataset_path,
+            dataset_list="DATASET_ITEM_LIST",
+            has_gravity=True,
+            max_num_forces=1,
+            norm_fac=5,
+            stage="deform",
+            mode="diff",
+            pc_size=2048,
+            repeat=1,
+            seed=0,
+            n_sample_pro_model=300,
+            n_frames_interval=1,
+            n_training_frames=24,
+            batch_size=20,
+            overfit=False,
+            input_frames=5,
+            output_frames=1,
+        ),
     )
 
 
@@ -120,6 +161,7 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             ("output_frames", 2, "output_frames"),
             ("use_diffusion", True, "use_diffusion"),
             ("eval_batch_size", 2, "eval_batch_size"),
+            ("n_layers", 7, "n_layers"),
         )
         for field, value, message in cases:
             with self.subTest(field=field):
@@ -129,6 +171,60 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_diagnostic_config(args, checkpoint)
 
+    def test_validate_diagnostic_config_normalizes_b1b_dataset_path_and_rejects_others(self):
+        checkpoint = Path(
+            "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors"
+        )
+        validate_diagnostic_config(
+            _diagnostic_args(dataset_path=".\\mm3_data\\mm3_test"), checkpoint
+        )
+
+        with self.assertRaisesRegex(ValueError, "dataset_path"):
+            validate_diagnostic_config(
+                _diagnostic_args(dataset_path="mm3_data/mm3_train"), checkpoint
+            )
+
+    def test_frozen_manifest_contains_the_exact_b1b_41_models(self):
+        manifest = diagnostic.load_frozen_test_manifest()
+        self.assertEqual(
+            manifest,
+            {
+                "elastic": (
+                    "39478_000.h5", "39511_000.h5", "39560_000.h5",
+                    "39586_000.h5", "39653_000.h5", "39659_000.h5",
+                    "39714_000.h5", "39726_000.h5", "39746_000.h5",
+                    "39764_000.h5", "39959_000.h5", "39973_000.h5",
+                    "39999_000.h5",
+                ),
+                "plasticine": (
+                    "40481_001.h5", "41341_001.h5", "42107_001.h5",
+                    "42473_001.h5", "42798_001.h5", "43014_001.h5",
+                    "43393_001.h5", "43624_001.h5", "43739_001.h5",
+                    "43941_001.h5", "44431_001.h5", "44503_001.h5",
+                    "44732_001.h5", "44774_001.h5",
+                ),
+                "sand": (
+                    "45583_002.h5", "45752_002.h5", "45767_002.h5",
+                    "45790_002.h5", "46081_002.h5", "46213_002.h5",
+                    "46809_002.h5", "47458_002.h5", "47570_002.h5",
+                    "47781_002.h5", "47956_002.h5", "48721_002.h5",
+                    "49196_002.h5", "49860_002.h5",
+                ),
+            },
+        )
+
+    def test_select_start_zero_indices_rejects_a_model_set_outside_frozen_manifest(self):
+        manifest = diagnostic.load_frozen_test_manifest()
+        expected_models = [name for names in manifest.values() for name in names]
+        wrong_models = [*expected_models[:-1], "unexpected_002.h5"]
+        dataset = SimpleNamespace(
+            models=[{"model": name, "start_idx": 0} for name in wrong_models],
+            split_lst_save=wrong_models,
+        )
+
+        with self.assertRaisesRegex(ValueError, "frozen model set mismatch"):
+            select_start_zero_indices(dataset, expected_models)
+
         with self.assertRaisesRegex(ValueError, "checkpoint-90000"):
             validate_diagnostic_config(
                 _diagnostic_args(),
@@ -137,9 +233,10 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                 ),
             )
 
-    def test_trajectory_diagnostic_fields_uses_full_mse_fde_and_frame24_proc(self):
+    def test_trajectory_diagnostic_fields_excludes_condition_frames_from_full_rollout_mse(self):
         gt = torch.arange(27, dtype=torch.float32).view(1, 9, 3).repeat(25, 1, 1)
         pred = gt.clone()
+        pred[:5] += 100.0
         pred[5:] += 2.0
         pred[24, :, 0] += torch.arange(9, dtype=torch.float32)
 
@@ -147,7 +244,7 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
 
         self.assertAlmostEqual(
             fields["full_rollout_mse"],
-            torch.mean((pred - gt).square()).item(),
+            torch.mean((pred[5:] - gt[5:]).square()).item(),
         )
         self.assertAlmostEqual(
             fields["fde"],
@@ -156,6 +253,39 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
         expected_proc = per_window_metrics(pred, gt, input_frames=5)["proc"][24]
         self.assertAlmostEqual(fields["f24_centroid_error"], expected_proc[0])
         self.assertAlmostEqual(fields["f24_shape_residual_mse"], expected_proc[3])
+
+    def test_ground_truth_is_moved_to_the_prediction_cuda_device_before_metrics(self):
+        class RecordingGroundTruth:
+            def __init__(self):
+                self.devices = []
+                self.result = torch.zeros(25, 9, 3)
+
+            def to(self, device):
+                self.devices.append(device)
+                return self.result
+
+        gt = RecordingGroundTruth()
+        pred = SimpleNamespace(device=torch.device("cuda"))
+
+        self.assertIs(
+            diagnostic._move_ground_truth_to_prediction_device(pred, gt), gt.result
+        )
+        self.assertEqual(gt.devices, [torch.device("cuda")])
+
+    def test_rollout_autocast_matches_eval_cuda_bfloat16_and_cpu_uses_nullcontext(self):
+        import src.diagnose_hybrid_state_feedback as diagnostic
+
+        with patch.object(diagnostic.torch, "autocast", return_value=nullcontext()) as autocast:
+            with diagnostic._rollout_autocast_context(torch.device("cuda")):
+                pass
+        autocast.assert_called_once_with("cuda", dtype=torch.bfloat16)
+
+        with patch.object(diagnostic.torch, "autocast") as autocast:
+            context = diagnostic._rollout_autocast_context(torch.device("cpu"))
+            with context:
+                pass
+        self.assertIsInstance(context, type(nullcontext()))
+        autocast.assert_not_called()
 
     def test_cli_parser_and_output_paths_use_fixed_b1b_90k_names(self):
         parsed = build_parser().parse_args(
@@ -187,11 +317,8 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
     def test_run_feedback_diagnostics_three_argument_call_writes_3280_rows_without_compile(self):
         import src.diagnose_hybrid_state_feedback as diagnostic
 
-        model_names = [
-            *(f"elastic_{index:02d}.h5" for index in range(13)),
-            *(f"plasticine_{index:02d}.h5" for index in range(14)),
-            *(f"sand_{index:02d}.h5" for index in range(14)),
-        ]
+        manifest = diagnostic.load_frozen_test_manifest()
+        model_names = [name for names in manifest.values() for name in names]
         records = [
             SimpleNamespace(
                 model=name,
@@ -285,7 +412,7 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             checkpoint = root / "checkpoint-90000" / "model.safetensors"
             checkpoint.parent.mkdir()
             checkpoint.touch()
-            args = _diagnostic_args(dataset_path=str(root))
+            args = _diagnostic_args()
             dataloader = [
                 (
                     {
@@ -318,6 +445,8 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                 mock.patch.object(diagnostic, "rollout_condition", return_value=expected_pred) as rollout,
                 mock.patch.object(diagnostic, "HybridStateFeedbackRecorder", FakeRecorder),
                 mock.patch.object(diagnostic.torch, "compile", side_effect=AssertionError("must be eager")) as compile,
+                mock.patch.object(diagnostic.Path, "is_dir", return_value=True),
+                mock.patch.object(diagnostic.torch, "autocast", return_value=nullcontext()) as autocast,
                 io.StringIO() as stdout,
                 redirect_stdout(stdout),
             ):
@@ -332,6 +461,11 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             self.assertEqual(len(rows), 3280)
             self.assertEqual(rollout.call_count, 41)
             compile.assert_not_called()
+            self.assertEqual(autocast.call_count, 41)
+            self.assertEqual(
+                autocast.call_args_list,
+                [mock.call("cuda", dtype=torch.bfloat16)] * 41,
+            )
             selected_dataset = dataloader_constructor.call_args.args[0]
             self.assertEqual(selected_dataset.indices, list(range(0, 41 * 4, 4)))
             self.assertTrue(csv_path.is_file())
@@ -341,6 +475,17 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             self.assertIn("<not-provided-direct-call>", markdown)
             self.assertIn("models=41", completion_output)
             self.assertIn("rows=3280", completion_output)
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                csv_rows = list(csv.DictReader(handle))
+            self.assertTrue(
+                all(row["checkpoint"] == str(checkpoint) for row in csv_rows)
+            )
+            self.assertTrue(
+                all(row["config"] == "<not-provided-direct-call>" for row in csv_rows)
+            )
+            self.assertTrue(
+                all(row["sample_scope"] == diagnostic.B1B_SAMPLE_SCOPE for row in csv_rows)
+            )
 
 
 class FeedbackDecompositionTests(unittest.TestCase):
@@ -668,9 +813,14 @@ class FeedbackSummaryTests(unittest.TestCase):
         )[0, 1]
         self.assertNotAlmostEqual(row_level_pearson, direct["pearson"], places=6)
 
-    def test_feedback_correlations_returns_nan_for_constant_or_single_model_groups(self):
+    def test_feedback_correlations_returns_nan_for_two_models_with_constant_feedback(self):
         rows = self._rows()
-        rows = [row for row in rows if row["model"] == "model-a"]
+        for row in rows:
+            row["feedback_rms"] = 1.0
+            row["global_rms"] = 1.0
+            row["deform_rms"] = 1.0
+            row["global_energy_fraction"] = 1.0
+            row["full_rollout_mse"] = 1.0
         correlations = feedback_correlations(rows)
         result = next(
             row
@@ -679,6 +829,7 @@ class FeedbackSummaryTests(unittest.TestCase):
             and row["feedback_metric"] == "feedback_rms"
             and row["trajectory_metric"] == "full_rollout_mse"
         )
+        self.assertEqual(result["n_models"], 2)
         self.assertTrue(math.isnan(result["pearson"]))
         self.assertTrue(math.isnan(result["spearman"]))
 
@@ -696,31 +847,32 @@ class FeedbackSummaryTests(unittest.TestCase):
     def test_feedback_writers_sort_csv_and_render_report_tables(self):
         rows = self._rows()
         rows.reverse()
+        metadata = {
+            "checkpoint": "checkpoint-90000/model.safetensors",
+            "config": "configs/eval.yaml",
+            "sample_scope": diagnostic.B1B_SAMPLE_SCOPE,
+        }
         with tempfile.TemporaryDirectory() as directory:
             csv_path = Path(directory) / "feedback.csv"
             report_path = Path(directory) / "feedback.md"
-            write_feedback_csv(csv_path, rows)
-            write_feedback_report(
-                report_path,
-                rows,
-                {
-                    "checkpoint": "checkpoint-90000/model.safetensors",
-                    "config": "configs/eval.yaml",
-                    "windows": "41-window start_idx=0",
-                },
-            )
+            write_feedback_csv(csv_path, rows, metadata)
+            write_feedback_report(report_path, rows, metadata)
 
             with csv_path.open(newline="", encoding="utf-8") as handle:
                 csv_rows = list(csv.DictReader(handle))
             self.assertEqual(csv_rows[0]["model"], "model-a")
             self.assertEqual(csv_rows[0]["rollout_step"], "0")
             self.assertEqual(csv_rows[0]["stage"], "0")
+            for csv_row in csv_rows:
+                self.assertEqual(csv_row["checkpoint"], metadata["checkpoint"])
+                self.assertEqual(csv_row["config"], metadata["config"])
+                self.assertEqual(csv_row["sample_scope"], metadata["sample_scope"])
 
             report = report_path.read_text(encoding="utf-8")
             for token in (
                 "checkpoint-90000/model.safetensors",
                 "configs/eval.yaml",
-                "41-window",
+                diagnostic.B1B_SAMPLE_SCOPE,
                 "overall",
                 "elastic",
                 "plasticine",
@@ -735,17 +887,21 @@ class FeedbackSummaryTests(unittest.TestCase):
             self.assertIn("plasticine=1", report)
             self.assertNotIn("nan", report.lower())
 
-    def test_feedback_report_requires_checkpoint_and_config_metadata(self):
+    def test_feedback_writers_require_checkpoint_config_and_sample_scope_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "feedback.csv"
             report_path = Path(directory) / "feedback.md"
             cases = (
                 ({}, "checkpoint"),
                 ({"checkpoint": "checkpoint.safetensors"}, "config"),
                 ({"checkpoint": "", "config": "configs/eval.yaml"}, "checkpoint"),
                 ({"checkpoint": "checkpoint.safetensors", "config": "  "}, "config"),
+                ({"checkpoint": "checkpoint.safetensors", "config": "configs/eval.yaml"}, "sample_scope"),
             )
             for metadata, missing_field in cases:
                 with self.subTest(missing_field=missing_field, metadata=metadata):
+                    with self.assertRaisesRegex(ValueError, missing_field):
+                        write_feedback_csv(csv_path, self._rows(), metadata)
                     with self.assertRaisesRegex(ValueError, missing_field):
                         write_feedback_report(report_path, self._rows(), metadata)
 
@@ -766,6 +922,7 @@ class FeedbackSummaryTests(unittest.TestCase):
                 {
                     "checkpoint": "checkpoint.safetensors",
                     "config": "configs/eval.yaml",
+                    "sample_scope": diagnostic.B1B_SAMPLE_SCOPE,
                 },
             )
 

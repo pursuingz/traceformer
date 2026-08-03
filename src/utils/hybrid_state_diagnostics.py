@@ -376,6 +376,9 @@ def feedback_correlations(rows: list[dict]) -> list[dict]:
 
 
 CSV_COLUMNS = (
+    "checkpoint",
+    "config",
+    "sample_scope",
     "model",
     "mat_type",
     "log10_e",
@@ -389,6 +392,8 @@ CSV_COLUMNS = (
     *TRAJECTORY_METRICS,
 )
 
+_PROVENANCE_FIELDS = ("checkpoint", "config", "sample_scope")
+
 
 def _format_value(value) -> str:
     if value is None:
@@ -398,9 +403,22 @@ def _format_value(value) -> str:
     return str(value)
 
 
-def write_feedback_csv(path: Path, rows: list[dict]) -> None:
+def _validate_provenance(metadata: dict[str, str]) -> dict[str, str]:
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict")
+    validated = {}
+    for key in _PROVENANCE_FIELDS:
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"metadata must contain a non-empty string: {key}")
+        validated[key] = value
+    return validated
+
+
+def write_feedback_csv(path: Path, rows: list[dict], metadata: dict[str, str]) -> None:
     """Write sorted raw feedback rows with a stable diagnostic schema."""
     validated = _validate_diagnostic_rows(rows, include_trajectory=True)
+    provenance = _validate_provenance(metadata)
     for row in validated:
         for key in ("mat_type", "log10_e", "nu", "rollout_step", "gate"):
             if key not in row:
@@ -420,18 +438,14 @@ def write_feedback_csv(path: Path, rows: list[dict]) -> None:
         writer.writeheader()
         for row in sorted_rows:
             output = {key: row.get(key) for key in CSV_COLUMNS}
+            output.update(provenance)
             output["horizon"] = row["horizon"]
             writer.writerow({key: _format_value(value) for key, value in output.items()})
 
 
 def write_feedback_report(path: Path, rows: list[dict], metadata: dict[str, str]) -> None:
     """Write the grouped feedback and model-level correlation report."""
-    if not isinstance(metadata, dict):
-        raise ValueError("metadata must be a dict")
-    for key in ("checkpoint", "config"):
-        value = metadata.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"metadata must contain a non-empty string: {key}")
+    provenance = _validate_provenance(metadata)
 
     validated = _validate_diagnostic_rows(rows, include_trajectory=True)
     summary = aggregate_feedback_rows(validated)
@@ -447,12 +461,12 @@ def write_feedback_report(path: Path, rows: list[dict], metadata: dict[str, str]
         f"{group}={count}" for group, count in material_counts.items()
     )
     lines = ["# HST Feedback Diagnostic", "", "## Metadata", ""]
-    for key, value in metadata.items():
+    for key, value in provenance.items():
         lines.append(f"- {key}: {value}")
     lines.extend(
         [
             "- Material groups: overall, elastic, plasticine, sand.",
-            "- Scope: 41-window start_idx=0 full-rollout diagnostic.",
+            f"- Scope: {provenance['sample_scope']}.",
             f"- Material model counts: {material_count_text or 'none'}.",
             "- correlation: model-level diagnostic association, not significance or causality.",
             "- Correlations are diagnostic associations only; no significance or causal claims are made.",
