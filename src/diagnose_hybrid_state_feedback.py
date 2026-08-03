@@ -44,6 +44,7 @@ ROLLOUT_STEPS = 20
 STAGES_PER_STEP = 4
 ROWS_PER_MODEL = ROLLOUT_STEPS * STAGES_PER_STEP
 CHECKPOINT_SUFFIX = "checkpoint-90000/model.safetensors"
+DIRECT_CALL_CONFIG_PATH = "<not-provided-direct-call>"
 
 
 def _config_value(config: Any, field: str) -> Any:
@@ -195,7 +196,7 @@ def run_feedback_diagnostics(
     checkpoint: Path,
     output_dir: Path,
     *,
-    config_path: Path,
+    config_path: Path | None = None,
 ) -> list[dict]:
     """Run exactly one eager start-0 rollout per B1b test model and write diagnostics."""
     from safetensors.torch import load_file
@@ -284,14 +285,18 @@ def run_feedback_diagnostics(
 
     _validate_completed_rows(rows, evaluated_models)
     csv_path, markdown_path = _output_paths(output_dir)
-    config_path = Path(config_path)
+    report_config_path = (
+        str(Path(config_path))
+        if config_path is not None
+        else DIRECT_CALL_CONFIG_PATH
+    )
     write_feedback_csv(csv_path, rows)
     write_feedback_report(
         markdown_path,
         rows,
         {
             "checkpoint": str(checkpoint),
-            "config": str(config_path),
+            "config": report_config_path,
         },
     )
     material_counts = Counter(int(record.mat_type) for record in records)

@@ -110,7 +110,9 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
         self.assertEqual(select_start_zero_indices(dataset), [0, 3, 6])
 
     def test_validate_diagnostic_config_rejects_non_b1b_runtime_shapes(self):
-        checkpoint = Path("outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors")
+        checkpoint = Path(
+            "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors"
+        )
         cases = (
             ("transformer_block", "SpatialTemporalTransformerBlock", "transformer_block"),
             ("contact_particle_cond", False, "contact_particle_cond"),
@@ -130,7 +132,9 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint-90000"):
             validate_diagnostic_config(
                 _diagnostic_args(),
-                Path("outputs/mm3_v11a_mc_hst_8L/checkpoint-45000/model.safetensors"),
+                Path(
+                    "outputs/mm3_v11a_contact_cond_8L/checkpoint-45000/model.safetensors"
+                ),
             )
 
     def test_trajectory_diagnostic_fields_uses_full_mse_fde_and_frame24_proc(self):
@@ -159,7 +163,7 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                 "--config",
                 "configs/eval_mm3_v11a_contact_cond_8L_45k.yaml",
                 "--checkpoint",
-                "outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors",
+                "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors",
                 "--output-dir",
                 "results/hst",
             ]
@@ -169,6 +173,10 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             "configs/eval_mm3_v11a_contact_cond_8L_45k.yaml",
         )
         self.assertEqual(
+            parsed.checkpoint,
+            "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors",
+        )
+        self.assertEqual(
             _output_paths(Path("results/hst")),
             (
                 Path("results/hst/hybrid_state_feedback_b1b_90k.csv"),
@@ -176,7 +184,7 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             ),
         )
 
-    def test_run_feedback_diagnostics_writes_3280_rows_without_compile(self):
+    def test_run_feedback_diagnostics_three_argument_call_writes_3280_rows_without_compile(self):
         import src.diagnose_hybrid_state_feedback as diagnostic
 
         model_names = [
@@ -317,7 +325,6 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                     args,
                     checkpoint,
                     root / "reports",
-                    config_path=Path("configs/eval_mm3_v11a_contact_cond_8L_45k.yaml"),
                 )
                 completion_output = stdout.getvalue()
 
@@ -329,7 +336,9 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             self.assertEqual(selected_dataset.indices, list(range(0, 41 * 4, 4)))
             self.assertTrue(csv_path.is_file())
             self.assertTrue(markdown_path.is_file())
-            self.assertIn(str(checkpoint.resolve()), markdown_path.read_text(encoding="utf-8"))
+            markdown = markdown_path.read_text(encoding="utf-8")
+            self.assertIn(str(checkpoint.resolve()), markdown)
+            self.assertIn("<not-provided-direct-call>", markdown)
             self.assertIn("models=41", completion_output)
             self.assertIn("rows=3280", completion_output)
 
