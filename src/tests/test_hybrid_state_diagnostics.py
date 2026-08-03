@@ -1,4 +1,8 @@
+import csv
+import math
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -6,7 +10,12 @@ import torch
 from model.hybrid_state import HybridStateExchange
 from utils.hybrid_state_diagnostics import (
     HybridStateFeedbackRecorder,
+    aggregate_feedback_rows,
     decompose_feedback,
+    feedback_correlations,
+    horizon_bucket,
+    write_feedback_csv,
+    write_feedback_report,
 )
 
 
@@ -196,6 +205,186 @@ class HybridStateFeedbackRecorderTests(unittest.TestCase):
         for row in records:
             self.assertEqual(row["feedback_energy"], 0.0)
             self.assertEqual(row["global_energy_fraction"], 0.0)
+
+
+class FeedbackSummaryTests(unittest.TestCase):
+    @staticmethod
+    def _rows():
+        rows = []
+        trajectory_by_model = {
+            "model-a": {
+                "full_rollout_mse": 1.0,
+                "fde": 2.0,
+                "f24_centroid_error": 3.0,
+                "f24_shape_residual_mse": 4.0,
+            },
+            "model-b": {
+                "full_rollout_mse": 2.0,
+                "fde": 4.0,
+                "f24_centroid_error": 6.0,
+                "f24_shape_residual_mse": 8.0,
+            },
+        }
+        for model_index, (model, trajectory) in enumerate(trajectory_by_model.items()):
+            for absolute_frame in (5, 11, 18):
+                for stage in range(4):
+                    value = float(model_index + 1)
+                    rows.append(
+                        {
+                            "model": model,
+                            "mat_type": model_index,
+                            "log10_e": 1.0 + model_index,
+                            "nu": 0.2 + model_index,
+                            "rollout_step": absolute_frame - 5,
+                            "absolute_frame": absolute_frame,
+                            "stage": stage,
+                            "gate": 0.1 * (stage + 1),
+                            "feedback_rms": value,
+                            "global_rms": value * 2.0,
+                            "deform_rms": value * 3.0,
+                            "global_energy_fraction": 0.1 * value,
+                            **trajectory,
+                        }
+                    )
+        return rows
+
+    def test_horizon_bucket_uses_fixed_inclusive_boundaries(self):
+        self.assertEqual(horizon_bucket(5), "short")
+        self.assertEqual(horizon_bucket(10), "short")
+        self.assertEqual(horizon_bucket(11), "mid")
+        self.assertEqual(horizon_bucket(17), "mid")
+        self.assertEqual(horizon_bucket(18), "long")
+        self.assertEqual(horizon_bucket(24), "long")
+
+    def test_aggregate_feedback_rows_reports_unique_model_counts(self):
+        summary = aggregate_feedback_rows(self._rows())
+
+        stage_row = next(
+            row
+            for row in summary
+            if row["group"] == "overall" and row["stage"] == 0
+        )
+        horizon_row = next(
+            row
+            for row in summary
+            if row["group"] == "overall" and row["horizon"] == "short"
+        )
+        self.assertEqual(stage_row["n_models"], 2)
+        self.assertAlmostEqual(stage_row["feedback_rms"], 1.5)
+        self.assertEqual(horizon_row["n_models"], 2)
+        self.assertAlmostEqual(horizon_row["global_rms"], 3.0)
+        self.assertEqual(
+            {row["group"] for row in summary},
+            {"overall", "elastic", "plasticine"},
+        )
+
+    def test_aggregate_feedback_rows_rejects_empty_missing_and_nonfinite_input(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            aggregate_feedback_rows([])
+
+        missing = self._rows()
+        del missing[0]["feedback_rms"]
+        with self.assertRaisesRegex(ValueError, "feedback_rms"):
+            aggregate_feedback_rows(missing)
+
+        nonfinite = self._rows()
+        nonfinite[0]["deform_rms"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "finite"):
+            aggregate_feedback_rows(nonfinite)
+
+    def test_feedback_correlations_aggregate_feedback_at_model_level(self):
+        rows = self._rows()
+        for row in rows:
+            model_value = 1.0 if row["model"] == "model-a" else 2.0
+            row["feedback_rms"] = model_value
+            row["full_rollout_mse"] = model_value
+            row["fde"] = 3.0 - model_value
+
+        correlations = feedback_correlations(rows)
+        direct = next(
+            row
+            for row in correlations
+            if row["group"] == "overall"
+            and row["feedback_metric"] == "feedback_rms"
+            and row["trajectory_metric"] == "full_rollout_mse"
+        )
+        inverse = next(
+            row
+            for row in correlations
+            if row["group"] == "overall"
+            and row["feedback_metric"] == "feedback_rms"
+            and row["trajectory_metric"] == "fde"
+        )
+        self.assertEqual(direct["n_models"], 2)
+        self.assertEqual(direct["pearson"], 1.0)
+        self.assertEqual(direct["spearman"], 1.0)
+        self.assertEqual(inverse["pearson"], -1.0)
+        self.assertEqual(inverse["spearman"], -1.0)
+
+    def test_feedback_correlations_returns_nan_for_constant_or_single_model_groups(self):
+        rows = self._rows()
+        rows = [row for row in rows if row["model"] == "model-a"]
+        correlations = feedback_correlations(rows)
+        result = next(
+            row
+            for row in correlations
+            if row["group"] == "overall"
+            and row["feedback_metric"] == "feedback_rms"
+            and row["trajectory_metric"] == "full_rollout_mse"
+        )
+        self.assertTrue(math.isnan(result["pearson"]))
+        self.assertTrue(math.isnan(result["spearman"]))
+
+    def test_feedback_correlations_rejects_missing_or_nonfinite_input(self):
+        missing = self._rows()
+        del missing[0]["fde"]
+        with self.assertRaisesRegex(ValueError, "fde"):
+            feedback_correlations(missing)
+
+        nonfinite = self._rows()
+        nonfinite[0]["full_rollout_mse"] = float("inf")
+        with self.assertRaisesRegex(ValueError, "finite"):
+            feedback_correlations(nonfinite)
+
+    def test_feedback_writers_sort_csv_and_render_report_tables(self):
+        rows = self._rows()
+        rows.reverse()
+        correlations = feedback_correlations(rows)
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "feedback.csv"
+            report_path = Path(directory) / "feedback.md"
+            write_feedback_csv(csv_path, rows)
+            write_feedback_report(
+                report_path,
+                rows,
+                {
+                    "checkpoint": "checkpoint-90000/model.safetensors",
+                    "config": "configs/eval.yaml",
+                    "windows": "41-window start_idx=0",
+                },
+            )
+
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                csv_rows = list(csv.DictReader(handle))
+            self.assertEqual(csv_rows[0]["model"], "model-a")
+            self.assertEqual(csv_rows[0]["rollout_step"], "0")
+            self.assertEqual(csv_rows[0]["stage"], "0")
+
+            report = report_path.read_text(encoding="utf-8")
+            for token in (
+                "checkpoint-90000/model.safetensors",
+                "configs/eval.yaml",
+                "41-window",
+                "overall",
+                "elastic",
+                "plasticine",
+                "sand",
+                "stage",
+                "horizon",
+                "correlation",
+            ):
+                self.assertIn(token, report)
+            self.assertNotIn("nan", report.lower())
 
 
 if __name__ == "__main__":
