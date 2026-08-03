@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from utils.eval_metrics import per_window_metrics
 from utils.hybrid_state_gate_knockout import (
     KNOCKOUT_CONDITIONS,
     masked_feedback_gates,
@@ -90,6 +91,48 @@ class GateMaskTests(unittest.TestCase):
 
 
 class TrajectoryMetricTests(unittest.TestCase):
+    def test_trajectory_metrics_match_gm_fde_and_frame24_procrustes(self):
+        points = torch.tensor(
+            [
+                [-1.0, -0.5, 0.0],
+                [0.0, -0.5, 0.25],
+                [1.0, -0.25, 0.5],
+                [-0.75, 0.5, 1.0],
+                [0.25, 0.75, 1.5],
+                [1.25, 0.25, 1.75],
+                [-0.5, 1.25, 2.0],
+                [0.75, 1.5, 2.5],
+            ]
+        )
+        gt = points.unsqueeze(0).repeat(25, 1, 1)
+        gt[:, :, 0] += torch.arange(25, dtype=torch.float32).view(-1, 1) * 0.02
+        gt[:, :, 2] += torch.arange(25, dtype=torch.float32).view(-1, 1) * 0.03
+
+        angle = torch.tensor(0.35)
+        rotation = torch.tensor(
+            [
+                [torch.cos(angle), -torch.sin(angle), 0.0],
+                [torch.sin(angle), torch.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        pred = gt.clone()
+        pred[5:] = 1.15 * (gt[5:] @ rotation.T) + torch.tensor([0.4, -0.2, 0.3])
+        pred[5:] += torch.arange(20, dtype=torch.float32).view(-1, 1, 1) * 0.01
+
+        metrics = trajectory_knockout_metrics(
+            pred, gt, input_frames=5, floor_height=-10.0
+        )
+        base = per_window_metrics(pred.float(), gt.float(), input_frames=5, k=7)
+        frame_mse = (pred[5:] - gt[5:]).square().mean((1, 2))
+        expected_gm = torch.exp(torch.log(frame_mse.clamp_min(1e-30)).mean()).item()
+        expected_centroid, _, _, expected_shape = base["proc"][24]
+
+        self.assertAlmostEqual(metrics["gm_mse"], expected_gm)
+        self.assertAlmostEqual(metrics["fde"], base["fde"])
+        self.assertAlmostEqual(metrics["f24_centroid_error"], expected_centroid)
+        self.assertAlmostEqual(metrics["f24_shape_residual_mse"], expected_shape)
+
     def test_trajectory_metrics_exclude_history_and_use_absolute_frame_segments(self):
         gt = torch.zeros(25, 8, 3)
         gt[:, :, 0] = torch.arange(8, dtype=torch.float32)
