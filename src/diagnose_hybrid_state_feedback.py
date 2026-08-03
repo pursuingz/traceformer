@@ -119,6 +119,40 @@ def _output_paths(output_dir: Path) -> tuple[Path, Path]:
     )
 
 
+def select_start_zero_indices(dataset: Any) -> list[int]:
+    """Select the one fixed start-0 diagnostic window for every test model."""
+    try:
+        entries = dataset.models
+        expected_models = [Path(name).name for name in dataset.split_lst_save]
+    except AttributeError as exc:
+        raise ValueError("diagnostic dataset must expose models and split_lst_save") from exc
+    if len(expected_models) != len(set(expected_models)):
+        raise ValueError("diagnostic dataset split contains duplicate model names")
+
+    selected: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        try:
+            model_name = Path(entry["model"]).name
+            start_idx = int(entry["start_idx"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid diagnostic dataset entry at index {index}") from exc
+        if start_idx != 0:
+            continue
+        if model_name in selected:
+            raise ValueError(f"{model_name}: duplicate start_idx=0 diagnostic window")
+        selected[model_name] = index
+
+    expected_set = set(expected_models)
+    selected_set = set(selected)
+    if selected_set != expected_set:
+        missing = sorted(expected_set - selected_set)
+        unexpected = sorted(selected_set - expected_set)
+        raise ValueError(
+            f"start_idx=0 selection mismatch: missing={missing}; unexpected={unexpected}"
+        )
+    return [selected[model_name] for model_name in expected_models]
+
+
 def _validate_records(records: list[Any], dataset_models: list[str]) -> dict[str, Any]:
     record_names = [Path(record.model).name for record in records]
     dataset_names = [Path(name).name for name in dataset_models]
@@ -160,6 +194,8 @@ def run_feedback_diagnostics(
     args: Any,
     checkpoint: Path,
     output_dir: Path,
+    *,
+    config_path: Path,
 ) -> list[dict]:
     """Run exactly one eager start-0 rollout per B1b test model and write diagnostics."""
     from safetensors.torch import load_file
@@ -188,13 +224,14 @@ def run_feedback_diagnostics(
     dataset = TrajDataset("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
     records_by_model = _validate_records(records, dataset.split_lst_save)
+    start_zero_indices = select_start_zero_indices(dataset)
 
     model = MDM_ST(args.pc_size, 1, n_feats=3, model_config=args.model_config).to("cuda")
     _load_checkpoint_strict(model, checkpoint, load_file)
     model.eval().requires_grad_(False)
     pipeline = TrajPipeline(model=model, scheduler=None)
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        torch.utils.data.Subset(dataset, start_zero_indices),
         batch_size=1,
         shuffle=False,
         num_workers=args.dataloader_num_workers,
@@ -247,16 +284,14 @@ def run_feedback_diagnostics(
 
     _validate_completed_rows(rows, evaluated_models)
     csv_path, markdown_path = _output_paths(output_dir)
-    config_path = getattr(args, "diagnostic_config_path", None)
-    if not isinstance(config_path, str) or not config_path.strip():
-        raise ValueError("diagnostic_config_path must record the CLI config path")
+    config_path = Path(config_path)
     write_feedback_csv(csv_path, rows)
     write_feedback_report(
         markdown_path,
         rows,
         {
             "checkpoint": str(checkpoint),
-            "config": config_path,
+            "config": str(config_path),
         },
     )
     material_counts = Counter(int(record.mat_type) for record in records)
@@ -284,8 +319,12 @@ def main() -> None:
     checkpoint = Path(cli_args.checkpoint)
     args = OmegaConf.merge(OmegaConf.structured(TestingConfig), OmegaConf.load(config_path))
     args.resume = str(checkpoint)
-    args.diagnostic_config_path = str(config_path)
-    run_feedback_diagnostics(args, checkpoint, Path(cli_args.output_dir))
+    run_feedback_diagnostics(
+        args,
+        checkpoint,
+        Path(cli_args.output_dir),
+        config_path=config_path,
+    )
 
 
 if __name__ == "__main__":

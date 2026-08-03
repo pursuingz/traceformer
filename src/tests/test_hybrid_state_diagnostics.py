@@ -27,7 +27,9 @@ from utils.eval_metrics import per_window_metrics
 from src.diagnose_hybrid_state_feedback import (
     _output_paths,
     build_parser,
+    main,
     run_feedback_diagnostics,
+    select_start_zero_indices,
     trajectory_diagnostic_fields,
     validate_diagnostic_config,
 )
@@ -43,7 +45,6 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
         num_inference_steps=1,
         input_frames=5,
         output_frames=1,
-        diagnostic_config_path="configs/eval_mm3_v11a_mc_hst_8L.yaml",
         model_config=SimpleNamespace(
             transformer_block="SpatialTemporalTransformerBlockv11a",
             contact_particle_cond=True,
@@ -53,6 +54,61 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
 
 
 class FeedbackDiagnosticCliTests(unittest.TestCase):
+    def test_main_uses_contact_config_overrides_resume_and_passes_metadata_explicitly(self):
+        import src.diagnose_hybrid_state_feedback as diagnostic
+
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "eval_mm3_v11a_contact_cond_8L_45k.yaml"
+        )
+        checkpoint = Path(
+            "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors"
+        )
+        output_dir = Path("results/hst-feedback")
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "diagnose_hybrid_state_feedback.py",
+                    "--config",
+                    str(config_path),
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--output-dir",
+                    str(output_dir),
+                ],
+            ),
+            patch.object(diagnostic, "run_feedback_diagnostics") as run,
+        ):
+            main()
+
+        args, passed_checkpoint, passed_output_dir = run.call_args.args
+        self.assertEqual(args.resume, str(checkpoint))
+        self.assertNotIn("diagnostic_config_path", args)
+        self.assertEqual(passed_checkpoint, checkpoint)
+        self.assertEqual(passed_output_dir, output_dir)
+        self.assertEqual(run.call_args.kwargs["config_path"], config_path)
+
+    def test_select_start_zero_indices_keeps_one_window_per_model(self):
+        dataset = SimpleNamespace(
+            models=[
+                {"model": "elastic.h5", "start_idx": 0},
+                {"model": "elastic.h5", "start_idx": 5},
+                {"model": "elastic.h5", "start_idx": 10},
+                {"model": "plasticine.h5", "start_idx": 0},
+                {"model": "plasticine.h5", "start_idx": 5},
+                {"model": "plasticine.h5", "start_idx": 10},
+                {"model": "sand.h5", "start_idx": 0},
+                {"model": "sand.h5", "start_idx": 5},
+                {"model": "sand.h5", "start_idx": 10},
+            ],
+            split_lst_save=["elastic.h5", "plasticine.h5", "sand.h5"],
+        )
+
+        self.assertEqual(select_start_zero_indices(dataset), [0, 3, 6])
+
     def test_validate_diagnostic_config_rejects_non_b1b_runtime_shapes(self):
         checkpoint = Path("outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors")
         cases = (
@@ -101,14 +157,17 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
         parsed = build_parser().parse_args(
             [
                 "--config",
-                "configs/eval_mm3_v11a_mc_hst_8L.yaml",
+                "configs/eval_mm3_v11a_contact_cond_8L_45k.yaml",
                 "--checkpoint",
                 "outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors",
                 "--output-dir",
                 "results/hst",
             ]
         )
-        self.assertEqual(parsed.config, "configs/eval_mm3_v11a_mc_hst_8L.yaml")
+        self.assertEqual(
+            parsed.config,
+            "configs/eval_mm3_v11a_contact_cond_8L_45k.yaml",
+        )
         self.assertEqual(
             _output_paths(Path("results/hst")),
             (
@@ -138,6 +197,11 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
         class FakeDataset:
             def __init__(self, split, config):
                 self.split_lst_save = list(model_names)
+                self.models = [
+                    {"model": model_name, "start_idx": start_idx}
+                    for model_name in model_names
+                    for start_idx in (0, 5, 10, 15)
+                ]
 
         class FakeModel:
             def to(self, device):
@@ -232,7 +296,11 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             expected_pred = reference.clone()
             with (
                 mock.patch.dict(sys.modules, imported_modules),
-                mock.patch.object(diagnostic.torch.utils.data, "DataLoader", return_value=dataloader),
+                mock.patch.object(
+                    diagnostic.torch.utils.data,
+                    "DataLoader",
+                    return_value=dataloader,
+                ) as dataloader_constructor,
                 mock.patch.object(diagnostic, "load_material_records", return_value=records),
                 mock.patch.object(
                     diagnostic,
@@ -245,13 +313,20 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
                 io.StringIO() as stdout,
                 redirect_stdout(stdout),
             ):
-                rows = run_feedback_diagnostics(args, checkpoint, root / "reports")
+                rows = run_feedback_diagnostics(
+                    args,
+                    checkpoint,
+                    root / "reports",
+                    config_path=Path("configs/eval_mm3_v11a_contact_cond_8L_45k.yaml"),
+                )
                 completion_output = stdout.getvalue()
 
             csv_path, markdown_path = _output_paths(root / "reports")
             self.assertEqual(len(rows), 3280)
             self.assertEqual(rollout.call_count, 41)
             compile.assert_not_called()
+            selected_dataset = dataloader_constructor.call_args.args[0]
+            self.assertEqual(selected_dataset.indices, list(range(0, 41 * 4, 4)))
             self.assertTrue(csv_path.is_file())
             self.assertTrue(markdown_path.is_file())
             self.assertIn(str(checkpoint.resolve()), markdown_path.read_text(encoding="utf-8"))
