@@ -426,9 +426,24 @@ def write_feedback_csv(path: Path, rows: list[dict]) -> None:
 
 def write_feedback_report(path: Path, rows: list[dict], metadata: dict[str, str]) -> None:
     """Write the grouped feedback and model-level correlation report."""
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict")
+    for key in ("checkpoint", "config"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"metadata must contain a non-empty string: {key}")
+
     validated = _validate_diagnostic_rows(rows, include_trajectory=True)
     summary = aggregate_feedback_rows(validated)
     correlations = feedback_correlations(validated)
+    material_counts = {
+        row["group"]: row["n_models"]
+        for row in summary
+        if row["group"] != "overall"
+    }
+    material_count_text = ", ".join(
+        f"{group}={count}" for group, count in material_counts.items()
+    )
     lines = ["# HST Feedback Diagnostic", "", "## Metadata", ""]
     for key, value in metadata.items():
         lines.append(f"- {key}: {value}")
@@ -436,7 +451,7 @@ def write_feedback_report(path: Path, rows: list[dict], metadata: dict[str, str]
         [
             "- Material groups: overall, elastic, plasticine, sand.",
             "- Scope: 41-window start_idx=0 full-rollout diagnostic.",
-            "- Material-level correlation diagnostics have n=13/14 models per material.",
+            f"- Material model counts: {material_count_text or 'none'}.",
             "- correlation: model-level diagnostic association, not significance or causality.",
             "- Correlations are diagnostic associations only; no significance or causal claims are made.",
             "",

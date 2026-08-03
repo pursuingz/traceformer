@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from model.hybrid_state import HybridStateExchange
@@ -293,12 +294,30 @@ class FeedbackSummaryTests(unittest.TestCase):
             aggregate_feedback_rows(nonfinite)
 
     def test_feedback_correlations_aggregate_feedback_at_model_level(self):
-        rows = self._rows()
-        for row in rows:
-            model_value = 1.0 if row["model"] == "model-a" else 2.0
-            row["feedback_rms"] = model_value
-            row["full_rollout_mse"] = model_value
-            row["fde"] = 3.0 - model_value
+        rows = []
+        specs = (
+            ("model-a", 0, 1.0, 1.0, 1),
+            ("model-b", 1, 2.0, 4.0, 2),
+            ("model-c", 2, 4.0, 2.0, 5),
+        )
+        for model, mat_type, feedback_value, trajectory_value, multiplicity in specs:
+            for repetition in range(multiplicity):
+                rows.append(
+                    {
+                        "model": model,
+                        "mat_type": mat_type,
+                        "absolute_frame": 5 + repetition,
+                        "stage": repetition % 4,
+                        "feedback_rms": feedback_value,
+                        "global_rms": feedback_value,
+                        "deform_rms": feedback_value,
+                        "global_energy_fraction": feedback_value / 10.0,
+                        "full_rollout_mse": trajectory_value,
+                        "fde": trajectory_value,
+                        "f24_centroid_error": trajectory_value,
+                        "f24_shape_residual_mse": trajectory_value,
+                    }
+                )
 
         correlations = feedback_correlations(rows)
         direct = next(
@@ -315,11 +334,16 @@ class FeedbackSummaryTests(unittest.TestCase):
             and row["feedback_metric"] == "feedback_rms"
             and row["trajectory_metric"] == "fde"
         )
-        self.assertEqual(direct["n_models"], 2)
-        self.assertEqual(direct["pearson"], 1.0)
-        self.assertEqual(direct["spearman"], 1.0)
-        self.assertEqual(inverse["pearson"], -1.0)
-        self.assertEqual(inverse["spearman"], -1.0)
+        self.assertEqual(direct["n_models"], 3)
+        self.assertAlmostEqual(direct["pearson"], 1.0 / 7.0)
+        self.assertAlmostEqual(direct["spearman"], 0.5)
+        self.assertAlmostEqual(inverse["pearson"], 1.0 / 7.0)
+        self.assertAlmostEqual(inverse["spearman"], 0.5)
+        row_level_pearson = np.corrcoef(
+            np.repeat([1.0, 2.0, 4.0], [1, 2, 5]),
+            np.repeat([1.0, 4.0, 2.0], [1, 2, 5]),
+        )[0, 1]
+        self.assertNotAlmostEqual(row_level_pearson, direct["pearson"], places=6)
 
     def test_feedback_correlations_returns_nan_for_constant_or_single_model_groups(self):
         rows = self._rows()
@@ -349,7 +373,6 @@ class FeedbackSummaryTests(unittest.TestCase):
     def test_feedback_writers_sort_csv_and_render_report_tables(self):
         rows = self._rows()
         rows.reverse()
-        correlations = feedback_correlations(rows)
         with tempfile.TemporaryDirectory() as directory:
             csv_path = Path(directory) / "feedback.csv"
             report_path = Path(directory) / "feedback.md"
@@ -384,7 +407,24 @@ class FeedbackSummaryTests(unittest.TestCase):
                 "correlation",
             ):
                 self.assertIn(token, report)
+            self.assertNotIn("n=13/14", report)
+            self.assertIn("elastic=1", report)
+            self.assertIn("plasticine=1", report)
             self.assertNotIn("nan", report.lower())
+
+    def test_feedback_report_requires_checkpoint_and_config_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "feedback.md"
+            cases = (
+                ({}, "checkpoint"),
+                ({"checkpoint": "checkpoint.safetensors"}, "config"),
+                ({"checkpoint": "", "config": "configs/eval.yaml"}, "checkpoint"),
+                ({"checkpoint": "checkpoint.safetensors", "config": "  "}, "config"),
+            )
+            for metadata, missing_field in cases:
+                with self.subTest(missing_field=missing_field, metadata=metadata):
+                    with self.assertRaisesRegex(ValueError, missing_field):
+                        write_feedback_report(report_path, self._rows(), metadata)
 
 
 if __name__ == "__main__":
