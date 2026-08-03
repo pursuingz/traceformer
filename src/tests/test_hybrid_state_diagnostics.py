@@ -426,6 +426,33 @@ class FeedbackSummaryTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, missing_field):
                         write_feedback_report(report_path, self._rows(), metadata)
 
+    def test_feedback_report_counts_material_models_from_raw_rows_with_partial_horizons(self):
+        rows = [
+            row
+            for row in self._rows()
+            if row["model"] == "model-a" or row["absolute_frame"] == 5
+        ]
+        for row in rows:
+            row["mat_type"] = 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "feedback.md"
+            write_feedback_report(
+                report_path,
+                rows,
+                {
+                    "checkpoint": "checkpoint.safetensors",
+                    "config": "configs/eval.yaml",
+                },
+            )
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Material model counts: elastic=2.", report)
+            self.assertIn(
+                "| elastic | feedback_rms | full_rollout_mse | 2 |",
+                report,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

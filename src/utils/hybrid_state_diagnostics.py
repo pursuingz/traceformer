@@ -436,10 +436,12 @@ def write_feedback_report(path: Path, rows: list[dict], metadata: dict[str, str]
     validated = _validate_diagnostic_rows(rows, include_trajectory=True)
     summary = aggregate_feedback_rows(validated)
     correlations = feedback_correlations(validated)
+    material_models: dict[str, set[str]] = {}
+    for row in validated:
+        material_models.setdefault(row["material"], set()).add(row["model"])
     material_counts = {
-        row["group"]: row["n_models"]
-        for row in summary
-        if row["group"] != "overall"
+        material: len(models)
+        for material, models in material_models.items()
     }
     material_count_text = ", ".join(
         f"{group}={count}" for group, count in material_counts.items()
