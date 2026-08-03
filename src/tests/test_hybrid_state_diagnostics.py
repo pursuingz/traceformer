@@ -1,8 +1,13 @@
 import csv
+import io
 import math
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
+from types import ModuleType, SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -18,6 +23,240 @@ from utils.hybrid_state_diagnostics import (
     write_feedback_csv,
     write_feedback_report,
 )
+from utils.eval_metrics import per_window_metrics
+from src.diagnose_hybrid_state_feedback import (
+    _output_paths,
+    build_parser,
+    run_feedback_diagnostics,
+    trajectory_diagnostic_fields,
+    validate_diagnostic_config,
+)
+
+
+def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
+    return SimpleNamespace(
+        pc_size=2048,
+        eval_batch_size=1,
+        dataloader_num_workers=0,
+        seed=0,
+        use_diffusion=False,
+        num_inference_steps=1,
+        input_frames=5,
+        output_frames=1,
+        diagnostic_config_path="configs/eval_mm3_v11a_mc_hst_8L.yaml",
+        model_config=SimpleNamespace(
+            transformer_block="SpatialTemporalTransformerBlockv11a",
+            contact_particle_cond=True,
+        ),
+        train_dataset=SimpleNamespace(dataset_path=dataset_path),
+    )
+
+
+class FeedbackDiagnosticCliTests(unittest.TestCase):
+    def test_validate_diagnostic_config_rejects_non_b1b_runtime_shapes(self):
+        checkpoint = Path("outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors")
+        cases = (
+            ("transformer_block", "SpatialTemporalTransformerBlock", "transformer_block"),
+            ("contact_particle_cond", False, "contact_particle_cond"),
+            ("input_frames", 4, "input_frames"),
+            ("output_frames", 2, "output_frames"),
+            ("use_diffusion", True, "use_diffusion"),
+            ("eval_batch_size", 2, "eval_batch_size"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                args = _diagnostic_args()
+                target = args.model_config if hasattr(args.model_config, field) else args
+                setattr(target, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_diagnostic_config(args, checkpoint)
+
+        with self.assertRaisesRegex(ValueError, "checkpoint-90000"):
+            validate_diagnostic_config(
+                _diagnostic_args(),
+                Path("outputs/mm3_v11a_mc_hst_8L/checkpoint-45000/model.safetensors"),
+            )
+
+    def test_trajectory_diagnostic_fields_uses_full_mse_fde_and_frame24_proc(self):
+        gt = torch.arange(27, dtype=torch.float32).view(1, 9, 3).repeat(25, 1, 1)
+        pred = gt.clone()
+        pred[5:] += 2.0
+        pred[24, :, 0] += torch.arange(9, dtype=torch.float32)
+
+        fields = trajectory_diagnostic_fields(pred, gt, input_frames=5)
+
+        self.assertAlmostEqual(
+            fields["full_rollout_mse"],
+            torch.mean((pred - gt).square()).item(),
+        )
+        self.assertAlmostEqual(
+            fields["fde"],
+            (pred[24] - gt[24]).norm(dim=-1).mean().item(),
+        )
+        expected_proc = per_window_metrics(pred, gt, input_frames=5)["proc"][24]
+        self.assertAlmostEqual(fields["f24_centroid_error"], expected_proc[0])
+        self.assertAlmostEqual(fields["f24_shape_residual_mse"], expected_proc[3])
+
+    def test_cli_parser_and_output_paths_use_fixed_b1b_90k_names(self):
+        parsed = build_parser().parse_args(
+            [
+                "--config",
+                "configs/eval_mm3_v11a_mc_hst_8L.yaml",
+                "--checkpoint",
+                "outputs/mm3_v11a_mc_hst_8L/checkpoint-90000/model.safetensors",
+                "--output-dir",
+                "results/hst",
+            ]
+        )
+        self.assertEqual(parsed.config, "configs/eval_mm3_v11a_mc_hst_8L.yaml")
+        self.assertEqual(
+            _output_paths(Path("results/hst")),
+            (
+                Path("results/hst/hybrid_state_feedback_b1b_90k.csv"),
+                Path("results/hst/hybrid_state_feedback_b1b_90k.md"),
+            ),
+        )
+
+    def test_run_feedback_diagnostics_writes_3280_rows_without_compile(self):
+        import src.diagnose_hybrid_state_feedback as diagnostic
+
+        model_names = [
+            *(f"elastic_{index:02d}.h5" for index in range(13)),
+            *(f"plasticine_{index:02d}.h5" for index in range(14)),
+            *(f"sand_{index:02d}.h5" for index in range(14)),
+        ]
+        records = [
+            SimpleNamespace(
+                model=name,
+                mat_type=0 if index < 13 else 1 if index < 27 else 2,
+                log10_e=3.0 + index / 100.0,
+                nu=0.2,
+            )
+            for index, name in enumerate(model_names)
+        ]
+
+        class FakeDataset:
+            def __init__(self, split, config):
+                self.split_lst_save = list(model_names)
+
+        class FakeModel:
+            def to(self, device):
+                self.device = device
+                self.dit = SimpleNamespace(hybrid_state_exchange=object())
+                return self
+
+            def load_state_dict(self, checkpoint, strict):
+                self.strict = strict
+
+            def eval(self):
+                return self
+
+            def requires_grad_(self, enabled):
+                self.requires_grad = enabled
+                return self
+
+        class FakeRecorder:
+            def __init__(self, exchange):
+                self.exchange = exchange
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def finalize(self, expected_rollout_steps):
+                self.expected_rollout_steps = expected_rollout_steps
+                return [
+                    {
+                        "stage": stage,
+                        "rollout_step": rollout_step,
+                        "absolute_frame": 5 + rollout_step,
+                        "gate": 0.25,
+                        "feedback_rms": 1.0,
+                        "global_rms": 0.5,
+                        "deform_rms": 0.5,
+                        "global_energy_fraction": 0.25,
+                    }
+                    for rollout_step in range(20)
+                    for stage in range(4)
+                ]
+
+        fake_model = FakeModel()
+        dataset_module = ModuleType("dataset.traj_dataset")
+        dataset_module.TrajDataset = FakeDataset
+        dataset_package = ModuleType("dataset")
+        dataset_package.__path__ = []
+        model_module = ModuleType("model.spacetime")
+        model_module.MDM_ST = mock.Mock(return_value=fake_model)
+        model_package = ModuleType("model")
+        model_package.__path__ = []
+        pipeline_module = ModuleType("pipeline_traj")
+        pipeline_module.TrajPipeline = mock.Mock(return_value=object())
+        safetensors_package = ModuleType("safetensors")
+        safetensors_package.__path__ = []
+        safetensors_torch_module = ModuleType("safetensors.torch")
+        safetensors_torch_module.load_file = mock.Mock(return_value={"weight": 1})
+        safetensors_package.torch = safetensors_torch_module
+        imported_modules = {
+            "dataset": dataset_package,
+            "dataset.traj_dataset": dataset_module,
+            "model": model_package,
+            "model.spacetime": model_module,
+            "pipeline_traj": pipeline_module,
+            "safetensors": safetensors_package,
+            "safetensors.torch": safetensors_torch_module,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint-90000" / "model.safetensors"
+            checkpoint.parent.mkdir()
+            checkpoint.touch()
+            args = _diagnostic_args(dataset_path=str(root))
+            dataloader = [
+                (
+                    {
+                        "model": [name],
+                        "start_idx": torch.tensor([0]),
+                    },
+                    {},
+                )
+                for name in reversed(model_names)
+            ]
+            reference = (
+                torch.arange(9, dtype=torch.float32)
+                .view(1, 1, 9, 1)
+                .repeat(1, 25, 1, 3)
+            )
+            expected_pred = reference.clone()
+            with (
+                mock.patch.dict(sys.modules, imported_modules),
+                mock.patch.object(diagnostic.torch.utils.data, "DataLoader", return_value=dataloader),
+                mock.patch.object(diagnostic, "load_material_records", return_value=records),
+                mock.patch.object(
+                    diagnostic,
+                    "_build_raw_reference",
+                    return_value=reference,
+                ),
+                mock.patch.object(diagnostic, "rollout_condition", return_value=expected_pred) as rollout,
+                mock.patch.object(diagnostic, "HybridStateFeedbackRecorder", FakeRecorder),
+                mock.patch.object(diagnostic.torch, "compile", side_effect=AssertionError("must be eager")) as compile,
+                io.StringIO() as stdout,
+                redirect_stdout(stdout),
+            ):
+                rows = run_feedback_diagnostics(args, checkpoint, root / "reports")
+                completion_output = stdout.getvalue()
+
+            csv_path, markdown_path = _output_paths(root / "reports")
+            self.assertEqual(len(rows), 3280)
+            self.assertEqual(rollout.call_count, 41)
+            compile.assert_not_called()
+            self.assertTrue(csv_path.is_file())
+            self.assertTrue(markdown_path.is_file())
+            self.assertIn(str(checkpoint.resolve()), markdown_path.read_text(encoding="utf-8"))
+            self.assertIn("models=41", completion_output)
+            self.assertIn("rows=3280", completion_output)
 
 
 class FeedbackDecompositionTests(unittest.TestCase):
