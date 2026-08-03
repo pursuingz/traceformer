@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import math
 
+import numpy as np
 import torch
 
 from utils.eval_metrics import per_window_metrics
@@ -27,6 +28,399 @@ KNOCKOUT_CONDITIONS = (
     ("stage1_off", (1, 0, 1, 1)),
     ("stage2_off", (1, 1, 0, 1)),
 )
+
+
+_MATERIAL_GROUPS = {0: "elastic", 1: "plasticine", 2: "sand"}
+_RAW_METADATA_FIELDS = ("model", "mat_type", "log10_e", "nu")
+_KNOCKOUT_CONDITION_NAMES = tuple(name for name, _ in KNOCKOUT_CONDITIONS)
+
+
+def _finite_number(value, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise ValueError(f"{field} must be a finite number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+def validate_raw_rows(rows):
+    """Validate the pre-registered 41-model by five-condition raw table."""
+    if not isinstance(rows, list):
+        raise ValueError("raw rows must be a list")
+    if len(rows) != 205:
+        raise ValueError("raw rows must contain exactly 205 rows")
+
+    by_model = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each raw row must be a dictionary")
+        for field in (*_RAW_METADATA_FIELDS, "condition", *KNOCKOUT_METRICS):
+            if field not in row:
+                raise ValueError(f"missing raw field: {field}")
+        model = row["model"]
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
+        mat_type = row["mat_type"]
+        if isinstance(mat_type, bool) or not isinstance(mat_type, (int, np.integer)):
+            raise ValueError("mat_type must be 0, 1, or 2")
+        if mat_type not in _MATERIAL_GROUPS:
+            raise ValueError("mat_type must be 0, 1, or 2")
+        if row["condition"] not in _KNOCKOUT_CONDITION_NAMES:
+            raise ValueError("condition is not pre-registered")
+        _finite_number(row["log10_e"], "log10_e")
+        _finite_number(row["nu"], "nu")
+        for metric in KNOCKOUT_METRICS:
+            value = _finite_number(row[metric], metric)
+            if value < 0:
+                raise ValueError(f"{metric} must be non-negative")
+        by_model.setdefault(model, []).append(row)
+
+    if len(by_model) != 41:
+        raise ValueError("raw rows must contain exactly 41 unique models")
+    material_counts = {mat_type: 0 for mat_type in _MATERIAL_GROUPS}
+    for model, model_rows in by_model.items():
+        if len(model_rows) != len(KNOCKOUT_CONDITIONS):
+            raise ValueError(f"{model}: expected five conditions")
+        conditions = tuple(row["condition"] for row in model_rows)
+        if set(conditions) != set(_KNOCKOUT_CONDITION_NAMES):
+            raise ValueError(f"{model}: condition set is incomplete or duplicated")
+        metadata = tuple(model_rows[0][field] for field in _RAW_METADATA_FIELDS[1:])
+        if any(
+            tuple(row[field] for field in _RAW_METADATA_FIELDS[1:]) != metadata
+            for row in model_rows[1:]
+        ):
+            raise ValueError(f"{model}: metadata must agree across conditions")
+        material_counts[metadata[0]] += 1
+    if material_counts != {0: 13, 1: 14, 2: 14}:
+        raise ValueError("material counts must be elastic=13, plasticine=14, sand=14")
+    return list(rows)
+
+
+def build_paired_rows(rows):
+    """Pair every knockout condition with the same model's normal rollout."""
+    validated_rows = validate_raw_rows(rows)
+    by_model = {}
+    for row in validated_rows:
+        by_model.setdefault(row["model"], {})[row["condition"]] = row
+
+    paired_rows = []
+    for model in sorted(by_model):
+        by_condition = by_model[model]
+        normal = by_condition["normal"]
+        for condition in _KNOCKOUT_CONDITION_NAMES:
+            if condition == "normal":
+                continue
+            knockout = by_condition[condition]
+            paired = {
+                field: normal[field] for field in _RAW_METADATA_FIELDS
+            }
+            paired["condition"] = condition
+            for metric in KNOCKOUT_METRICS:
+                normal_value = float(normal[metric])
+                knockout_value = float(knockout[metric])
+                delta = knockout_value - normal_value
+                paired[f"normal_{metric}"] = normal_value
+                paired[f"knockout_{metric}"] = knockout_value
+                paired[f"delta_{metric}"] = delta
+                paired[f"relative_change_pct_{metric}"] = (
+                    delta / normal_value * 100.0
+                    if normal_value > 0
+                    else 0.0 if knockout_value == 0 else None
+                )
+            paired_rows.append(paired)
+    return paired_rows
+
+
+def paired_delta_summary(normal, knockout, samples, seed):
+    """Summarize paired values and bootstrap only their model-level deltas."""
+    normal = np.asarray(normal, dtype=float)
+    knockout = np.asarray(knockout, dtype=float)
+    if normal.ndim != 1 or knockout.ndim != 1 or normal.size == 0:
+        raise ValueError("normal and knockout must be non-empty one-dimensional arrays")
+    if normal.shape != knockout.shape:
+        raise ValueError("normal and knockout must have the same shape")
+    if not np.isfinite(normal).all() or not np.isfinite(knockout).all():
+        raise ValueError("normal and knockout must contain only finite values")
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+        raise ValueError("samples must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
+    delta = knockout - normal
+    indices = np.random.default_rng(seed).integers(
+        0, delta.size, size=(samples, delta.size)
+    )
+    bootstrap_means = delta[indices].mean(axis=1)
+    normal_mean = float(normal.mean())
+    knockout_mean = float(knockout.mean())
+    ci_low, ci_high = np.percentile(bootstrap_means, (2.5, 97.5))
+    return {
+        "n_models": int(delta.size),
+        "normal_mean": normal_mean,
+        "knockout_mean": knockout_mean,
+        "mean_delta": float(delta.mean()),
+        "median_delta": float(np.median(delta)),
+        "relative_change_pct": (
+            float(delta.mean() / normal_mean * 100.0)
+            if normal_mean > 0
+            else 0.0 if knockout_mean == 0 else None
+        ),
+        "improved_count": int(np.sum(delta < 0)),
+        "ci_low": float(ci_low),
+        "ci_high": float(ci_high),
+    }
+
+
+def _validate_paired_rows(rows):
+    if not isinstance(rows, list) or len(rows) != 164:
+        raise ValueError("paired rows must contain exactly 164 rows")
+    expected_conditions = set(_KNOCKOUT_CONDITION_NAMES) - {"normal"}
+    by_model = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each paired row must be a dictionary")
+        for field in (*_RAW_METADATA_FIELDS, "condition"):
+            if field not in row:
+                raise ValueError(f"missing paired field: {field}")
+        if row["condition"] not in expected_conditions:
+            raise ValueError("paired condition is not pre-registered")
+        mat_type = row["mat_type"]
+        if isinstance(mat_type, bool) or mat_type not in _MATERIAL_GROUPS:
+            raise ValueError("mat_type must be 0, 1, or 2")
+        _finite_number(row["log10_e"], "log10_e")
+        _finite_number(row["nu"], "nu")
+        for metric in KNOCKOUT_METRICS:
+            normal = _finite_number(row.get(f"normal_{metric}"), f"normal_{metric}")
+            knockout = _finite_number(
+                row.get(f"knockout_{metric}"), f"knockout_{metric}"
+            )
+            delta = _finite_number(row.get(f"delta_{metric}"), f"delta_{metric}")
+            if normal < 0 or knockout < 0:
+                raise ValueError(f"{metric} values must be non-negative")
+            if not math.isclose(delta, knockout - normal, abs_tol=1e-12):
+                raise ValueError(f"delta_{metric} must equal knockout minus normal")
+        by_model.setdefault(row["model"], []).append(row)
+
+    if len(by_model) != 41:
+        raise ValueError("paired rows must contain exactly 41 unique models")
+    material_counts = {mat_type: 0 for mat_type in _MATERIAL_GROUPS}
+    for model, model_rows in by_model.items():
+        if len(model_rows) != len(expected_conditions):
+            raise ValueError(f"{model}: expected four paired conditions")
+        if {row["condition"] for row in model_rows} != expected_conditions:
+            raise ValueError(f"{model}: paired condition set is incomplete or duplicated")
+        metadata = tuple(model_rows[0][field] for field in _RAW_METADATA_FIELDS[1:])
+        if any(
+            tuple(row[field] for field in _RAW_METADATA_FIELDS[1:]) != metadata
+            for row in model_rows[1:]
+        ):
+            raise ValueError(f"{model}: metadata must agree across paired conditions")
+        material_counts[metadata[0]] += 1
+    if material_counts != {0: 13, 1: 14, 2: 14}:
+        raise ValueError("material counts must be elastic=13, plasticine=14, sand=14")
+    return list(rows)
+
+
+def summarize_paired_rows(rows, bootstrap_samples, bootstrap_seed):
+    """Return equal-model-weighted overall, material, and within-material E summaries."""
+    paired_rows = _validate_paired_rows(rows)
+    group_rows = [("overall", paired_rows)]
+    for mat_type, material in _MATERIAL_GROUPS.items():
+        material_rows = [row for row in paired_rows if row["mat_type"] == mat_type]
+        group_rows.append((material, material_rows))
+        median_e = float(np.median([row["log10_e"] for row in material_rows]))
+        group_rows.append(
+            (
+                f"{material}_low_E",
+                [row for row in material_rows if row["log10_e"] <= median_e],
+            )
+        )
+        group_rows.append(
+            (
+                f"{material}_high_E",
+                [row for row in material_rows if row["log10_e"] > median_e],
+            )
+        )
+
+    summary_rows = []
+    for group, grouped_rows in group_rows:
+        for condition in _KNOCKOUT_CONDITION_NAMES:
+            if condition == "normal":
+                continue
+            condition_rows = [
+                row for row in grouped_rows if row["condition"] == condition
+            ]
+            for metric in KNOCKOUT_METRICS:
+                stats = paired_delta_summary(
+                    np.asarray(
+                        [row[f"normal_{metric}"] for row in condition_rows],
+                        dtype=float,
+                    ),
+                    np.asarray(
+                        [row[f"knockout_{metric}"] for row in condition_rows],
+                        dtype=float,
+                    ),
+                    bootstrap_samples,
+                    bootstrap_seed,
+                )
+                summary_rows.append(
+                    {"group": group, "condition": condition, "metric": metric, **stats}
+                )
+    return summary_rows
+
+
+def _summary_row_index(summary_rows):
+    if not isinstance(summary_rows, list):
+        raise ValueError("summary rows must be a list")
+    index = {}
+    required = {
+        "group",
+        "condition",
+        "metric",
+        "n_models",
+        "normal_mean",
+        "knockout_mean",
+        "median_delta",
+        "relative_change_pct",
+        "improved_count",
+    }
+    for row in summary_rows:
+        if not isinstance(row, dict) or not required.issubset(row):
+            continue
+        key = (row["group"], row["condition"], row["metric"])
+        if key in index:
+            raise ValueError("summary rows must not contain duplicate group-condition-metric rows")
+        index[key] = row
+    return index
+
+
+def _verdict_stats(row):
+    if row is None:
+        return None
+    n_models = row["n_models"]
+    improved_count = row["improved_count"]
+    if (
+        isinstance(n_models, bool)
+        or not isinstance(n_models, (int, np.integer))
+        or n_models <= 0
+        or isinstance(improved_count, bool)
+        or not isinstance(improved_count, (int, np.integer))
+        or not 0 <= improved_count <= n_models
+    ):
+        return None
+    try:
+        normal_mean = _finite_number(row["normal_mean"], "normal_mean")
+        knockout_mean = _finite_number(row["knockout_mean"], "knockout_mean")
+        median_delta = _finite_number(row["median_delta"], "median_delta")
+    except ValueError:
+        return None
+    relative_change_pct = row["relative_change_pct"]
+    if relative_change_pct is not None:
+        try:
+            relative_change_pct = _finite_number(
+                relative_change_pct, "relative_change_pct"
+            )
+        except ValueError:
+            return None
+    return {
+        "n_models": int(n_models),
+        "improved_count": int(improved_count),
+        "normal_mean": normal_mean,
+        "knockout_mean": knockout_mean,
+        "median_delta": median_delta,
+        "relative_change_pct": relative_change_pct,
+    }
+
+
+def dynamic_gate_verdict(summary_rows):
+    """Apply the pre-registered B1b dynamic-gate decision rule, fail-closed."""
+    index = _summary_row_index(summary_rows)
+    candidate_metrics = ("long_mse", "fde", "f24_centroid_error")
+    safety_metrics = ("full_rollout_mse", "fde")
+    penetration_metrics = ("penetration_rate", "penetration_depth")
+    failure_reasons = []
+
+    for stage in ("stage0_off", "stage2_off"):
+        plasticine_metrics = []
+        sand_opposite_metrics = []
+        for metric in candidate_metrics:
+            plasticine = _verdict_stats(index.get(("plasticine", stage, metric)))
+            if (
+                plasticine is not None
+                and plasticine["n_models"] == 14
+                and plasticine["relative_change_pct"] is not None
+                and plasticine["relative_change_pct"] <= -5.0
+                and plasticine["improved_count"] >= 8
+                and plasticine["median_delta"] < 0.0
+            ):
+                plasticine_metrics.append(metric)
+                sand = _verdict_stats(index.get(("sand", stage, metric)))
+                if (
+                    sand is not None
+                    and sand["n_models"] == 14
+                    and sand["relative_change_pct"] is not None
+                    and sand["relative_change_pct"] >= 5.0
+                    and sand["n_models"] - sand["improved_count"] >= 8
+                    and sand["median_delta"] > 0.0
+                ):
+                    sand_opposite_metrics.append(metric)
+
+        safe_trajectory = True
+        for metric in safety_metrics:
+            stats = _verdict_stats(index.get(("overall", stage, metric)))
+            if (
+                stats is None
+                or stats["n_models"] != 41
+                or stats["relative_change_pct"] is None
+                or stats["relative_change_pct"] >= 10.0
+            ):
+                safe_trajectory = False
+
+        safe_penetration = True
+        for metric in penetration_metrics:
+            stats = _verdict_stats(index.get(("overall", stage, metric)))
+            if stats is None or stats["n_models"] != 41:
+                safe_penetration = False
+            elif stats["normal_mean"] == 0.0:
+                if stats["knockout_mean"] != 0.0:
+                    safe_penetration = False
+            elif (
+                stats["relative_change_pct"] is None
+                or stats["relative_change_pct"] >= 25.0
+            ):
+                safe_penetration = False
+
+        if (
+            len(plasticine_metrics) >= 2
+            and sand_opposite_metrics
+            and safe_trajectory
+            and safe_penetration
+        ):
+            return {
+                "proceed_dynamic_gate": True,
+                "qualifying_stage": stage,
+                "plasticine_metrics": tuple(plasticine_metrics),
+                "sand_opposite_metrics": tuple(sand_opposite_metrics),
+                "reasons": (f"{stage} satisfies all pre-registered criteria",),
+            }
+
+        if len(plasticine_metrics) < 2:
+            failure_reasons.append(f"{stage}: fewer than two plasticine metrics qualify")
+        if not sand_opposite_metrics:
+            failure_reasons.append(f"{stage}: no qualifying sand opposite response")
+        if not safe_trajectory:
+            failure_reasons.append(f"{stage}: overall trajectory safety threshold failed")
+        if not safe_penetration:
+            failure_reasons.append(f"{stage}: overall penetration safety threshold failed")
+
+    return {
+        "proceed_dynamic_gate": False,
+        "qualifying_stage": None,
+        "plasticine_metrics": (),
+        "sand_opposite_metrics": (),
+        "reasons": tuple(failure_reasons),
+    }
 
 
 @contextmanager
