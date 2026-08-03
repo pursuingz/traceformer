@@ -44,6 +44,7 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
         seed=0,
         use_diffusion=False,
         num_inference_steps=1,
+        floor_projection=False,
         input_frames=5,
         output_frames=1,
         pred_offset=True,
@@ -183,6 +184,35 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
             validate_diagnostic_config(
                 _diagnostic_args(dataset_path="mm3_data/mm3_train"), checkpoint
             )
+
+    def test_validate_diagnostic_config_rejects_floor_projection(self):
+        args = _diagnostic_args()
+        args.floor_projection = True
+
+        with self.assertRaisesRegex(ValueError, "floor_projection"):
+            validate_diagnostic_config(
+                args,
+                Path(
+                    "outputs/mm3_v11a_contact_cond_8L/"
+                    "checkpoint-90000/model.safetensors"
+                ),
+            )
+
+    def test_validate_diagnostic_config_rejects_checkpoint_90000_from_other_run(self):
+        with self.assertRaisesRegex(ValueError, "mm3_v11a_contact_cond_8L"):
+            validate_diagnostic_config(
+                _diagnostic_args(),
+                Path("outputs/other_run/checkpoint-90000/model.safetensors"),
+            )
+
+    def test_validate_diagnostic_config_accepts_absolute_b1b_checkpoint_path(self):
+        validate_diagnostic_config(
+            _diagnostic_args(),
+            Path(
+                "D:/server/traceformer/outputs/mm3_v11a_contact_cond_8L/"
+                "checkpoint-90000/model.safetensors"
+            ),
+        )
 
     def test_frozen_manifest_contains_the_exact_b1b_41_models(self):
         manifest = diagnostic.load_frozen_test_manifest()
@@ -409,8 +439,14 @@ class FeedbackDiagnosticCliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkpoint = root / "checkpoint-90000" / "model.safetensors"
-            checkpoint.parent.mkdir()
+            checkpoint = (
+                root
+                / "outputs"
+                / "mm3_v11a_contact_cond_8L"
+                / "checkpoint-90000"
+                / "model.safetensors"
+            )
+            checkpoint.parent.mkdir(parents=True)
             checkpoint.touch()
             args = _diagnostic_args()
             dataloader = [

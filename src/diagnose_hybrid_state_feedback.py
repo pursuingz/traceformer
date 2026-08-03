@@ -44,7 +44,9 @@ except ModuleNotFoundError:
 ROLLOUT_STEPS = 20
 STAGES_PER_STEP = 4
 ROWS_PER_MODEL = ROLLOUT_STEPS * STAGES_PER_STEP
-CHECKPOINT_SUFFIX = "checkpoint-90000/model.safetensors"
+CHECKPOINT_SUFFIX = (
+    "outputs/mm3_v11a_contact_cond_8L/checkpoint-90000/model.safetensors"
+)
 DIRECT_CALL_CONFIG_PATH = "<not-provided-direct-call>"
 B1B_DATASET_PATH = "mm3_data/mm3_test"
 B1B_SAMPLE_SCOPE = "frozen 41-model start_idx=0 full-horizon B1b test"
@@ -120,8 +122,10 @@ def _config_value(config: Any, field: str) -> Any:
 
 
 def _checkpoint_matches(checkpoint: Path) -> bool:
-    normalized = str(checkpoint).replace("\\", "/")
-    return normalized.endswith(CHECKPOINT_SUFFIX)
+    normalized = posixpath.normpath(str(checkpoint).replace("\\", "/"))
+    return normalized == CHECKPOINT_SUFFIX or normalized.endswith(
+        f"/{CHECKPOINT_SUFFIX}"
+    )
 
 
 def _normalized_dataset_path(value: Any) -> str:
@@ -202,6 +206,8 @@ def validate_diagnostic_config(args: Any, checkpoint: Path) -> None:
         )
     if _config_value(args, "input_frames") != 5:
         raise ValueError("B1b diagnostic requires input_frames=5")
+    if _config_value(args, "floor_projection") is not False:
+        raise ValueError("B1b diagnostic requires floor_projection=False")
     if not _checkpoint_matches(checkpoint):
         raise ValueError(
             f"B1b diagnostic checkpoint must end with {CHECKPOINT_SUFFIX}: {checkpoint}"
