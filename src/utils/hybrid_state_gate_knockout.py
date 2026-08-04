@@ -167,6 +167,7 @@ def paired_delta_summary(normal, knockout, samples, seed):
             else 0.0 if knockout_mean == 0 else None
         ),
         "improved_count": int(np.sum(delta < 0)),
+        "degraded_count": int(np.sum(delta > 0)),
         "ci_low": float(ci_low),
         "ci_high": float(ci_high),
     }
@@ -284,6 +285,7 @@ def _summary_row_index(summary_rows):
         "median_delta",
         "relative_change_pct",
         "improved_count",
+        "degraded_count",
     }
     for row in summary_rows:
         if not isinstance(row, dict) or not required.issubset(row):
@@ -300,6 +302,7 @@ def _verdict_stats(row):
         return None
     n_models = row["n_models"]
     improved_count = row["improved_count"]
+    degraded_count = row["degraded_count"]
     if (
         isinstance(n_models, bool)
         or not isinstance(n_models, (int, np.integer))
@@ -307,6 +310,9 @@ def _verdict_stats(row):
         or isinstance(improved_count, bool)
         or not isinstance(improved_count, (int, np.integer))
         or not 0 <= improved_count <= n_models
+        or isinstance(degraded_count, bool)
+        or not isinstance(degraded_count, (int, np.integer))
+        or not 0 <= degraded_count <= n_models
     ):
         return None
     try:
@@ -326,6 +332,7 @@ def _verdict_stats(row):
     return {
         "n_models": int(n_models),
         "improved_count": int(improved_count),
+        "degraded_count": int(degraded_count),
         "normal_mean": normal_mean,
         "knockout_mean": knockout_mean,
         "median_delta": median_delta,
@@ -361,7 +368,7 @@ def dynamic_gate_verdict(summary_rows):
                     and sand["n_models"] == 14
                     and sand["relative_change_pct"] is not None
                     and sand["relative_change_pct"] >= 5.0
-                    and sand["n_models"] - sand["improved_count"] >= 8
+                    and sand["degraded_count"] >= 8
                     and sand["median_delta"] > 0.0
                 ):
                     sand_opposite_metrics.append(metric)

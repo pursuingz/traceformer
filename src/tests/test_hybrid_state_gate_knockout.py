@@ -342,6 +342,7 @@ class PairedStatisticTests(unittest.TestCase):
                 "median_delta",
                 "relative_change_pct",
                 "improved_count",
+                "degraded_count",
                 "ci_low",
                 "ci_high",
             },
@@ -366,6 +367,46 @@ class PairedStatisticTests(unittest.TestCase):
         self.assertTrue(np.isfinite(degraded["ci_low"]))
         self.assertTrue(np.isfinite(degraded["ci_high"]))
         self.assertEqual(unchanged["relative_change_pct"], 0.0)
+
+    def test_delta_summary_counts_only_strictly_positive_degradations(self):
+        normal = np.ones(14)
+        knockout = np.concatenate((np.full(7, 1.1), np.ones(7)))
+
+        stats = paired_delta_summary(normal, knockout, samples=200, seed=11)
+
+        self.assertEqual(stats["improved_count"], 0)
+        self.assertEqual(stats["degraded_count"], 7)
+
+    def test_summary_retains_strict_degraded_count(self):
+        rows = self._raw_rows()
+        sand_models = sorted(
+            {row["model"] for row in rows if row["mat_type"] == 2}
+        )
+        normal_fde = {
+            row["model"]: row["fde"]
+            for row in rows
+            if row["condition"] == "normal" and row["mat_type"] == 2
+        }
+        for index, model in enumerate(sand_models):
+            row = next(
+                row
+                for row in rows
+                if row["model"] == model and row["condition"] == "stage0_off"
+            )
+            row["fde"] = normal_fde[model] * (1.1 if index < 7 else 1.0)
+
+        summary = summarize_paired_rows(
+            build_paired_rows(rows), bootstrap_samples=200, bootstrap_seed=11
+        )
+        sand_fde = next(
+            row
+            for row in summary
+            if row["group"] == "sand"
+            and row["condition"] == "stage0_off"
+            and row["metric"] == "fde"
+        )
+
+        self.assertEqual(sand_fde["degraded_count"], 7)
 
     def test_summary_retains_zero_baseline_penetration_delta_and_ci(self):
         rows = self._raw_rows()
@@ -399,6 +440,7 @@ class PairedStatisticTests(unittest.TestCase):
         metric,
         relative_change_pct=0.0,
         improved_count=0,
+        degraded_count=0,
         median_delta=0.0,
         n_models=14,
         normal_mean=1.0,
@@ -415,6 +457,7 @@ class PairedStatisticTests(unittest.TestCase):
             "median_delta": median_delta,
             "relative_change_pct": relative_change_pct,
             "improved_count": improved_count,
+            "degraded_count": degraded_count,
             "ci_low": median_delta,
             "ci_high": median_delta,
         }
@@ -446,6 +489,7 @@ class PairedStatisticTests(unittest.TestCase):
                 "fde",
                 relative_change_pct=6.0,
                 improved_count=6,
+                degraded_count=8,
                 median_delta=0.1,
             )
         )
@@ -493,6 +537,26 @@ class PairedStatisticTests(unittest.TestCase):
         verdict = dynamic_gate_verdict(stage1_only)
         self.assertFalse(verdict["proceed_dynamic_gate"])
         self.assertIsNone(verdict["qualifying_stage"])
+
+    def test_dynamic_gate_verdict_rejects_sand_zeros_as_non_degradations(self):
+        summary = self._passing_verdict_summary()
+        sand = next(
+            row
+            for row in summary
+            if row["group"] == "sand" and row["metric"] == "fde"
+        )
+        sand.update(
+            paired_delta_summary(
+                np.ones(14),
+                np.concatenate((np.full(7, 1.1), np.ones(7))),
+                samples=200,
+                seed=11,
+            )
+        )
+        sand["degraded_count"] = 7
+
+        self.assertEqual(sand["degraded_count"], 7)
+        self.assertFalse(dynamic_gate_verdict(summary)["proceed_dynamic_gate"])
 
 
 if __name__ == "__main__":
