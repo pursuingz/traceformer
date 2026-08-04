@@ -226,6 +226,7 @@ def run_material_response_sweep(
     config_path: Path,
     seed: int,
     runtime: RuntimeComponents | None = None,
+    profile: str = B2_PROFILE,
 ) -> list[dict[str, Any]]:
     """Load the frozen arm once, run 287 paired rollouts, and write B2 outputs."""
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
@@ -234,7 +235,7 @@ def run_material_response_sweep(
     output_dir = Path(output_dir)
     config_path = Path(config_path)
     args.resume = str(checkpoint)
-    _validate_b0_identity(args, profile=B2_PROFILE)
+    _validate_b0_identity(args, profile=profile)
 
     dataset_root = Path(args.train_dataset.dataset_path)
     if not checkpoint.is_file():
@@ -250,7 +251,7 @@ def run_material_response_sweep(
     runtime = runtime or _load_runtime_components()
     dataset = runtime.dataset_cls("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
-    _validate_b0_identity(args, records=records, profile=B2_PROFILE)
+    _validate_b0_identity(args, records=records, profile=profile)
     args.model_config.cond_frames = input_frames
     records_by_model = {record.model: record for record in records}
     if len(records_by_model) != EXPECTED_MODEL_COUNT:
@@ -272,6 +273,7 @@ def run_material_response_sweep(
         "checkpoint": str(checkpoint),
         "config": str(config_path),
         "seed": seed,
+        "profile": profile,
         "sample_scope": B2_SAMPLE_SCOPE,
     }
 
@@ -355,7 +357,13 @@ def _non_negative_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the frozen mm3_contact_cond@90k B2 E/nu response sweep."
+        description="Run a registered frozen-model B2 E/nu response sweep."
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("contact_cond90", "b3a45"),
+        default=B2_PROFILE,
+        help="Strict checkpoint/config identity profile.",
     )
     parser.add_argument(
         "--config", required=True, help="Frozen mm3_contact_cond evaluation YAML."
@@ -388,6 +396,7 @@ def main() -> None:
         output_dir=Path(cli_args.output_dir),
         config_path=config_path,
         seed=cli_args.seed,
+        profile=cli_args.profile,
     )
 
 

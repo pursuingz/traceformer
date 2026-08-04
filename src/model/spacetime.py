@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 from model.contact_adapter import FactorizedContactAdapter
 from model.dit import *
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
+from model.material_state import FactorizedMaterialStateAdapter
 from diffusers.models.embeddings import LabelEmbedding 
 from utils.contact import (
     apply_contact_feature_mask,
@@ -2129,6 +2130,14 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hybrid_state_dim: int = 64,
         hybrid_state_heads: int = 4,
         hybrid_state_interval: int = 2,
+        material_state_adapter: bool = False,
+        material_state_rank: int = 64,
+        material_state_interval: int = 2,
+        material_state_e_center: float = 5.5,
+        material_state_e_scale: float = 1.0,
+        material_state_nu_center: float = 0.25,
+        material_state_nu_scale: float = 0.15,
+        material_state_runtime_scale: float = 1.0,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -2236,6 +2245,40 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     history_frames=history_frames,
                     num_stages=num_layers // hybrid_state_interval,
                 )
+        self.material_state_enabled = bool(material_state_adapter)
+        if self.material_state_enabled:
+            if transformer_block != "SpatialTemporalTransformerBlock":
+                raise ValueError(
+                    "material-state adapter requires the serial SpatialTemporalTransformerBlock"
+                )
+            if not isinstance(material_state_interval, int) or material_state_interval <= 0:
+                raise ValueError("material_state_interval must be a positive integer")
+            if num_layers % material_state_interval != 0:
+                raise ValueError("material_state_interval must evenly divide num_layers")
+            if history_frames != 5:
+                raise ValueError("material-state adapter history must be exactly five frames")
+            if cond_seq_length_t - history_frames != 1:
+                raise ValueError(
+                    "material-state adapter requires one mask pseudo-frame"
+                )
+            if sample_frames - cond_seq_length_t != 1:
+                raise ValueError("material-state adapter requires one prediction frame")
+            if num_classes != 4:
+                raise ValueError("material-state adapter num_materials must be exactly four")
+            self.material_state_interval = material_state_interval
+            self.material_state_history_frames = history_frames
+            self.material_state_runtime_scale = float(material_state_runtime_scale)
+            with torch.random.fork_rng(devices=[]):
+                self.material_state_exchange = FactorizedMaterialStateAdapter(
+                    particle_dim=inner_dim,
+                    rank=material_state_rank,
+                    num_materials=num_classes,
+                    num_stages=num_layers // material_state_interval,
+                    e_center=material_state_e_center,
+                    e_scale=material_state_e_scale,
+                    nu_center=material_state_nu_center,
+                    nu_scale=material_state_nu_scale,
+                )
         self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
 
         # 4. Output blocks
@@ -2327,6 +2370,7 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         return_dict: bool = True,
         explicit_frame_state: Optional[torch.Tensor] = None,
         material_values: Optional[torch.Tensor] = None,
+        material_classes: Optional[torch.Tensor] = None,
     ):
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -2377,6 +2421,17 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if history_start != 1 or F != prediction_index + 1:
                 raise ValueError(
                     "v11a hidden frame layout must be [mask, five history, one prediction]"
+                )
+        if self.material_state_enabled:
+            if material_values is None or material_classes is None:
+                raise ValueError("material-state adapter requires material conditions")
+            physical_start = (
+                self.cond_seq_length_t - self.material_state_history_frames
+            )
+            if physical_start != 1 or F - physical_start != 6:
+                raise ValueError(
+                    "material-state hidden frame layout must be "
+                    "[mask, five history, one prediction]"
                 )
         full_seq = torch.cat([encoder_hidden_states, hidden_states.reshape(B, F*N, -1)], axis=1)
 
@@ -2532,6 +2587,20 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     prediction_index=prediction_index,
                     stage_index=(i + 1) // self.hybrid_state_interval - 1,
                 )
+            if (
+                self.material_state_enabled
+                and (i + 1) % self.material_state_interval == 0
+            ):
+                physical_hidden = self.material_state_exchange(
+                    hidden_states[:, physical_start:],
+                    material_values,
+                    material_classes,
+                    stage_index=(i + 1) // self.material_state_interval - 1,
+                    runtime_scale=self.material_state_runtime_scale,
+                )
+                hidden_states = torch.cat(
+                    (hidden_states[:, :physical_start], physical_hidden), dim=1
+                )
         hidden_states = rearrange(hidden_states, 'b f n c -> b (f n) c')
         # 4. Final block
         hidden_states = self.norm_final(hidden_states)
@@ -2673,6 +2742,16 @@ class MDM_ST(nn.Module):
             self.cond_seq_length += 1
 
         self.num_mat = model_config.get('num_mat', 0)
+        self.material_state_adapter = bool(
+            model_config.get('material_state_adapter', False)
+        )
+        if self.material_state_adapter:
+            if self.num_mat != 4:
+                raise ValueError(
+                    "material-state adapter num_materials must be exactly four"
+                )
+            if not model_config.get('class_token', False):
+                raise ValueError("material-state adapter requires class_token=true")
         if model_config.class_token:
             self.class_embedding = nn.Embedding(model_config.num_mat, self.latent_dim)
             self.cond_seq_length += 1
@@ -2751,6 +2830,16 @@ class MDM_ST(nn.Module):
                 hybrid_state_dim=model_config.get('hybrid_state_dim', 64),
                 hybrid_state_heads=model_config.get('hybrid_state_heads', 4),
                 hybrid_state_interval=model_config.get('hybrid_state_interval', 2),
+                material_state_adapter=self.material_state_adapter,
+                material_state_rank=model_config.get('material_state_rank', 64),
+                material_state_interval=model_config.get('material_state_interval', 2),
+                material_state_e_center=model_config.get('material_state_e_center', 5.5),
+                material_state_e_scale=model_config.get('material_state_e_scale', 1.0),
+                material_state_nu_center=model_config.get('material_state_nu_center', 0.25),
+                material_state_nu_scale=model_config.get('material_state_nu_scale', 0.15),
+                material_state_runtime_scale=model_config.get(
+                    'material_state_runtime_scale', 1.0
+                ),
             )
         
         self._init_weights()
@@ -2785,6 +2874,7 @@ class MDM_ST(nn.Module):
 
         explicit_frame_state = None
         material_values = None
+        material_classes = None
         if self.model_config.transformer_block == "SpatialTemporalTransformerBlockv11a":
             if init_pc_cond.shape[1] != self.physical_history_frames:
                 raise ValueError(
@@ -2795,6 +2885,14 @@ class MDM_ST(nn.Module):
                 (E.reshape(bs, -1)[:, :1], nu.reshape(bs, -1)[:, :1]),
                 dim=1,
             )
+        if self.material_state_adapter:
+            if y is None:
+                raise ValueError("material-state adapter requires mat_type")
+            material_values = torch.cat(
+                (E.reshape(bs, -1)[:, :1], nu.reshape(bs, -1)[:, :1]),
+                dim=1,
+            )
+            material_classes = y.reshape(bs)
 
         force = force.unsqueeze(1) if force.ndim == 2 else force
         drag_point = drag_point.unsqueeze(1) if drag_point.ndim == 2 else drag_point
@@ -3006,13 +3104,18 @@ class MDM_ST(nn.Module):
             mask = self.mask_encoder(mask_input)
             hidden_states = torch.cat([mask, hidden_states], axis=1)
         if self.model_config.transformer_block in ["SpatialTemporalTransformerBlock", "SpatialTemporalTransformerBlockv11a", "SpatialTemporalTransformerBlockv3", "SpatialTemporalTransformerBlockv4", "SpatialTemporalTransformerBlockv5", "SpatialTemporalTransformerBlockv6", "SpatialTemporalTransformerBlockv6b", "SpatialTemporalTransformerBlockv7", "SpatialTemporalTransformerBlockv8", "SpatialTemporalTransformerBlockv9", "SpatialTemporalTransformerBlockv10", "TemporalOnlyTransformerBlock", "SpatialOnlyTransformerBlock", "SpatialTemporalTransformerNoDiffusion"]:
-            v11a_kwargs = {}
+            dit_kwargs = {}
             if self.model_config.transformer_block == "SpatialTemporalTransformerBlockv11a":
-                v11a_kwargs = {
+                dit_kwargs.update({
                     "explicit_frame_state": explicit_frame_state,
                     "material_values": material_values,
-                }
-            output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats, rest_indices=rest_indices, grid_assign=grid_assign, **v11a_kwargs).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
+                })
+            if self.material_state_adapter:
+                dit_kwargs.update({
+                    "material_values": material_values,
+                    "material_classes": material_classes,
+                })
+            output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats, rest_indices=rest_indices, grid_assign=grid_assign, **dit_kwargs).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
         if self.pred_velocity:

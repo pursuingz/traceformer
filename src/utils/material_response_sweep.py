@@ -438,6 +438,7 @@ def write_sweep_outputs(
         f"- checkpoint: `{metadata['checkpoint']}`",
         f"- config: `{metadata['config']}`",
         f"- seed: `{metadata['seed']}`",
+        f"- profile: `{metadata.get('profile', 'unspecified')}`",
         f"- sample_scope: {metadata['sample_scope']}",
         "- 扫描: log10(E)=4.5/5.5/6.5；nu=0.10/0.25/0.40",
         "- 完整性: 287 condition rows；41 model rows；材质 13/14/14",

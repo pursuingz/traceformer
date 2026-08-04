@@ -2,6 +2,7 @@ import sys
 sys.path.append('./')
 from omegaconf import OmegaConf
 from model.hybrid_state import HybridStateExchange
+from model.material_state import FactorizedMaterialStateAdapter
 from model.spacetime import MDM_ST, SpatialTemporalTransformerBlock
 
 base_mc = {
@@ -181,6 +182,83 @@ def validate_v11a_parameter_budget(baseline, v11a):
         'exchange_stages': exchange.num_stages,
         'exchange_interval': interval,
         'exchange_calls': exchange_calls,
+    }
+
+
+def validate_material_state_parameter_budget(baseline, candidate):
+    baseline_total = count(baseline)
+    candidate_total = count(candidate)
+    if baseline_total != count_trainable(baseline):
+        raise RuntimeError("baseline total params must equal trainable params")
+    if candidate_total != count_trainable(candidate):
+        raise RuntimeError("B3 total params must equal trainable params")
+
+    blocks = find_blocks(candidate)
+    if len(blocks) != 8 or not all(
+        type(block) is SpatialTemporalTransformerBlock for block in blocks
+    ):
+        raise RuntimeError("B3 must retain eight original serial transformer blocks")
+
+    adapters = [
+        module
+        for module in candidate.modules()
+        if isinstance(module, FactorizedMaterialStateAdapter)
+    ]
+    if len(adapters) != 1:
+        raise RuntimeError(
+            "B3 must contain exactly one FactorizedMaterialStateAdapter; "
+            f"got {len(adapters)}"
+        )
+    adapter = adapters[0]
+    adapter_params = count(adapter)
+    if adapter_params != count_trainable(adapter):
+        raise RuntimeError("B3 adapter parameters must all be trainable")
+
+    signed_delta = candidate_total - baseline_total
+    if signed_delta != adapter_params or adapter_params != 34_052:
+        raise RuntimeError(
+            "B3 parameter delta must equal the unique 34,052-parameter adapter: "
+            f"delta={signed_delta}, adapter={adapter_params}"
+        )
+    if adapter.rank != 64 or adapter.num_stages != 4:
+        raise RuntimeError(
+            "B3 adapter must use rank=64 and four stages; "
+            f"rank={adapter.rank}, stages={adapter.num_stages}"
+        )
+    interval = getattr(candidate.dit, "material_state_interval", None)
+    if interval != 2:
+        raise RuntimeError(f"B3 material_state_interval must be 2; got {interval}")
+
+    baseline_parameters = dict(baseline.named_parameters())
+    candidate_parameters = dict(candidate.named_parameters())
+    baseline_only = set(baseline_parameters) - set(candidate_parameters)
+    candidate_only = set(candidate_parameters) - set(baseline_parameters)
+    if baseline_only:
+        raise RuntimeError(f"B3 removed baseline parameters: {sorted(baseline_only)}")
+    if not candidate_only or not all(
+        name.startswith("dit.material_state_exchange.") for name in candidate_only
+    ):
+        raise RuntimeError(
+            "B3-only parameters must belong to dit.material_state_exchange: "
+            f"{sorted(candidate_only)}"
+        )
+    for name in baseline_parameters:
+        if baseline_parameters[name].shape != candidate_parameters[name].shape:
+            raise RuntimeError(f"B3 changed shared parameter shape: {name}")
+
+    delta_percent = 100.0 * signed_delta / baseline_total
+    if delta_percent >= 0.3:
+        raise RuntimeError(f"B3 parameter delta is too large: {delta_percent:.6f}%")
+    return {
+        "baseline_total": baseline_total,
+        "candidate_total": candidate_total,
+        "signed_delta": signed_delta,
+        "delta_percent": delta_percent,
+        "adapter_params": adapter_params,
+        "block_count": len(blocks),
+        "stage_count": adapter.num_stages,
+        "rank": adapter.rank,
+        "interval": interval,
     }
 
 
@@ -438,6 +516,32 @@ def main():
         'separate/shared difference: '
         f'{contact_report["condition_frame_bias_params"]:,}-parameter '
         'separate-only condition-frame bias'
+    )
+
+    b3_mm3 = build_mm3(
+        'SpatialTemporalTransformerBlock',
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='separate',
+        material_state_adapter=True,
+        material_state_rank=64,
+        material_state_interval=2,
+    )
+    b3_report = validate_material_state_parameter_budget(
+        separate_contact_mm3,
+        b3_mm3,
+    )
+    print('--- B3a material-state adapter exact parameter budget ---')
+    print(
+        f'baseline={b3_report["baseline_total"]:,}  '
+        f'candidate={b3_report["candidate_total"]:,}  '
+        f'delta={b3_report["signed_delta"]:+,} '
+        f'({b3_report["delta_percent"]:.6f}%)'
+    )
+    print(
+        f'adapter={b3_report["adapter_params"]:,}  '
+        f'rank={b3_report["rank"]}  stages={b3_report["stage_count"]}  '
+        f'interval={b3_report["interval"]}'
     )
 
     # Preserve the historical five-output-frame v_xyz comparison.

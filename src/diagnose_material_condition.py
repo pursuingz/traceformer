@@ -154,6 +154,27 @@ B01_PROFILES = {
             "contact_bias_scale": 1.0,
         },
     ),
+    "b3a45": DiagnosticProfile(
+        name="b3a45",
+        resume_suffix=(
+            "outputs/mm3_b3a_material_state_adapter_8L/"
+            "checkpoint-45000/model.safetensors"
+        ),
+        model_defaults={
+            "contact_injection_mode": "separate",
+            "contact_velocity_mode": "vertical",
+            "contact_feature_mask": [1, 1, 1],
+            "contact_bias_scale": 1.0,
+            "material_state_adapter": True,
+            "material_state_rank": 64,
+            "material_state_interval": 2,
+            "material_state_e_center": 5.5,
+            "material_state_e_scale": 1.0,
+            "material_state_nu_center": 0.25,
+            "material_state_nu_scale": 0.15,
+            "material_state_runtime_scale": 1.0,
+        },
+    ),
 }
 # Compatibility aliases for legacy callers and tests. Identity validation resolves
 # these values through B01_PROFILES below.
@@ -361,9 +382,12 @@ def _validate_b0_identity(
     profile: str | None = None,
 ) -> None:
     resolved_profile = _resolve_profile(profile)
+    allowed_model_config_fields = frozenset(
+        set(EXPECTED_MODEL_CONFIG) | set(resolved_profile.model_defaults)
+    )
     _validate_allowed_fields(args, "top-level", ALLOWED_TOP_LEVEL_FIELDS)
     _validate_allowed_fields(
-        args.model_config, "model_config", ALLOWED_MODEL_CONFIG_FIELDS
+        args.model_config, "model_config", allowed_model_config_fields
     )
     _validate_allowed_fields(
         args.train_dataset, "train_dataset", ALLOWED_TRAIN_DATASET_FIELDS

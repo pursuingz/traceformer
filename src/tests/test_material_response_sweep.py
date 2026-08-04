@@ -251,6 +251,7 @@ class SweepSummaryTests(unittest.TestCase):
             "checkpoint": "checkpoint.safetensors",
             "config": "eval.yaml",
             "seed": 0,
+            "profile": "b3a45",
             "sample_scope": "frozen 41-model start0 B2",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -263,6 +264,7 @@ class SweepSummaryTests(unittest.TestCase):
             with Path(paths["model_summary"]).open(encoding="utf-8", newline="") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 41)
             report = Path(paths["report"]).read_text(encoding="utf-8")
+            self.assertIn("profile: `b3a45`", report)
             self.assertIn("没有 counterfactual GT", report)
             self.assertIn("不能判断反事实轨迹的准确率", report)
             self.assertIn("elastic", report)
@@ -326,10 +328,43 @@ class SweepCliTests(unittest.TestCase):
         )
         self.assertEqual(parsed.seed, 0)
         self.assertEqual(parsed.output_dir, "results/material_response_sweep_b2")
+        self.assertEqual(parsed.profile, "contact_cond90")
+        b3 = build_parser().parse_args(
+            [
+                "--profile",
+                "b3a45",
+                "--config",
+                "src/configs/eval_mm3_b3a_material_state_adapter_45k.yaml",
+                "--checkpoint",
+                "outputs/mm3_b3a_material_state_adapter_8L/checkpoint-45000/model.safetensors",
+            ]
+        )
+        self.assertEqual(b3.profile, "b3a45")
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args(
                 ["--config", "src/configs/eval_mm3_contact_cond.yaml"]
             )
+
+    def test_b3_profile_is_strict_and_does_not_weaken_contact_profile(self):
+        from omegaconf import OmegaConf
+        from src.diagnose_material_condition import _validate_b0_identity
+        from src.options import TestingConfig
+
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "eval_mm3_b3a_material_state_adapter_45k.yaml"
+        )
+        args = OmegaConf.merge(
+            OmegaConf.structured(TestingConfig), OmegaConf.load(config_path)
+        )
+        _validate_b0_identity(args, profile="b3a45")
+        with self.assertRaisesRegex(ValueError, "unexpected model_config"):
+            _validate_b0_identity(args, profile="contact_cond90")
+
+        args.model_config.material_state_rank = 32
+        with self.assertRaisesRegex(ValueError, "material_state_rank"):
+            _validate_b0_identity(args, profile="b3a45")
 
     def test_one_model_runs_seven_paired_conditions_with_identical_seed(self):
         import src.diagnose_material_response_sweep as diagnostic

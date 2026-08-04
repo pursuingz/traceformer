@@ -74,5 +74,60 @@ class V11aParameterValidationTests(unittest.TestCase):
                 parameter.requires_grad_(True)
 
 
+class MaterialStateParameterValidationTests(unittest.TestCase):
+    def test_b3_exact_parameter_delta(self):
+        baseline = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+            contact_injection_mode="separate",
+        )
+        candidate = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+            contact_injection_mode="separate",
+            material_state_adapter=True,
+            material_state_rank=64,
+            material_state_interval=2,
+        )
+
+        report = count_params.validate_material_state_parameter_budget(
+            baseline, candidate
+        )
+
+        self.assertEqual(report["adapter_params"], 34_052)
+        self.assertEqual(report["signed_delta"], 34_052)
+        self.assertLess(report["delta_percent"], 0.3)
+        self.assertEqual(report["block_count"], 8)
+        self.assertEqual(report["stage_count"], 4)
+        self.assertEqual(report["rank"], 64)
+
+    def test_b3_common_parameters_share_exact_initialization(self):
+        import torch
+
+        torch.manual_seed(0)
+        baseline = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_injection_mode="separate",
+        )
+        torch.manual_seed(0)
+        candidate = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_injection_mode="separate",
+            material_state_adapter=True,
+        )
+
+        base_state = baseline.state_dict()
+        candidate_state = candidate.state_dict()
+        common = set(base_state) & set(candidate_state)
+        self.assertIn("dit.norm_final.weight", common)
+        self.assertIn("dit.proj_out.weight", common)
+        for name in common:
+            self.assertTrue(torch.equal(base_state[name], candidate_state[name]), name)
+
+
 if __name__ == "__main__":
     unittest.main()

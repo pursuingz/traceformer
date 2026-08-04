@@ -1,0 +1,104 @@
+# B3a: config_mm3_contact_cond.yaml plus one factorized material-state adapter.
+# Frozen: serial 8L backbone, contact path, data, losses, optimizer and schedule.
+image_size: 128
+output_dir: ./outputs/mm3_b3a_material_state_adapter_8L
+seed: 0
+train_batch_size: 1
+eval_batch_size: 1
+num_train_epochs: 50
+max_train_steps: 90000
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+learning_rate: 1e-4
+scale_lr: false
+lr_scheduler: "costant_with_warmup"
+lr_warmup_steps: 100
+use_8bit_adam: false
+allow_tf32: true
+dataloader_num_workers: 16
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.e-2
+adam_epsilon: 1.e-08
+max_grad_norm: 1.0
+prediction_type: null
+vis_dir: vis
+logging_dir: logs
+mixed_precision: 'bf16'
+report_to: 'tensorboard'
+local_rank: -1
+checkpointing_steps: 2500
+checkpoints_total_limit: 19
+resume_from_checkpoint: latest
+enable_xformers_memory_efficient_attention: true
+validation_steps: 2000
+validation_train_steps: 2000
+validation_sanity_check: true
+tracker_project_name: 'diffusion'
+push_to_hub: false
+set_grads_to_none: true
+lambda_vel: 1.0
+lambda_mask: 0.0
+lambda_momentum: 0.0
+lambda_deform: 0.001
+single_frame_deform: true
+geom_elastic_only: true
+lambda_laplacian: 0.5
+lambda_collision: 0.1
+lambda_edge: 1.0
+lambda_floor: 0.1
+laplacian_k: 8
+collision_margin: 0.01
+pc_size: 2048
+condition_drop_rate: 0.0
+model_type: 'dit_st'
+pred_offset: true
+output_frames: 1
+rollout_random_window: true
+windows_per_model: 20
+
+model_config:
+  n_layers: 8
+  latent_dim: 256
+  frame_cond: true
+  point_embed: true
+  mask_cond: true
+  pred_offset: true
+  num_neighbors: -1
+  floor_cond: true
+  max_num_forces: 1
+  force_as_token: false
+  force_as_latent: false
+  gravity_emb: true
+  coeff_cond: false
+  num_mat: 4
+  class_token: true
+  transformer_block: SpatialTemporalTransformerBlock
+  contact_particle_cond: true
+  contact_feature_sigma: 0.04
+  material_state_adapter: true
+  material_state_rank: 64
+  material_state_interval: 2
+  material_state_e_center: 5.5
+  material_state_e_scale: 1.0
+  material_state_nu_center: 0.25
+  material_state_nu_scale: 0.15
+  material_state_runtime_scale: 1.0
+
+train_dataset:
+  category: hf-objaverse-v1
+  dataset_path: mm3_data/mm3_train
+  dataset_list: DATASET_ITEM_LIST
+  has_gravity: true
+  max_num_forces: ${model_config.max_num_forces}
+  norm_fac: 5
+  stage: 'deform'
+  mode: 'diff'
+  pc_size: ${pc_size}
+  repeat: 1
+  seed: 0
+  n_sample_pro_model: 300
+  n_frames_interval: 1
+  n_training_frames: 24
+  batch_size: 20
+  overfit: false
