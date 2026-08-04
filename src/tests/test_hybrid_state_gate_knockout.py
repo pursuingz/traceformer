@@ -1,5 +1,7 @@
 import csv
 import io
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -129,6 +131,9 @@ class WriterTests(unittest.TestCase):
                 "low_E",
                 "high_E",
                 "负值表示改善",
+                "all_off 仅表示同一已训练 checkpoint 内的因果 knockout",
+                "不是独立训练 baseline",
+                "不能视为公平的 HST-vs-no-HST 架构对比",
                 "close",
             ):
                 self.assertIn(token, report)
@@ -246,6 +251,26 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
 
 
 class GateKnockoutCliTests(unittest.TestCase):
+    def test_package_import_succeeds_from_repo_root_without_pythonpath(self):
+        project_root = Path(__file__).resolve().parents[2]
+        environment = dict(os.environ)
+        environment.pop("PYTHONPATH", None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import src.diagnose_hybrid_state_gate_knockout",
+            ],
+            cwd=project_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_parser_fixes_required_paths_and_bootstrap_protocol(self):
         from src.diagnose_hybrid_state_gate_knockout import build_parser
 

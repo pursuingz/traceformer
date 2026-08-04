@@ -7,7 +7,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from utils.eval_metrics import per_window_metrics
+from .eval_metrics import per_window_metrics
 
 
 KNOCKOUT_METRICS = (
@@ -706,6 +706,8 @@ def write_knockout_report(
         f"- raw rows: {len(validated_raw)} / 205",
         f"- paired rows: {paired_count} / 164",
         "- 配对差值定义为 `knockout - normal`；所有指标越低越好，负值表示改善。",
+        "- all_off 仅表示同一已训练 checkpoint 内的因果 knockout；"
+        "它不是独立训练 baseline，不能视为公平的 HST-vs-no-HST 架构对比。",
         "",
     ]
 
