@@ -251,6 +251,71 @@ def _diagnostic_args(dataset_path="mm3_data/mm3_test"):
 
 
 class GateKnockoutCliTests(unittest.TestCase):
+    def test_config_guard_rejects_noncanonical_runtime_semantics(self):
+        import src.diagnose_hybrid_state_gate_knockout as diagnostic
+
+        checkpoint = Path(
+            "outputs/mm3_v11a_contact_cond_8L/"
+            "checkpoint-90000/model.safetensors"
+        )
+        cases = (
+            ("model_config", "contact_injection_mode", "shared"),
+            ("model_config", "contact_velocity_mode", "xyz"),
+            ("model_config", "contact_feature_mask", [1.0, 0.0, 1.0]),
+            ("model_config", "contact_bias_scale", 0.5),
+            ("model_config", "pred_velocity", True),
+            ("model_config", "class_dropout_prob", 0.1),
+            ("model_config", "physics_slices", 16),
+            ("model_config", "grid_res", 16),
+            ("train_dataset", "rollout_unroll_steps", 2),
+            ("train_dataset", "rollout_random_window", True),
+            ("train_dataset", "rollout_force_start0", True),
+            ("train_dataset", "windows_per_model", 1),
+            ("train_dataset", "train_extra_random_windows", 1),
+            ("train_dataset", "contact_window_ratio", 0.5),
+            ("train_dataset", "contact_margin", 0.1),
+            ("train_dataset", "contact_frame_radius", 3),
+            ("train_dataset", "causal_start_vel", True),
+        )
+        for section, field, value in cases:
+            with self.subTest(section=section, field=field):
+                args = _diagnostic_args()
+                setattr(getattr(args, section), field, value)
+                with self.assertRaisesRegex(ValueError, field):
+                    diagnostic.validate_diagnostic_config(args, checkpoint)
+
+    def test_config_guard_rejects_unregistered_fields_in_every_section(self):
+        import src.diagnose_hybrid_state_gate_knockout as diagnostic
+
+        checkpoint = Path(
+            "outputs/mm3_v11a_contact_cond_8L/"
+            "checkpoint-90000/model.safetensors"
+        )
+        for section in (None, "model_config", "train_dataset"):
+            with self.subTest(section=section):
+                args = _diagnostic_args()
+                target = args if section is None else getattr(args, section)
+                setattr(target, "unregistered_semantic_mode", True)
+                with self.assertRaisesRegex(ValueError, "unregistered_semantic_mode"):
+                    diagnostic.validate_diagnostic_config(args, checkpoint)
+
+    def test_config_guard_allows_registered_nonsemantic_runtime_fields(self):
+        import src.diagnose_hybrid_state_gate_knockout as diagnostic
+
+        args = _diagnostic_args()
+        args.resume = "ignored because the CLI checkpoint is authoritative"
+        args.vis_dir = "unused-by-knockout"
+        args.per_model_csv = False
+        args.contact_eval_margin = 123.0
+
+        diagnostic.validate_diagnostic_config(
+            args,
+            Path(
+                "outputs/mm3_v11a_contact_cond_8L/"
+                "checkpoint-90000/model.safetensors"
+            ),
+        )
+
     def test_package_import_succeeds_from_repo_root_without_pythonpath(self):
         project_root = Path(__file__).resolve().parents[2]
         environment = dict(os.environ)
@@ -367,6 +432,7 @@ class GateKnockoutCliTests(unittest.TestCase):
             )
             for index, name in enumerate(model_names)
         ]
+        records_by_name = {record.model: record for record in records}
 
         class FakeDataset:
             def __init__(self, split, config):
@@ -474,6 +540,11 @@ class GateKnockoutCliTests(unittest.TestCase):
                         "model": [name],
                         "start_idx": torch.tensor([0]),
                         "floor_height": torch.tensor([-10.0]),
+                        "E": torch.tensor([records_by_name[name].log10_e]),
+                        "nu": torch.tensor([records_by_name[name].nu]),
+                        "mat_type": torch.tensor(
+                            [records_by_name[name].mat_type]
+                        ),
                     },
                     {},
                 )
@@ -569,8 +640,143 @@ class GateKnockoutCliTests(unittest.TestCase):
             with paired_path.open(newline="", encoding="utf-8") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 164)
 
+    def test_run_rejects_batch_material_mismatch_before_any_rollout(self):
+        import src.diagnose_hybrid_state_gate_knockout as diagnostic
+
+        record = SimpleNamespace(
+            model="model.h5",
+            mat_type=1,
+            log10_e=3.0,
+            nu=0.2,
+        )
+
+        class FakeDataset:
+            def __init__(self, split, config):
+                self.split_lst_save = [record.model]
+                self.models = [{"model": record.model, "start_idx": 0}]
+
+        class FakeModel:
+            def __init__(self):
+                self.dit = SimpleNamespace(
+                    hybrid_state_exchange=SimpleNamespace(
+                        feedback_gates=torch.nn.Parameter(torch.ones(4))
+                    )
+                )
+
+            def to(self, device):
+                return self
+
+            def load_state_dict(self, checkpoint, strict):
+                return None
+
+            def eval(self):
+                return self
+
+            def requires_grad_(self, enabled):
+                return self
+
+        dataset_module = ModuleType("dataset.traj_dataset")
+        dataset_module.TrajDataset = FakeDataset
+        dataset_package = ModuleType("dataset")
+        dataset_package.__path__ = []
+        model_module = ModuleType("model.spacetime")
+        model_module.MDM_ST = mock.Mock(return_value=FakeModel())
+        model_package = ModuleType("model")
+        model_package.__path__ = []
+        pipeline_module = ModuleType("pipeline_traj")
+        pipeline_module.TrajPipeline = mock.Mock(return_value=object())
+        safetensors_package = ModuleType("safetensors")
+        safetensors_package.__path__ = []
+        safetensors_torch_module = ModuleType("safetensors.torch")
+        safetensors_torch_module.load_file = mock.Mock(return_value={})
+        safetensors_package.torch = safetensors_torch_module
+        imported_modules = {
+            "dataset": dataset_package,
+            "dataset.traj_dataset": dataset_module,
+            "model": model_package,
+            "model.spacetime": model_module,
+            "pipeline_traj": pipeline_module,
+            "safetensors": safetensors_package,
+            "safetensors.torch": safetensors_torch_module,
+        }
+        mismatched_batch = {
+            "model": [record.model],
+            "start_idx": torch.tensor([0]),
+            "floor_height": torch.tensor([-10.0]),
+            "E": torch.tensor([record.log10_e + 1.0]),
+            "nu": torch.tensor([record.nu]),
+            "mat_type": torch.tensor([record.mat_type]),
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            checkpoint.touch()
+            with (
+                mock.patch.dict(sys.modules, imported_modules),
+                mock.patch.object(
+                    diagnostic, "validate_diagnostic_config"
+                ),
+                mock.patch.object(
+                    diagnostic,
+                    "load_frozen_test_manifest",
+                    return_value={"plasticine": (record.model,)},
+                ),
+                mock.patch.object(
+                    diagnostic, "load_material_records", return_value=[record]
+                ),
+                mock.patch.object(
+                    diagnostic,
+                    "_validate_records",
+                    return_value={record.model: record},
+                ),
+                mock.patch.object(
+                    diagnostic, "select_start_zero_indices", return_value=[0]
+                ),
+                mock.patch.object(
+                    diagnostic.torch.utils.data,
+                    "DataLoader",
+                    return_value=[(mismatched_batch, {})],
+                ),
+                mock.patch.object(diagnostic.Path, "is_dir", return_value=True),
+                mock.patch.object(diagnostic, "_build_raw_reference") as build_gt,
+                mock.patch.object(
+                    diagnostic,
+                    "rollout_condition",
+                    side_effect=AssertionError("rollout must not run"),
+                ) as rollout,
+            ):
+                with self.assertRaisesRegex(ValueError, "batch/HDF5 E mismatch"):
+                    diagnostic.run_gate_knockout_diagnostics(
+                        _diagnostic_args(),
+                        checkpoint,
+                        root / "reports",
+                        1,
+                        0,
+                    )
+
+            build_gt.assert_not_called()
+            rollout.assert_not_called()
+
 
 class GateMaskTests(unittest.TestCase):
+    def test_metrics_are_the_complete_pre_registered_ordered_tuple(self):
+        self.assertEqual(
+            KNOCKOUT_METRICS,
+            (
+                "full_rollout_mse",
+                "short_mse",
+                "mid_mse",
+                "long_mse",
+                "gm_mse",
+                "fde",
+                "f24_centroid_error",
+                "f24_shape_residual_mse",
+                "penetration_rate",
+                "penetration_depth",
+            ),
+        )
+
     def test_conditions_are_pre_registered_and_ordered(self):
         self.assertEqual(
             KNOCKOUT_CONDITIONS,

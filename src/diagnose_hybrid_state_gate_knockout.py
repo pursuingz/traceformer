@@ -1,6 +1,7 @@
 """Run the frozen B1b inference-only HST feedback-gate knockout diagnostic."""
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,12 @@ try:  # Supports both ``python src/...`` and ``import src....``.
         _validate_records,
         load_frozen_test_manifest,
         select_start_zero_indices,
-        validate_diagnostic_config,
+        validate_diagnostic_config as _validate_base_diagnostic_config,
     )
     from diagnose_material_condition import (
         _build_raw_reference,
         _load_checkpoint_strict,
+        _validate_normal_material_condition,
         load_material_records,
         rollout_condition,
     )
@@ -45,11 +47,12 @@ except ModuleNotFoundError:
         _validate_records,
         load_frozen_test_manifest,
         select_start_zero_indices,
-        validate_diagnostic_config,
+        validate_diagnostic_config as _validate_base_diagnostic_config,
     )
     from src.diagnose_material_condition import (
         _build_raw_reference,
         _load_checkpoint_strict,
+        _validate_normal_material_condition,
         load_material_records,
         rollout_condition,
     )
@@ -66,6 +69,218 @@ except ModuleNotFoundError:
         write_knockout_report,
         write_paired_csv,
         write_raw_csv,
+    )
+
+
+_TOP_LEVEL_CONFIG_FIELDS = frozenset(
+    {
+        "pc_size",
+        "eval_batch_size",
+        "dataloader_num_workers",
+        "seed",
+        "pred_offset",
+        "model_type",
+        "use_diffusion",
+        "num_inference_steps",
+        "output_frames",
+        "input_frames",
+        "floor_projection",
+        "model_config",
+        "train_dataset",
+        # These fields do not affect this diagnostic's rollout semantics.
+        "resume",
+        "vis_dir",
+        "per_model_csv",
+        "contact_eval_margin",
+    }
+)
+_MODEL_CONFIG_FIELDS = frozenset(
+    {
+        "n_layers",
+        "latent_dim",
+        "frame_cond",
+        "point_embed",
+        "mask_cond",
+        "pred_offset",
+        "num_neighbors",
+        "floor_cond",
+        "max_num_forces",
+        "force_as_token",
+        "force_as_latent",
+        "gravity_emb",
+        "coeff_cond",
+        "num_mat",
+        "class_token",
+        "transformer_block",
+        "hybrid_state_dim",
+        "hybrid_state_heads",
+        "hybrid_state_interval",
+        "contact_particle_cond",
+        "contact_feature_sigma",
+        "cond_frames",
+        "contact_injection_mode",
+        "contact_velocity_mode",
+        "contact_feature_mask",
+        "contact_bias_scale",
+        "pred_velocity",
+        "class_dropout_prob",
+        "physics_slices",
+        "grid_res",
+    }
+)
+_MODEL_RUNTIME_DEFAULTS = {
+    "cond_frames": 5,
+    "contact_injection_mode": "separate",
+    "contact_velocity_mode": "vertical",
+    "contact_feature_mask": (1.0, 1.0, 1.0),
+    "contact_bias_scale": 1.0,
+    "pred_velocity": False,
+    "class_dropout_prob": 0.0,
+    "physics_slices": 32,
+    "grid_res": 8,
+}
+_DATASET_CONFIG_FIELDS = frozenset(
+    {
+        "category",
+        "dataset_path",
+        "dataset_list",
+        "has_gravity",
+        "max_num_forces",
+        "norm_fac",
+        "stage",
+        "mode",
+        "pc_size",
+        "repeat",
+        "seed",
+        "n_sample_pro_model",
+        "n_frames_interval",
+        "n_training_frames",
+        "batch_size",
+        "overfit",
+        "input_frames",
+        "output_frames",
+        "rollout_unroll_steps",
+        "rollout_random_window",
+        "rollout_force_start0",
+        "windows_per_model",
+        "train_extra_random_windows",
+        "contact_window_ratio",
+        "contact_margin",
+        "contact_frame_radius",
+        "causal_start_vel",
+    }
+)
+_DATASET_RUNTIME_DEFAULTS = {
+    "rollout_unroll_steps": 1,
+    "rollout_random_window": False,
+    "rollout_force_start0": False,
+    "windows_per_model": None,
+    "train_extra_random_windows": 0,
+    "contact_window_ratio": 0.0,
+    "contact_margin": 0.04,
+    "contact_frame_radius": 2,
+    "causal_start_vel": False,
+}
+_MISSING = object()
+
+
+def _config_field_names(config: Any) -> set[str]:
+    keys = getattr(config, "keys", None)
+    if callable(keys):
+        return {str(key) for key in keys()}
+    try:
+        return set(vars(config))
+    except TypeError as exc:
+        raise ValueError(f"B1b config section is not inspectable: {config!r}") from exc
+
+
+def _config_value(config: Any, field: str) -> Any:
+    try:
+        return getattr(config, field)
+    except (AttributeError, KeyError):
+        try:
+            return config[field]
+        except (KeyError, TypeError):
+            return _MISSING
+
+
+def _config_values_match(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, tuple):
+        try:
+            actual_values = tuple(actual)
+        except TypeError:
+            return False
+        return len(actual_values) == len(expected) and all(
+            not isinstance(actual_value, bool)
+            and isinstance(actual_value, (int, float))
+            and math.isclose(
+                float(actual_value),
+                float(expected_value),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            for actual_value, expected_value in zip(actual_values, expected)
+        )
+    if isinstance(expected, float):
+        return (
+            not isinstance(actual, bool)
+            and isinstance(actual, (int, float))
+            and math.isclose(float(actual), expected, rel_tol=0.0, abs_tol=1e-12)
+        )
+    return type(actual) is type(expected) and actual == expected
+
+
+def _validate_allowed_fields(
+    config: Any,
+    section: str,
+    allowed: frozenset[str],
+) -> None:
+    unexpected = sorted(_config_field_names(config) - allowed)
+    if unexpected:
+        raise ValueError(
+            f"B1b gate knockout has unregistered {section} field(s): {unexpected}"
+        )
+
+
+def _validate_runtime_defaults(
+    config: Any,
+    section: str,
+    expected_defaults: dict[str, Any],
+) -> None:
+    for field, expected in expected_defaults.items():
+        actual = _config_value(config, field)
+        if actual is _MISSING:
+            continue
+        if not _config_values_match(actual, expected):
+            raise ValueError(
+                f"B1b gate knockout requires {section}.{field}={expected!r}; "
+                f"got {actual!r}"
+            )
+
+
+def validate_diagnostic_config(args: Any, checkpoint: Path) -> None:
+    """Fail closed over every registered B1b rollout configuration field."""
+    _validate_allowed_fields(args, "top-level", _TOP_LEVEL_CONFIG_FIELDS)
+    _validate_allowed_fields(
+        args.model_config,
+        "model_config",
+        _MODEL_CONFIG_FIELDS,
+    )
+    _validate_allowed_fields(
+        args.train_dataset,
+        "train_dataset",
+        _DATASET_CONFIG_FIELDS,
+    )
+    _validate_base_diagnostic_config(args, checkpoint)
+    _validate_runtime_defaults(
+        args.model_config,
+        "model_config",
+        _MODEL_RUNTIME_DEFAULTS,
+    )
+    _validate_runtime_defaults(
+        args.train_dataset,
+        "train_dataset",
+        _DATASET_RUNTIME_DEFAULTS,
     )
 
 
@@ -177,6 +392,7 @@ def run_gate_knockout_diagnostics(
         if record is None:
             raise ValueError(f"{model_name}: missing material metadata")
 
+        _validate_normal_material_condition(batch, record)
         gt = _build_raw_reference(batch, args.train_dataset)
         for condition, mask in KNOCKOUT_CONDITIONS:
             _assert_checkpoint_gates(exchange, original_gates)
