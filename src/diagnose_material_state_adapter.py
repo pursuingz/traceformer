@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True, help="Output path prefix.")
+    parser.add_argument(
+        "--profile",
+        choices=("b3a45", "b3a90"),
+        default="b3a45",
+        help="Strict B3a checkpoint/config identity profile.",
+    )
     return parser
 
 
@@ -75,7 +81,7 @@ def main() -> None:
         OmegaConf.structured(TestingConfig), OmegaConf.load(config_path)
     )
     args.resume = str(checkpoint)
-    _validate_b0_identity(args, profile="b3a45")
+    _validate_b0_identity(args, profile=cli.profile)
     args.model_config.cond_frames = int(args.input_frames)
     model = MDM_ST(
         args.pc_size,

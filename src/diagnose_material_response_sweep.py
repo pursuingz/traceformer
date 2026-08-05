@@ -357,21 +357,21 @@ def _non_negative_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a registered frozen-model B2 E/nu response sweep."
+        description="Run a registered frozen-model E/nu response sweep."
     )
     parser.add_argument(
         "--profile",
-        choices=("contact_cond90", "b3a45"),
+        choices=("contact_cond90", "b3a45", "b3a90"),
         default=B2_PROFILE,
         help="Strict checkpoint/config identity profile.",
     )
     parser.add_argument(
-        "--config", required=True, help="Frozen mm3_contact_cond evaluation YAML."
+        "--config", required=True, help="Registered evaluation YAML."
     )
     parser.add_argument(
         "--checkpoint",
         required=True,
-        help="Frozen mm3_contact_cond checkpoint-90000 model.safetensors.",
+        help="Checkpoint matching the selected strict identity profile.",
     )
     parser.add_argument(
         "--output-dir",

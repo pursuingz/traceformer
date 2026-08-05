@@ -340,6 +340,17 @@ class SweepCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(b3.profile, "b3a45")
+        b3_90 = build_parser().parse_args(
+            [
+                "--profile",
+                "b3a90",
+                "--config",
+                "src/configs/eval_mm3_b3a_material_state_adapter_90k.yaml",
+                "--checkpoint",
+                "outputs/mm3_b3a_material_state_adapter_8L/checkpoint-90000/model.safetensors",
+            ]
+        )
+        self.assertEqual(b3_90.profile, "b3a90")
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args(
                 ["--config", "src/configs/eval_mm3_contact_cond.yaml"]
@@ -365,6 +376,31 @@ class SweepCliTests(unittest.TestCase):
         args.model_config.material_state_rank = 32
         with self.assertRaisesRegex(ValueError, "material_state_rank"):
             _validate_b0_identity(args, profile="b3a45")
+
+    def test_b3_90_profile_rejects_45k_checkpoint(self):
+        from omegaconf import OmegaConf
+        from src.diagnose_material_condition import _validate_b0_identity
+        from src.options import TestingConfig
+
+        config_dir = Path(__file__).resolve().parents[1] / "configs"
+        args_90 = OmegaConf.merge(
+            OmegaConf.structured(TestingConfig),
+            OmegaConf.load(
+                config_dir / "eval_mm3_b3a_material_state_adapter_90k.yaml"
+            ),
+        )
+        _validate_b0_identity(args_90, profile="b3a90")
+        with self.assertRaisesRegex(ValueError, "checkpoint mismatch"):
+            _validate_b0_identity(args_90, profile="b3a45")
+
+        args_45 = OmegaConf.merge(
+            OmegaConf.structured(TestingConfig),
+            OmegaConf.load(
+                config_dir / "eval_mm3_b3a_material_state_adapter_45k.yaml"
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "checkpoint mismatch"):
+            _validate_b0_identity(args_45, profile="b3a90")
 
     def test_one_model_runs_seven_paired_conditions_with_identical_seed(self):
         import src.diagnose_material_response_sweep as diagnostic

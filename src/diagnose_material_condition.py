@@ -175,6 +175,27 @@ B01_PROFILES = {
             "material_state_runtime_scale": 1.0,
         },
     ),
+    "b3a90": DiagnosticProfile(
+        name="b3a90",
+        resume_suffix=(
+            "outputs/mm3_b3a_material_state_adapter_8L/"
+            "checkpoint-90000/model.safetensors"
+        ),
+        model_defaults={
+            "contact_injection_mode": "separate",
+            "contact_velocity_mode": "vertical",
+            "contact_feature_mask": [1, 1, 1],
+            "contact_bias_scale": 1.0,
+            "material_state_adapter": True,
+            "material_state_rank": 64,
+            "material_state_interval": 2,
+            "material_state_e_center": 5.5,
+            "material_state_e_scale": 1.0,
+            "material_state_nu_center": 0.25,
+            "material_state_nu_scale": 0.15,
+            "material_state_runtime_scale": 1.0,
+        },
+    ),
 }
 # Compatibility aliases for legacy callers and tests. Identity validation resolves
 # these values through B01_PROFILES below.
