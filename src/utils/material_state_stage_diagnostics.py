@@ -1,5 +1,6 @@
 import math
 from contextlib import contextmanager
+import weakref
 
 import torch
 
@@ -12,6 +13,7 @@ STAGE_KNOCKOUT_CONDITIONS = (
     ("stage2_off", (1, 1, 0, 1)),
     ("stage3_off", (1, 1, 1, 0)),
 )
+_ACTIVE_COLLECTORS = weakref.WeakKeyDictionary()
 
 
 @contextmanager
@@ -45,19 +47,30 @@ class MaterialStateActivityCollector:
         self._handle = None
 
     def __enter__(self):
+        if self._handle is not None or self.adapter in _ACTIVE_COLLECTORS:
+            raise ValueError("nested collector contexts are not supported")
         self._rows.clear()
         self._capture_state = None
-        self._handle = self.adapter.register_forward_hook(
-            self._capture_activity,
-            with_kwargs=True,
-        )
+        _ACTIVE_COLLECTORS[self.adapter] = self
+        try:
+            self._handle = self.adapter.register_forward_hook(
+                self._capture_activity,
+                with_kwargs=True,
+            )
+        except BaseException:
+            del _ACTIVE_COLLECTORS[self.adapter]
+            raise
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
-        self._capture_state = None
+        try:
+            if self._handle is not None:
+                self._handle.remove()
+                self._handle = None
+        finally:
+            if _ACTIVE_COLLECTORS.get(self.adapter) is self:
+                del _ACTIVE_COLLECTORS[self.adapter]
+            self._capture_state = None
         return False
 
     @contextmanager

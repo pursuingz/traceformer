@@ -121,6 +121,20 @@ class MaterialStateStageDiagnosticsTests(unittest.TestCase):
                 for stage_index in range(4):
                     self.forward_stage(adapter, stage_index)
 
+    def test_nested_collector_contexts_are_rejected_without_leaking_hook(self):
+        adapter = self.make_adapter()
+        outer = MaterialStateActivityCollector(adapter)
+
+        with outer:
+            with self.assertRaisesRegex(ValueError, "nested collector"):
+                with MaterialStateActivityCollector(adapter):
+                    pass
+            with outer.capture("model-a", 0, 1):
+                for stage_index in range(4):
+                    self.forward_stage(adapter, stage_index)
+
+        self.assertEqual(len(adapter._forward_hooks), 0)
+
     def test_capture_rejects_missing_stages_on_exit(self):
         adapter = self.make_adapter()
         with MaterialStateActivityCollector(adapter) as collector:
