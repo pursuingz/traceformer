@@ -20,7 +20,7 @@ def _model_names(dataset_path, dataset_list):
     else:
         names = sorted(name for name in os.listdir(dataset_path) if name.endswith(".h5"))
 
-    dataset_root = os.path.realpath(dataset_path)
+    dataset_root = os.path.abspath(dataset_path)
     seen = set()
     for name in names:
         if (
@@ -33,10 +33,10 @@ def _model_names(dataset_path, dataset_list):
             raise ValueError(f"dataset_list contains duplicate model {name!r}")
         seen.add(name)
     for name in names:
-        resolved = os.path.realpath(os.path.join(dataset_root, name))
-        if os.path.commonpath((dataset_root, resolved)) != dataset_root:
-            raise ValueError("dataset_list entries must stay inside mm3_train")
-        if not os.path.isfile(resolved):
+        entry_path = os.path.abspath(os.path.join(dataset_root, name))
+        if os.path.commonpath((dataset_root, entry_path)) != dataset_root:
+            raise ValueError("dataset entries must stay inside mm3_train")
+        if not os.path.isfile(entry_path):
             raise ValueError(f"dataset model does not exist: {name}")
     return names
 

@@ -8,7 +8,11 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from dataset.material_gate_dataset import MaterialGateDataset, build_material_split
+from dataset.material_gate_dataset import (
+    MaterialGateDataset,
+    _model_names,
+    build_material_split,
+)
 from dataset.traj_dataset import TrajDataset
 
 
@@ -104,6 +108,63 @@ class TrajDatasetExplicitSpecTest(unittest.TestCase):
 
 
 class MaterialSplitTest(unittest.TestCase):
+    def test_accepts_mm3_assembly_symlink_with_external_backing_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            source_path = os.path.join(root, "source_h5")
+            os.makedirs(dataset_path)
+            os.makedirs(source_path)
+            expected = {"elastic": set(), "plasticine": set(), "sand": set()}
+            for material, material_name in enumerate(expected):
+                for index in range(2):
+                    model_name = f"material_{material}_{index:03d}.h5"
+                    backing_file = os.path.join(source_path, model_name)
+                    write_model(backing_file, material)
+                    try:
+                        os.symlink(
+                            backing_file,
+                            os.path.join(dataset_path, model_name),
+                        )
+                    except OSError as exc:
+                        self.skipTest(f"file symlinks are unavailable: {exc}")
+                    expected[material_name].add(model_name)
+
+            manifest = build_material_split(
+                dataset_path,
+                "MISSING_DATASET_LIST",
+                train_fraction=0.5,
+                seed=0,
+            )
+            for material_name, expected_names in expected.items():
+                actual = manifest["materials"][material_name]
+                self.assertEqual(set(actual["train"] + actual["val"]), expected_names)
+
+    def test_rejects_missing_dataset_model(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            os.makedirs(dataset_path)
+            dataset_list = os.path.join(root, "list.json")
+            with open(dataset_list, "w", encoding="utf-8") as handle:
+                json.dump(["missing.h5"], handle)
+
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                _model_names(dataset_path, dataset_list)
+
+    def test_rejects_broken_dataset_symlink(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            os.makedirs(dataset_path)
+            try:
+                os.symlink(
+                    os.path.join(root, "missing_source.h5"),
+                    os.path.join(dataset_path, "broken.h5"),
+                )
+            except OSError as exc:
+                self.skipTest(f"file symlinks are unavailable: {exc}")
+
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                _model_names(dataset_path, "MISSING_DATASET_LIST")
+
     def test_split_is_stratified_reproducible_and_excludes_rigid(self):
         with tempfile.TemporaryDirectory() as root:
             dataset_path = os.path.join(root, "mm3_train")
