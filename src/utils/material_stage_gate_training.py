@@ -384,6 +384,7 @@ def calibrate_material_rows(
     reg_weight=1.0e-3,
     accelerator=None,
     noise_seed=0,
+    progress_factory=None,
 ):
     if max_updates < validation_interval:
         raise ValueError("max_updates must include at least one validation interval")
@@ -396,10 +397,14 @@ def calibrate_material_rows(
         patience=patience,
     )
     history = []
+    material_names = ("elastic", "plasticine", "sand")
 
     for material_id in range(3):
         if material_id not in train_loaders or material_id not in val_loaders:
             raise ValueError(f"missing train/val loader for material {material_id}")
+        material_name = material_names[material_id]
+        if progress_factory is not None and accelerator is not None:
+            accelerator.print(f"[{material_name}] evaluating identity gate...")
         identity_metrics = _validation_metrics(
             model,
             val_loaders[material_id],
@@ -422,6 +427,10 @@ def calibrate_material_rows(
                 **identity_metrics,
             }
         )
+        if progress_factory is not None and accelerator is not None:
+            accelerator.print(
+                f"[{material_name}] identity score={identity_metrics['score']:.6e}"
+            )
 
         row_mask = torch.zeros_like(gate)
         row_mask[material_id] = 1.0
@@ -429,6 +438,16 @@ def calibrate_material_rows(
         optimizer = torch.optim.Adam([gate], lr=learning_rate, weight_decay=0.0)
         loader = train_loaders[material_id]
         iterator = iter(loader)
+        progress = (
+            progress_factory(
+                total=max_updates,
+                desc=f"{material_name} gate",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            if progress_factory is not None
+            else None
+        )
 
         try:
             for update in range(1, max_updates + 1):
@@ -456,6 +475,9 @@ def calibrate_material_rows(
                         noise_seed=noise_seed,
                     )
                 optimizer.step()
+                train_score = float(train_metrics["full_mse"]) + long_weight * float(
+                    train_metrics["long_mse"]
+                )
                 history.append(
                     {
                         "material": material_id,
@@ -464,12 +486,29 @@ def calibrate_material_rows(
                         "full_mse": float(train_metrics["full_mse"]),
                         "long_mse": float(train_metrics["long_mse"]),
                         "regularizer": float(train_metrics["regularizer"]),
-                        "score": float(train_metrics["full_mse"])
-                        + long_weight * float(train_metrics["long_mse"]),
+                        "score": train_score,
                     }
                 )
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(
+                        {
+                            "train": f"{train_score:.3e}",
+                            "best": f"{tracker.best_scores[material_id]:.3e}",
+                        },
+                        refresh=True,
+                    )
 
                 if tracker.should_validate(update):
+                    if progress is not None:
+                        progress.set_postfix(
+                            {
+                                "train": f"{train_score:.3e}",
+                                "status": "validating",
+                                "best": f"{tracker.best_scores[material_id]:.3e}",
+                            },
+                            refresh=True,
+                        )
                     val_metrics = _validation_metrics(
                         model,
                         val_loaders[material_id],
@@ -493,15 +532,37 @@ def calibrate_material_rows(
                         val_metrics["score"],
                         gate[material_id],
                     )
+                    if progress is not None:
+                        progress.set_postfix(
+                            {
+                                "train": f"{train_score:.3e}",
+                                "val": f"{val_metrics['score']:.3e}",
+                                "best": f"{tracker.best_scores[material_id]:.3e}",
+                            },
+                            refresh=True,
+                        )
                     if should_stop:
+                        if progress_factory is not None and accelerator is not None:
+                            accelerator.print(
+                                f"[{material_name}] early stop at update {update}; "
+                                f"best update={tracker.best_update[material_id]}"
+                            )
                         break
         finally:
             hook.remove()
+            if progress is not None:
+                progress.close()
 
         if tracker.best_update[material_id] is None:
             raise RuntimeError(f"material {material_id} was never validated")
         with torch.no_grad():
             gate[material_id].copy_(tracker.best_rows[material_id].to(gate))
+        if progress_factory is not None and accelerator is not None:
+            accelerator.print(
+                f"[{material_name}] restored best update="
+                f"{tracker.best_update[material_id]}, score="
+                f"{tracker.best_scores[material_id]:.6e}"
+            )
 
     return {
         "history": history,

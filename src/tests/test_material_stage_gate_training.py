@@ -402,6 +402,67 @@ def calibration_sample(material_id, target):
 
 
 class CalibrationOrchestrationTest(unittest.TestCase):
+    def test_reports_material_update_and_validation_progress(self):
+        class RecordingProgress:
+            def __init__(self, **kwargs):
+                self.total = kwargs["total"]
+                self.description = kwargs["desc"]
+                self.updates = 0
+                self.postfixes = []
+                self.closed = False
+
+            def update(self, amount=1):
+                self.updates += amount
+
+            def set_description_str(self, description):
+                self.description = description
+
+            def set_postfix(self, values, refresh=True):
+                self.postfixes.append(dict(values))
+
+            def close(self):
+                self.closed = True
+
+        bars = []
+
+        def progress_factory(**kwargs):
+            bar = RecordingProgress(**kwargs)
+            bars.append(bar)
+            return bar
+
+        model = CalibrationModel()
+        train_loaders = {
+            0: [calibration_sample(0, 0.2)],
+            1: [calibration_sample(1, 1.0)],
+            2: [calibration_sample(2, 1.8)],
+        }
+        result = calibrate_material_rows(
+            model,
+            train_loaders,
+            {material_id: list(samples) for material_id, samples in train_loaders.items()},
+            max_updates=2,
+            validation_interval=1,
+            patience=2,
+            learning_rate=0.1,
+            long_weight=0.5,
+            reg_weight=1.0e-3,
+            noise_seed=0,
+            progress_factory=progress_factory,
+        )
+
+        self.assertEqual(result["best_updates"], [2, 0, 2])
+        self.assertEqual(len(bars), 3)
+        self.assertEqual([bar.total for bar in bars], [2, 2, 2])
+        self.assertEqual([bar.updates for bar in bars], [2, 2, 2])
+        self.assertEqual(
+            [bar.description for bar in bars],
+            ["elastic gate", "plasticine gate", "sand gate"],
+        )
+        self.assertTrue(all(bar.closed for bar in bars))
+        self.assertTrue(all("train" in bar.postfixes[-1] for bar in bars))
+        self.assertTrue(all("val" in bar.postfixes[-1] for bar in bars))
+        self.assertTrue(all("best" in bar.postfixes[-1] for bar in bars))
+
     def test_calibrates_rows_independently_and_restores_each_best_row(self):
         model = CalibrationModel()
         train_loaders = {

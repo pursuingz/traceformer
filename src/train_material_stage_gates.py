@@ -5,6 +5,7 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 
 from dataset.material_gate_dataset import (
@@ -121,6 +122,7 @@ def run(config):
         reg_weight=float(config.gate_reg_weight),
         accelerator=accelerator,
         noise_seed=int(config.get("seed", 0)),
+        progress_factory=tqdm,
     )
 
     accelerator.wait_for_everyone()
