@@ -16,6 +16,9 @@ class FactorizedMaterialStateAdapter(nn.Module):
         e_scale: float = 1.0,
         nu_center: float = 0.25,
         nu_scale: float = 0.15,
+        material_stage_gate: bool = False,
+        gated_materials: int = 3,
+        gate_max: float = 2.0,
     ):
         super().__init__()
         if particle_dim <= 0:
@@ -39,14 +42,57 @@ class FactorizedMaterialStateAdapter(nn.Module):
         self.e_scale = float(e_scale)
         self.nu_center = float(nu_center)
         self.nu_scale = float(nu_scale)
+        self.material_stage_gate = bool(material_stage_gate)
+        self.gated_materials = int(gated_materials)
+        self.gate_max = float(gate_max)
+
+        if self.material_stage_gate:
+            if not 0 < self.gated_materials < self.num_materials:
+                raise ValueError(
+                    "gated_materials must cover a strict subset of material classes"
+                )
+            if self.gate_max <= 0:
+                raise ValueError("gate_max must be positive")
 
         self.state_norm = nn.LayerNorm(self.particle_dim)
         self.state_proj = nn.Linear(self.particle_dim, self.rank)
         self.material_proj = nn.Linear(2 + self.num_materials, self.rank)
         self.output_proj = nn.Linear(self.rank, self.particle_dim)
         self.stage_scales = nn.Parameter(torch.ones(self.num_stages))
+        if self.material_stage_gate:
+            self.gate_logits = nn.Parameter(
+                torch.zeros(self.gated_materials, self.num_stages)
+            )
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
+
+    def material_stage_gates(self) -> torch.Tensor:
+        if not self.material_stage_gate:
+            raise RuntimeError("material-stage gate is disabled")
+        return self.gate_max * torch.sigmoid(self.gate_logits)
+
+    def gate_for(
+        self,
+        material_labels: torch.Tensor,
+        stage_index: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self.material_stage_gate:
+            return torch.ones(
+                material_labels.shape[0],
+                device=material_labels.device,
+                dtype=dtype,
+            )
+        if not isinstance(stage_index, int) or not 0 <= stage_index < self.num_stages:
+            raise IndexError("stage_index is outside the configured stage range")
+
+        labels = material_labels.long()
+        active = labels < self.gated_materials
+        safe_labels = labels.clamp(min=0, max=self.gated_materials - 1)
+        selected = self.material_stage_gates().to(dtype=dtype)[
+            safe_labels, stage_index
+        ]
+        return torch.where(active, selected, torch.ones_like(selected))
 
     def _validate_inputs(
         self,
@@ -113,4 +159,7 @@ class FactorizedMaterialStateAdapter(nn.Module):
         interaction = state * material[:, None, None, :]
         delta = self.output_proj(interaction)
         scale = self.stage_scales[stage_index].to(delta.dtype) * float(runtime_scale)
+        if self.material_stage_gate:
+            gate = self.gate_for(material_labels, stage_index, delta.dtype)
+            scale = scale * gate[:, None, None, None]
         return hidden_states + scale * delta

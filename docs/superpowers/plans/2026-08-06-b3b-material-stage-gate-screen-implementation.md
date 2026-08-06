@@ -138,7 +138,7 @@ def gate_for(self, material_labels, stage_index, dtype):
 scale = self.stage_scales[stage_index].to(delta.dtype) * float(runtime_scale)
 if self.material_stage_gate:
     gate = self.gate_for(material_labels, stage_index, delta.dtype)
-    scale = scale * gate[:, None, None]
+    scale = scale * gate[:, None, None, None]
 return hidden_states + scale * delta
 ```
 
