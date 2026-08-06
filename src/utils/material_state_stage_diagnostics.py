@@ -36,6 +36,185 @@ _STAGE_CONDITION_NAMES = tuple(name for name, _ in STAGE_KNOCKOUT_CONDITIONS)
 _RAW_METADATA_FIELDS = ("model", "mat_type", "log10_e", "nu")
 _PROVENANCE_FIELDS = ("checkpoint", "config", "seed", "sample_scope")
 _ACTIVE_COLLECTORS = weakref.WeakKeyDictionary()
+_GRADIENT_MATERIAL_COUNTS = {"elastic": 52, "plasticine": 56, "sand": 56}
+_GRADIENT_PAIRS = (
+    ("elastic", "plasticine"),
+    ("elastic", "sand"),
+    ("plasticine", "sand"),
+)
+
+
+def _adapter_leaf_group(parameter_name):
+    if parameter_name == "stage_scales":
+        return "stage_scales"
+    group = parameter_name.split(".", 1)[0]
+    if group not in {"state_norm", "state_proj", "material_proj", "output_proj"}:
+        raise ValueError(f"unregistered adapter parameter: {parameter_name}")
+    return group
+
+
+def _parameter_groups_from_names(parameter_names):
+    parameter_names = tuple(parameter_names)
+    if not parameter_names or len(parameter_names) != len(set(parameter_names)):
+        raise ValueError("adapter parameter names must be non-empty and unique")
+
+    groups = {"all_adapter": parameter_names}
+    for name in parameter_names:
+        if not isinstance(name, str) or not name:
+            raise ValueError("adapter parameter names must be non-empty strings")
+        group = _adapter_leaf_group(name)
+        groups.setdefault(group, []).append(name)
+    required = {
+        "all_adapter",
+        "state_norm",
+        "state_proj",
+        "material_proj",
+        "output_proj",
+        "stage_scales",
+    }
+    if set(groups) != required:
+        raise ValueError("adapter parameter groups are incomplete")
+    return {
+        group: names if isinstance(names, tuple) else tuple(names)
+        for group, names in groups.items()
+    }
+
+
+def adapter_parameter_groups(adapter):
+    """Return deterministic full and leaf parameter groups for the B3a adapter."""
+    return _parameter_groups_from_names(name for name, _ in adapter.named_parameters())
+
+
+def snapshot_adapter_gradients(adapter):
+    """Copy every adapter gradient to detached CPU float64 tensors."""
+    snapshot = {}
+    for name, parameter in adapter.named_parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            raise ValueError(f"missing gradient for adapter parameter: {name}")
+        if gradient.shape != parameter.shape:
+            raise ValueError(f"gradient shape mismatch for adapter parameter: {name}")
+        gradient = gradient.detach()
+        if not torch.isfinite(gradient).all():
+            raise ValueError(f"nonfinite gradient for adapter parameter: {name}")
+        snapshot[name] = gradient.to(device="cpu", dtype=torch.float64).clone()
+    _parameter_groups_from_names(snapshot)
+    return snapshot
+
+
+def mean_named_gradients(sums, sample_count):
+    """Convert named sample-weighted gradient sums into detached mean gradients."""
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, (int, np.integer))
+        or sample_count <= 0
+    ):
+        raise ValueError("sample_count must be a positive integer")
+    if not isinstance(sums, dict) or not sums:
+        raise ValueError("gradient sums must be a non-empty dictionary")
+
+    means = {}
+    for name, value in sums.items():
+        if not isinstance(name, str) or not name or not isinstance(value, torch.Tensor):
+            raise ValueError("gradient sums must map names to tensors")
+        value = value.detach().to(device="cpu", dtype=torch.float64)
+        if not torch.isfinite(value).all():
+            raise ValueError(f"gradient sum must be finite: {name}")
+        means[name] = (value / int(sample_count)).clone()
+    return means
+
+
+def _gradient_group_vectors(named_gradients, groups):
+    vectors = {}
+    for group, names in groups.items():
+        vectors[group] = torch.cat(
+            [named_gradients[name].reshape(-1) for name in names], dim=0
+        )
+    return vectors
+
+
+def _gradient_cosine(left, right):
+    left_norm = torch.linalg.vector_norm(left)
+    right_norm = torch.linalg.vector_norm(right)
+    if float(left_norm) == 0.0 or float(right_norm) == 0.0:
+        return None
+    return float(torch.dot(left, right) / (left_norm * right_norm))
+
+
+def summarize_material_gradient_conflict(material_gradients):
+    """Summarize B3a per-material mean gradients by norm and pairwise cosine."""
+    if not isinstance(material_gradients, dict) or set(material_gradients) != set(
+        _GRADIENT_MATERIAL_COUNTS
+    ):
+        raise ValueError("material gradients must contain elastic, plasticine, and sand")
+
+    sample_counts = {}
+    validated = {}
+    parameter_names = None
+    parameter_shapes = None
+    for material, expected_count in _GRADIENT_MATERIAL_COUNTS.items():
+        payload = material_gradients[material]
+        if not isinstance(payload, dict):
+            raise ValueError(f"{material} gradient payload must be a dictionary")
+        sample_count = payload.get("sample_count")
+        if sample_count != expected_count or isinstance(sample_count, bool):
+            raise ValueError(
+                f"{material} sample_count must equal the frozen count {expected_count}"
+            )
+        named = payload.get("named_gradients")
+        if not isinstance(named, dict) or not named:
+            raise ValueError(f"{material} named_gradients must be non-empty")
+        names = tuple(named)
+        if parameter_names is None:
+            parameter_names = names
+            parameter_shapes = {name: value.shape for name, value in named.items()}
+        elif names != parameter_names:
+            raise ValueError("gradient parameter names and order must agree by material")
+
+        material_values = {}
+        for name, value in named.items():
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"gradient must be a tensor: {material}.{name}")
+            value = value.detach().to(device="cpu", dtype=torch.float64)
+            if value.shape != parameter_shapes[name]:
+                raise ValueError(f"gradient shape must agree by material: {name}")
+            if not torch.isfinite(value).all():
+                raise ValueError(f"gradient must be finite: {material}.{name}")
+            material_values[name] = value.clone()
+        validated[material] = material_values
+        sample_counts[material] = int(sample_count)
+
+    groups = _parameter_groups_from_names(parameter_names)
+    vectors = {
+        material: _gradient_group_vectors(named, groups)
+        for material, named in validated.items()
+    }
+    group_summary = {}
+    for group in groups:
+        group_summary[group] = {
+            "gradient_norms": {
+                material: float(torch.linalg.vector_norm(vectors[material][group]))
+                for material in _GRADIENT_MATERIAL_COUNTS
+            },
+            "pairwise_cosine": {
+                f"{left}__{right}": _gradient_cosine(
+                    vectors[left][group], vectors[right][group]
+                )
+                for left, right in _GRADIENT_PAIRS
+            },
+        }
+
+    stage_scale_gradients = {}
+    for material, named in validated.items():
+        stage_values = named["stage_scales"].reshape(-1)
+        if stage_values.numel() != 4:
+            raise ValueError("stage_scales gradient must contain exactly four values")
+        stage_scale_gradients[material] = [float(value) for value in stage_values]
+    return {
+        "sample_counts": sample_counts,
+        "groups": group_summary,
+        "stage_scale_gradients": stage_scale_gradients,
+    }
 
 
 def _finite_number(value, field):
