@@ -254,15 +254,17 @@ class TrajDataset(Dataset):
         return model_data, model_info
     
     def get_deform_diff(self, index):
-        
-        model = self.models[index]
+        return self.get_deform_diff_from_spec(self.models[index])
+
+    def get_deform_diff_from_spec(self, model):
         model_name = model["model"]
         start_idx = model["start_idx"]
         if start_idx == -2:  # contact-aware random window
             candidates = model["contact_starts"]
             start_idx = int(candidates[np.random.randint(0, len(candidates))])
-        elif start_idx < 0:   # random-window mode: draw a start over [0, max_start]
-            start_idx = int(np.random.randint(0, model["max_start"] + 1))
+        elif start_idx < 0:   # random-window mode: draw a start over [min_start, max_start]
+            min_start = int(model.get("min_start", 0))
+            start_idx = int(np.random.randint(min_start, model["max_start"] + 1))
 
         input_indices = np.arange(start_idx, start_idx + self.input_frames * self.n_frames_interval, self.n_frames_interval)
         output_indices = np.arange(
