@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 
@@ -8,6 +9,7 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 from train_material_stage_gates import create_gate_model
+from model.spacetime import MDM_ST
 from utils.material_stage_gate_training import (
     calibrate_material_rows,
     frame_loss_weights,
@@ -267,6 +269,8 @@ class MaterialBestRowTrackerTest(unittest.TestCase):
         self.assertFalse(tracker.should_validate(24))
         self.assertTrue(tracker.should_validate(25))
 
+        tracker.record_identity(0, 6.0, torch.zeros(4))
+        self.assertEqual(tracker.best_update[0], 0)
         self.assertFalse(tracker.observe(0, 25, 5.0, torch.full((4,), 0.25)))
         self.assertFalse(tracker.observe(0, 50, 4.0, torch.full((4,), 0.50)))
         self.assertFalse(tracker.observe(0, 75, 4.1, torch.full((4,), 0.75)))
@@ -278,6 +282,7 @@ class MaterialBestRowTrackerTest(unittest.TestCase):
             torch.full((4,), 0.50),
         )
 
+        tracker.record_identity(1, 3.0, torch.zeros(4))
         self.assertFalse(tracker.observe(1, 25, 2.0, torch.full((4,), -0.25)))
         self.assertEqual(tracker.best_update[1], 25)
         torch.testing.assert_close(
@@ -287,8 +292,14 @@ class MaterialBestRowTrackerTest(unittest.TestCase):
 
     def test_rejects_observations_outside_validation_schedule(self):
         tracker = MaterialBestRowTracker(3, 4, validation_interval=25, patience=3)
+        tracker.record_identity(0, 2.0, torch.zeros(4))
         with self.assertRaisesRegex(ValueError, "validation interval"):
             tracker.observe(0, 24, 1.0, torch.zeros(4))
+
+    def test_requires_identity_baseline_before_post_update_observation(self):
+        tracker = MaterialBestRowTracker(3, 4, validation_interval=25, patience=3)
+        with self.assertRaisesRegex(RuntimeError, "identity"):
+            tracker.observe(0, 25, 1.0, torch.zeros(4))
 
 
 class GateArtifactTest(unittest.TestCase):
@@ -320,7 +331,13 @@ class GateArtifactTest(unittest.TestCase):
                 root,
                 split_manifest=manifest,
                 training_history=history,
-                metadata={"base_checkpoint": "base/model.safetensors"},
+                metadata={
+                    "base_checkpoint": "base/model.safetensors",
+                    "identity_scores": [0.3, 0.2, 0.1],
+                    "best_updates": [25, 0, 50],
+                    "best_scores": [0.2, 0.2, 0.05],
+                    "seed": 0,
+                },
             )
 
             expected = [
@@ -339,6 +356,11 @@ class GateArtifactTest(unittest.TestCase):
             for key, value in model.state_dict().items():
                 torch.testing.assert_close(restored[key], value)
             del restored
+            with open(os.path.join(root, "best_gates.json"), encoding="utf-8") as handle:
+                gate_audit = json.load(handle)
+            self.assertEqual(gate_audit["identity_scores"], [0.3, 0.2, 0.1])
+            self.assertEqual(gate_audit["best_updates"], [25, 0, 50])
+            self.assertEqual(gate_audit["seed"], 0)
 
 
 class CalibrationModel(nn.Module):
@@ -408,8 +430,9 @@ class CalibrationOrchestrationTest(unittest.TestCase):
         self.assertLess(model.gate_logits[0].mean().item(), 0.0)
         self.assertAlmostEqual(model.gate_logits[1].mean().item(), 0.0, places=6)
         self.assertGreater(model.gate_logits[2].mean().item(), 0.0)
-        self.assertEqual(result["best_updates"], [2, 1, 2])
-        self.assertEqual(len(result["history"]), 12)
+        self.assertEqual(result["best_updates"], [2, 0, 2])
+        self.assertEqual(len(result["identity_scores"]), 3)
+        self.assertEqual(len(result["history"]), 15)
         self.assertFalse(model.backbone.requires_grad)
         self.assertTrue(model.gate_logits.requires_grad)
 
@@ -470,6 +493,81 @@ class GateTrainerCliTest(unittest.TestCase):
         disabled.model_config.material_stage_gate = False
         with self.assertRaisesRegex(ValueError, "material_stage_gate"):
             create_gate_model(disabled)
+
+
+class RealModelGateCalibrationSmokeTest(unittest.TestCase):
+    def test_load_rollout_update_save_and_reload_changes_only_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = GateTrainerCliTest.small_config()
+            b3a_config = OmegaConf.create(
+                OmegaConf.to_container(config.model_config, resolve=True)
+            )
+            b3a_config.cond_frames = 5
+            b3a_config.material_stage_gate = False
+            b3a = MDM_ST(2, 1, 3, b3a_config).eval()
+            with torch.no_grad():
+                b3a.dit.material_state_exchange.output_proj.weight.fill_(0.01)
+                b3a.dit.material_state_exchange.output_proj.bias.fill_(0.001)
+            base_checkpoint = os.path.join(root, "b3a.safetensors")
+            save_file(
+                {
+                    key: value.detach().cpu().contiguous()
+                    for key, value in b3a.state_dict().items()
+                },
+                base_checkpoint,
+            )
+
+            b3b = create_gate_model(config).eval()
+            load_b3a_into_b3b(b3b, base_checkpoint)
+            gate = freeze_for_gate_training(b3b)
+            frozen_before = {
+                key: value.detach().clone()
+                for key, value in b3b.state_dict().items()
+                if not key.endswith("gate_logits")
+            }
+            sample = rollout_sample()
+            sample["mat_type"] = torch.tensor([1], dtype=torch.long)
+            sample["future_gt"] = torch.randn(1, 2, 2, 3)
+            optimizer = torch.optim.Adam([gate], lr=1.0e-2)
+            optimizer.zero_grad(set_to_none=True)
+            gate_rollout_loss(
+                b3b,
+                sample,
+                material_id=1,
+                backward=True,
+                noise_seed=0,
+            )
+            optimizer.step()
+
+            self.assertGreater(torch.count_nonzero(gate).item(), 0)
+            for key, expected in frozen_before.items():
+                torch.testing.assert_close(
+                    b3b.state_dict()[key],
+                    expected,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+
+            output_dir = os.path.join(root, "artifacts")
+            save_gate_artifacts(
+                b3b,
+                output_dir,
+                split_manifest={"seed": 0, "train_fraction": 0.8, "materials": {}},
+                training_history=[],
+                metadata={"base_checkpoint": base_checkpoint},
+            )
+            restored_state = load_file(
+                os.path.join(output_dir, "checkpoint-best", "model.safetensors")
+            )
+            restored = create_gate_model(GateTrainerCliTest.small_config()).eval()
+            incompatible = restored.load_state_dict(restored_state, strict=True)
+            self.assertEqual(incompatible.missing_keys, [])
+            self.assertEqual(incompatible.unexpected_keys, [])
+            torch.testing.assert_close(
+                restored.dit.material_state_exchange.gate_logits,
+                b3b.dit.material_state_exchange.gate_logits,
+            )
+            del restored_state
 
 
 if __name__ == "__main__":

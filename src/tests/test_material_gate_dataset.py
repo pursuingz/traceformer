@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 
@@ -156,6 +157,28 @@ class MaterialSplitTest(unittest.TestCase):
                     train_fraction=0.8,
                     seed=0,
                 )
+
+    def test_dataset_list_rejects_paths_outside_train_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            os.makedirs(dataset_path)
+            dataset_list = os.path.join(root, "list.json")
+            with open(dataset_list, "w", encoding="utf-8") as handle:
+                json.dump(["../mm3_test/elastic_000.h5"], handle)
+
+            with self.assertRaisesRegex(ValueError, "plain H5 basenames"):
+                build_material_split(dataset_path, dataset_list, seed=0)
+
+    def test_dataset_list_rejects_duplicate_models(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            os.makedirs(dataset_path)
+            dataset_list = os.path.join(root, "list.json")
+            with open(dataset_list, "w", encoding="utf-8") as handle:
+                json.dump(["elastic_000.h5", "elastic_000.h5"], handle)
+
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                build_material_split(dataset_path, dataset_list, seed=0)
 
 
 class MaterialGateDatasetTest(unittest.TestCase):

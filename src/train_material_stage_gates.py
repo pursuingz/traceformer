@@ -135,6 +135,9 @@ def run(config):
             training_history=result["history"],
             metadata={
                 "base_checkpoint": str(config.base_checkpoint),
+                "seed": int(config.get("seed", 0)),
+                "gate_split_seed": int(config.gate_split_seed),
+                "identity_scores": result["identity_scores"],
                 "best_updates": result["best_updates"],
                 "best_scores": result["best_scores"],
                 "material_names": MATERIAL_NAMES,

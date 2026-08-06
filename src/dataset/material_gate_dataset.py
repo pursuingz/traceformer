@@ -16,8 +16,29 @@ MATERIAL_NAMES = {0: "elastic", 1: "plasticine", 2: "sand"}
 def _model_names(dataset_path, dataset_list):
     if dataset_list and os.path.exists(dataset_list):
         with open(dataset_list, "r", encoding="utf-8") as handle:
-            return list(json.load(handle))
-    return sorted(name for name in os.listdir(dataset_path) if name.endswith(".h5"))
+            names = list(json.load(handle))
+    else:
+        names = sorted(name for name in os.listdir(dataset_path) if name.endswith(".h5"))
+
+    dataset_root = os.path.realpath(dataset_path)
+    seen = set()
+    for name in names:
+        if (
+            not isinstance(name, str)
+            or name != os.path.basename(name)
+            or not name.endswith(".h5")
+        ):
+            raise ValueError("dataset_list entries must be plain H5 basenames")
+        if name in seen:
+            raise ValueError(f"dataset_list contains duplicate model {name!r}")
+        seen.add(name)
+    for name in names:
+        resolved = os.path.realpath(os.path.join(dataset_root, name))
+        if os.path.commonpath((dataset_root, resolved)) != dataset_root:
+            raise ValueError("dataset_list entries must stay inside mm3_train")
+        if not os.path.isfile(resolved):
+            raise ValueError(f"dataset model does not exist: {name}")
+    return names
 
 
 def build_material_split(dataset_path, dataset_list, train_fraction=0.8, seed=0):

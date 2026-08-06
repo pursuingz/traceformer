@@ -120,6 +120,46 @@ class B3MaterialStateConfigTest(unittest.TestCase):
         )
         self.assertEqual(parsed.profile, "b3a90")
 
+    def test_b3b_screen_changes_only_material_stage_gate_model_fields(self):
+        b3a = flatten(
+            self.load("config_mm3_b3a_material_state_adapter.yaml").model_config
+        )
+        b3b_config = self.load("config_mm3_b3b_material_stage_gate_screen.yaml")
+        b3b = flatten(b3b_config.model_config)
+        differing = {
+            key
+            for key in set(b3a) | set(b3b)
+            if b3a.get(key) != b3b.get(key)
+        }
+        self.assertEqual(
+            differing,
+            {"material_stage_gate", "material_stage_gate_max"},
+        )
+        self.assertEqual(b3b_config.base_checkpoint,
+            "outputs/mm3_b3a_material_state_adapter_8L/checkpoint-90000/model.safetensors")
+        self.assertEqual(b3b_config.train_dataset.dataset_path, "mm3_data/mm3_train")
+        self.assertEqual(b3b_config.gate_batch_size, 1)
+        self.assertEqual(b3b_config.gate_start0_probability, 0.5)
+        self.assertEqual(b3b_config.gate_max_rollout_steps, 20)
+        self.assertEqual(b3b_config.gate_updates_per_material, 200)
+
+    def test_b3b_eval_mirrors_screen_model_and_uses_dev_test_once(self):
+        train = self.load("config_mm3_b3b_material_stage_gate_screen.yaml")
+        evaluate = self.load("eval_mm3_b3b_material_stage_gate_screen.yaml")
+        self.assertEqual(
+            OmegaConf.to_container(train.model_config, resolve=True),
+            OmegaConf.to_container(evaluate.model_config, resolve=True),
+        )
+        self.assertEqual(evaluate.train_dataset.dataset_path, "mm3_data/mm3_test")
+        self.assertEqual(evaluate.train_dataset.input_frames, 5)
+        self.assertEqual(evaluate.train_dataset.output_frames, 1)
+        self.assertFalse(evaluate.use_diffusion)
+        self.assertEqual(evaluate.num_inference_steps, 1)
+        self.assertEqual(
+            evaluate.resume,
+            "outputs/mm3_b3b_material_stage_gate_screen/checkpoint-best/model.safetensors",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

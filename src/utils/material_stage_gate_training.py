@@ -229,6 +229,7 @@ class MaterialBestRowTracker:
         self.validation_interval = int(validation_interval)
         self.patience = int(patience)
         self.best_scores = [float("inf")] * self.num_materials
+        self.identity_scores = [None] * self.num_materials
         self.best_update = [None] * self.num_materials
         self.best_rows = torch.zeros(self.num_materials, self.num_stages)
         self.bad_counts = [0] * self.num_materials
@@ -236,11 +237,27 @@ class MaterialBestRowTracker:
     def should_validate(self, update):
         return update > 0 and update % self.validation_interval == 0
 
+    def record_identity(self, material_id, score, row):
+        if not 0 <= material_id < self.num_materials:
+            raise ValueError("material_id is out of range")
+        if self.identity_scores[material_id] is not None:
+            raise RuntimeError(f"identity baseline already recorded for material {material_id}")
+        row = row.detach().cpu().reshape(-1)
+        if row.numel() != self.num_stages:
+            raise ValueError("gate row has the wrong number of stages")
+        self.identity_scores[material_id] = float(score)
+        self.best_scores[material_id] = float(score)
+        self.best_update[material_id] = 0
+        self.best_rows[material_id].copy_(row)
+        self.bad_counts[material_id] = 0
+
     def observe(self, material_id, update, score, row):
         if not self.should_validate(update):
             raise ValueError("observation update must match the validation interval")
         if not 0 <= material_id < self.num_materials:
             raise ValueError("material_id is out of range")
+        if self.identity_scores[material_id] is None:
+            raise RuntimeError("identity baseline must be recorded before gate updates")
         row = row.detach().cpu().reshape(-1)
         if row.numel() != self.num_stages:
             raise ValueError("gate row has the wrong number of stages")
@@ -292,16 +309,17 @@ def save_gate_artifacts(
         "gate_logits": gate_logits.tolist(),
         "gates": gates.tolist(),
     }
+    gate_audit = dict(metadata)
+    gate_audit.update(gate_payload)
     with open(os.path.join(output_dir, "best_gates.json"), "w", encoding="utf-8") as handle:
-        json.dump(gate_payload, handle, indent=2)
+        json.dump(gate_audit, handle, indent=2, ensure_ascii=False)
 
     state = {
         key: value.detach().cpu().contiguous()
         for key, value in unwrapped.state_dict().items()
     }
     save_file(state, os.path.join(checkpoint_dir, "model.safetensors"))
-    gate_metadata = dict(metadata)
-    gate_metadata.update(gate_payload)
+    gate_metadata = gate_audit
     with open(
         os.path.join(checkpoint_dir, "gate_metadata.json"),
         "w",
@@ -382,6 +400,29 @@ def calibrate_material_rows(
     for material_id in range(3):
         if material_id not in train_loaders or material_id not in val_loaders:
             raise ValueError(f"missing train/val loader for material {material_id}")
+        identity_metrics = _validation_metrics(
+            model,
+            val_loaders[material_id],
+            material_id,
+            long_weight,
+            reg_weight,
+            accelerator,
+            noise_seed,
+        )
+        tracker.record_identity(
+            material_id,
+            identity_metrics["score"],
+            gate[material_id],
+        )
+        history.append(
+            {
+                "material": material_id,
+                "update": 0,
+                "split": "val_identity",
+                **identity_metrics,
+            }
+        )
+
         row_mask = torch.zeros_like(gate)
         row_mask[material_id] = 1.0
         hook = gate.register_hook(lambda gradient, mask=row_mask: gradient * mask)
@@ -464,6 +505,7 @@ def calibrate_material_rows(
 
     return {
         "history": history,
+        "identity_scores": list(tracker.identity_scores),
         "best_updates": list(tracker.best_update),
         "best_scores": list(tracker.best_scores),
         "best_rows": tracker.best_rows.clone(),
