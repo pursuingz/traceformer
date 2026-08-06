@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 from model.contact_adapter import FactorizedContactAdapter
 from model.dit import *
 from model.hybrid_state import HybridStateExchange, compute_explicit_frame_state
+from model.material_adaln import ContinuousMaterialConditioner
 from model.material_state import FactorizedMaterialStateAdapter
 from diffusers.models.embeddings import LabelEmbedding 
 from utils.contact import (
@@ -2140,6 +2141,13 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         material_state_runtime_scale: float = 1.0,
         material_stage_gate: bool = False,
         material_stage_gate_max: float = 2.0,
+        material_adaln_cond: bool = False,
+        material_adaln_hidden_dim: int = 64,
+        material_adaln_e_center: float = 5.5,
+        material_adaln_e_scale: float = 1.0,
+        material_adaln_nu_center: float = 0.25,
+        material_adaln_nu_scale: float = 0.15,
+        material_adaln_runtime_scale: float = 1.0,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -2284,6 +2292,18 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     gated_materials=3,
                     gate_max=material_stage_gate_max,
                 )
+        self.material_adaln_enabled = bool(material_adaln_cond)
+        self.material_adaln_runtime_scale = float(material_adaln_runtime_scale)
+        if self.material_adaln_enabled:
+            with torch.random.fork_rng(devices=[]):
+                self.material_conditioner = ContinuousMaterialConditioner(
+                    output_dim=time_embed_dim,
+                    hidden_dim=material_adaln_hidden_dim,
+                    e_center=material_adaln_e_center,
+                    e_scale=material_adaln_e_scale,
+                    nu_center=material_adaln_nu_center,
+                    nu_scale=material_adaln_nu_scale,
+                )
         self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
 
         # 4. Output blocks
@@ -2407,6 +2427,13 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
             assert class_labels is not None
             class_labels = self.class_embedder(class_labels, force_drop_ids=force_drop_ids) # (N, D)
             emb = emb + class_labels
+
+        if self.material_adaln_enabled:
+            if material_values is None:
+                raise ValueError("continuous material AdaLN requires material_values")
+            material_emb = self.material_conditioner(material_values)
+            material_emb = material_emb.to(dtype=emb.dtype, device=emb.device)
+            emb = emb + self.material_adaln_runtime_scale * material_emb
 
         if self.ofs_embedding is not None:
             ofs_emb = self.ofs_proj(ofs)
@@ -2750,6 +2777,13 @@ class MDM_ST(nn.Module):
         self.material_state_adapter = bool(
             model_config.get('material_state_adapter', False)
         )
+        self.material_adaln_cond = bool(
+            model_config.get("material_adaln_cond", False)
+        )
+        if self.material_adaln_cond and self.material_state_adapter:
+            raise ValueError(
+                "material_adaln_cond and material_state_adapter are mutually exclusive"
+            )
         self.material_stage_gate = bool(
             model_config.get('material_stage_gate', False)
         )
@@ -2856,6 +2890,25 @@ class MDM_ST(nn.Module):
                 material_stage_gate_max=model_config.get(
                     'material_stage_gate_max', 2.0
                 ),
+                material_adaln_cond=self.material_adaln_cond,
+                material_adaln_hidden_dim=model_config.get(
+                    'material_adaln_hidden_dim', 64
+                ),
+                material_adaln_e_center=model_config.get(
+                    'material_adaln_e_center', 5.5
+                ),
+                material_adaln_e_scale=model_config.get(
+                    'material_adaln_e_scale', 1.0
+                ),
+                material_adaln_nu_center=model_config.get(
+                    'material_adaln_nu_center', 0.25
+                ),
+                material_adaln_nu_scale=model_config.get(
+                    'material_adaln_nu_scale', 0.15
+                ),
+                material_adaln_runtime_scale=model_config.get(
+                    'material_adaln_runtime_scale', 1.0
+                ),
             )
         
         self._init_weights()
@@ -2909,6 +2962,11 @@ class MDM_ST(nn.Module):
                 dim=1,
             )
             material_classes = y.reshape(bs)
+        elif self.material_adaln_cond:
+            material_values = torch.cat(
+                (E.reshape(bs, -1)[:, :1], nu.reshape(bs, -1)[:, :1]),
+                dim=1,
+            )
 
         force = force.unsqueeze(1) if force.ndim == 2 else force
         drag_point = drag_point.unsqueeze(1) if drag_point.ndim == 2 else drag_point
@@ -3131,6 +3189,8 @@ class MDM_ST(nn.Module):
                     "material_values": material_values,
                     "material_classes": material_classes,
                 })
+            if self.material_adaln_cond:
+                dit_kwargs["material_values"] = material_values
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, class_labels=y, indices=base_indices, strain_feats=strain_feats, rest_indices=rest_indices, grid_assign=grid_assign, **dit_kwargs).reshape(bs, -1, n_points, 3)[:, self.cond_frame:]
         else:
             output = self.dit(hidden_states, encoder_hidden_states, timesteps, indices=indices).reshape(bs, -1, n_points, 3)
