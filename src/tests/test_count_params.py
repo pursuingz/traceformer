@@ -129,5 +129,39 @@ class MaterialStateParameterValidationTests(unittest.TestCase):
             self.assertTrue(torch.equal(base_state[name], candidate_state[name]), name)
 
 
+class MaterialStageGateParameterValidationTests(unittest.TestCase):
+    def test_b3b_adds_exactly_twelve_gate_parameters(self):
+        b3a = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_injection_mode="separate",
+            material_state_adapter=True,
+            material_state_rank=64,
+            material_state_interval=2,
+        )
+        b3b = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_injection_mode="separate",
+            material_state_adapter=True,
+            material_state_rank=64,
+            material_state_interval=2,
+            material_stage_gate=True,
+            material_stage_gate_max=2.0,
+        )
+
+        report = count_params.validate_material_stage_gate_parameter_budget(
+            b3a,
+            b3b,
+        )
+
+        self.assertEqual(report["signed_delta"], 12)
+        self.assertEqual(report["gate_params"], 12)
+        self.assertEqual(
+            report["candidate_only"],
+            ["dit.material_state_exchange.gate_logits"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

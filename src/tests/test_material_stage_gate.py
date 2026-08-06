@@ -1,8 +1,10 @@
 import unittest
 
 import torch
+from omegaconf import OmegaConf
 
 from model.material_state import FactorizedMaterialStateAdapter
+from model.spacetime import MDM_ST
 
 
 class MaterialStageGateMathTest(unittest.TestCase):
@@ -87,6 +89,95 @@ class MaterialStageGateMathTest(unittest.TestCase):
                 material_stage_gate=True,
                 gate_max=0.0,
             )
+
+
+class MaterialStageGateIntegrationTest(unittest.TestCase):
+    @staticmethod
+    def small_config(*, adapter: bool = True, gate: bool = False):
+        return OmegaConf.create(
+            {
+                "n_layers": 2,
+                "latent_dim": 64,
+                "frame_cond": True,
+                "cond_frames": 5,
+                "point_embed": True,
+                "mask_cond": True,
+                "pred_offset": True,
+                "num_neighbors": -1,
+                "floor_cond": False,
+                "max_num_forces": 1,
+                "force_as_token": False,
+                "force_as_latent": False,
+                "gravity_emb": False,
+                "coeff_cond": False,
+                "num_mat": 4,
+                "class_token": True,
+                "class_dropout_prob": 0.0,
+                "transformer_block": "SpatialTemporalTransformerBlock",
+                "material_state_adapter": adapter,
+                "material_state_rank": 16,
+                "material_state_interval": 1,
+                "material_stage_gate": gate,
+                "material_stage_gate_max": 2.0,
+            }
+        )
+
+    @staticmethod
+    def small_inputs():
+        return {
+            "x": torch.randn(1, 1, 2, 3),
+            "timesteps": torch.zeros(1, dtype=torch.long),
+            "init_pc": torch.randn(1, 5, 2, 3),
+            "force": torch.randn(1, 3),
+            "E": torch.tensor([[5.5]]),
+            "nu": torch.tensor([[0.25]]),
+            "drag_mask": torch.zeros(1, 1, 2, 1),
+            "drag_point": torch.zeros(1, 4),
+            "floor_height": None,
+            "y": torch.tensor([1]),
+        }
+
+    def test_disabled_b3a_state_dict_has_no_gate_parameter(self):
+        model = MDM_ST(2, 1, 3, self.small_config(gate=False))
+        self.assertNotIn(
+            "dit.material_state_exchange.gate_logits",
+            model.state_dict(),
+        )
+
+    def test_b3a_checkpoint_loads_with_only_gate_missing(self):
+        b3a = MDM_ST(2, 1, 3, self.small_config(gate=False)).eval()
+        b3b = MDM_ST(2, 1, 3, self.small_config(gate=True)).eval()
+
+        incompatible = b3b.load_state_dict(b3a.state_dict(), strict=False)
+
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertEqual(
+            incompatible.missing_keys,
+            ["dit.material_state_exchange.gate_logits"],
+        )
+
+    def test_identity_gate_matches_nonzero_b3a_forward(self):
+        torch.manual_seed(17)
+        b3a = MDM_ST(2, 1, 3, self.small_config(gate=False)).eval()
+        with torch.no_grad():
+            b3a.dit.material_state_exchange.output_proj.weight.fill_(0.01)
+            b3a.dit.material_state_exchange.output_proj.bias.fill_(0.001)
+        b3b = MDM_ST(2, 1, 3, self.small_config(gate=True)).eval()
+        incompatible = b3b.load_state_dict(b3a.state_dict(), strict=False)
+        self.assertEqual(
+            incompatible.missing_keys,
+            ["dit.material_state_exchange.gate_logits"],
+        )
+
+        inputs = self.small_inputs()
+        with torch.no_grad():
+            expected = b3a(**inputs)
+            actual = b3b(**inputs)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-7)
+
+    def test_gate_requires_material_state_adapter(self):
+        with self.assertRaisesRegex(ValueError, "material-state adapter"):
+            MDM_ST(2, 1, 3, self.small_config(adapter=False, gate=True))
 
 
 if __name__ == "__main__":

@@ -262,6 +262,43 @@ def validate_material_state_parameter_budget(baseline, candidate):
     }
 
 
+def validate_material_stage_gate_parameter_budget(b3a, b3b):
+    b3a_total = count(b3a)
+    b3b_total = count(b3b)
+    b3a_parameters = dict(b3a.named_parameters())
+    b3b_parameters = dict(b3b.named_parameters())
+    b3a_only = set(b3a_parameters) - set(b3b_parameters)
+    candidate_only = set(b3b_parameters) - set(b3a_parameters)
+    expected_only = {"dit.material_state_exchange.gate_logits"}
+
+    if b3a_only:
+        raise RuntimeError(f"B3b removed B3a parameters: {sorted(b3a_only)}")
+    if candidate_only != expected_only:
+        raise RuntimeError(
+            "B3b must add only material-stage gate logits: "
+            f"{sorted(candidate_only)}"
+        )
+    for name, parameter in b3a_parameters.items():
+        if parameter.shape != b3b_parameters[name].shape:
+            raise RuntimeError(f"B3b changed shared parameter shape: {name}")
+
+    gate = b3b_parameters["dit.material_state_exchange.gate_logits"]
+    gate_params = gate.numel()
+    signed_delta = b3b_total - b3a_total
+    if gate_params != 12 or signed_delta != gate_params:
+        raise RuntimeError(
+            "B3b must add exactly twelve gate parameters: "
+            f"delta={signed_delta}, gate={gate_params}"
+        )
+    return {
+        "b3a_total": b3a_total,
+        "b3b_total": b3b_total,
+        "signed_delta": signed_delta,
+        "gate_params": gate_params,
+        "candidate_only": sorted(candidate_only),
+    }
+
+
 def validate_contact_parameter_budget(baseline, separate, shared):
     expected_contact_parameter_names = {
         'contact_encoder.weight',
@@ -542,6 +579,29 @@ def main():
         f'adapter={b3_report["adapter_params"]:,}  '
         f'rank={b3_report["rank"]}  stages={b3_report["stage_count"]}  '
         f'interval={b3_report["interval"]}'
+    )
+
+    b3b_mm3 = build_mm3(
+        'SpatialTemporalTransformerBlock',
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='separate',
+        material_state_adapter=True,
+        material_state_rank=64,
+        material_state_interval=2,
+        material_stage_gate=True,
+        material_stage_gate_max=2.0,
+    )
+    b3b_report = validate_material_stage_gate_parameter_budget(
+        b3_mm3,
+        b3b_mm3,
+    )
+    print('--- B3b material-stage gate exact parameter budget ---')
+    print(
+        f'B3a={b3b_report["b3a_total"]:,}  '
+        f'B3b={b3b_report["b3b_total"]:,}  '
+        f'gate={b3b_report["gate_params"]:,}  '
+        f'delta={b3b_report["signed_delta"]:+,}'
     )
 
     # Preserve the historical five-output-frame v_xyz comparison.

@@ -2138,6 +2138,8 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
         material_state_nu_center: float = 0.25,
         material_state_nu_scale: float = 0.15,
         material_state_runtime_scale: float = 1.0,
+        material_stage_gate: bool = False,
+        material_stage_gate_max: float = 2.0,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -2278,6 +2280,9 @@ class SpaitalTemporalTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     e_scale=material_state_e_scale,
                     nu_center=material_state_nu_center,
                     nu_scale=material_state_nu_scale,
+                    material_stage_gate=material_stage_gate,
+                    gated_materials=3,
+                    gate_max=material_stage_gate_max,
                 )
         self.norm_final = nn.LayerNorm(inner_dim, norm_eps, norm_elementwise_affine)
 
@@ -2745,6 +2750,13 @@ class MDM_ST(nn.Module):
         self.material_state_adapter = bool(
             model_config.get('material_state_adapter', False)
         )
+        self.material_stage_gate = bool(
+            model_config.get('material_stage_gate', False)
+        )
+        if self.material_stage_gate and not self.material_state_adapter:
+            raise ValueError(
+                "material-stage gate requires material-state adapter"
+            )
         if self.material_state_adapter:
             if self.num_mat != 4:
                 raise ValueError(
@@ -2839,6 +2851,10 @@ class MDM_ST(nn.Module):
                 material_state_nu_scale=model_config.get('material_state_nu_scale', 0.15),
                 material_state_runtime_scale=model_config.get(
                     'material_state_runtime_scale', 1.0
+                ),
+                material_stage_gate=self.material_stage_gate,
+                material_stage_gate_max=model_config.get(
+                    'material_stage_gate_max', 2.0
                 ),
             )
         
