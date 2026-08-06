@@ -157,7 +157,11 @@ def summarize_material_gradient_conflict(material_gradients):
         if not isinstance(payload, dict):
             raise ValueError(f"{material} gradient payload must be a dictionary")
         sample_count = payload.get("sample_count")
-        if sample_count != expected_count or isinstance(sample_count, bool):
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, (int, np.integer))
+            or sample_count != expected_count
+        ):
             raise ValueError(
                 f"{material} sample_count must equal the frozen count {expected_count}"
             )
