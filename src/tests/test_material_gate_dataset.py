@@ -239,6 +239,34 @@ class MaterialGateDatasetTest(unittest.TestCase):
             self.assertGreaterEqual(min(starts), 1)
             self.assertLessEqual(max(starts), 19)
 
+    def test_validation_random_start_is_seeded_once_and_stays_fixed(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset_path = os.path.join(root, "mm3_train")
+            os.makedirs(dataset_path)
+            model_name = "elastic_000.h5"
+            write_model(os.path.join(dataset_path, model_name), 0)
+            first = MaterialGateDataset(
+                make_dataset_config(dataset_path),
+                [model_name],
+                seed=11,
+                max_rollout_steps=20,
+                resample_random_start=False,
+            )
+            repeated = MaterialGateDataset(
+                make_dataset_config(dataset_path),
+                [model_name],
+                seed=11,
+                max_rollout_steps=20,
+                resample_random_start=False,
+            )
+
+            self.assertEqual(first.sample_specs, repeated.sample_specs)
+            fixed_start = first.sample_specs[1]["start_idx"]
+            self.assertGreaterEqual(fixed_start, 1)
+            self.assertLessEqual(fixed_start, 19)
+            self.assertEqual(int(first[1][0]["start_idx"]), fixed_start)
+            self.assertEqual(int(first[1][0]["start_idx"]), fixed_start)
+
 
 if __name__ == "__main__":
     unittest.main()

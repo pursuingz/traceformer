@@ -59,7 +59,14 @@ def build_material_split(dataset_path, dataset_list, train_fraction=0.8, seed=0)
 
 
 class MaterialGateDataset(Dataset):
-    def __init__(self, dataset_cfg, model_names, seed=0, max_rollout_steps=20):
+    def __init__(
+        self,
+        dataset_cfg,
+        model_names,
+        seed=0,
+        max_rollout_steps=20,
+        resample_random_start=True,
+    ):
         if os.path.basename(os.path.normpath(dataset_cfg.dataset_path)) != "mm3_train":
             raise ValueError("material-gate calibration must read an mm3_train dataset")
         if int(dataset_cfg.get("output_frames", 1)) != 1:
@@ -74,6 +81,7 @@ class MaterialGateDataset(Dataset):
         self.norm_fac = float(dataset_cfg.norm_fac)
         self.max_rollout_steps = int(max_rollout_steps)
         self.seed = int(seed)
+        random_start_generator = random.Random(self.seed)
         self.sample_specs = []
 
         for model_name in model_names:
@@ -84,16 +92,20 @@ class MaterialGateDataset(Dataset):
                 raise ValueError(
                     f"{model_name} does not have enough frames for both start0 and random windows"
                 )
+            if resample_random_start:
+                random_spec = {
+                    "model": model_name,
+                    "start_idx": -1,
+                    "min_start": 1,
+                    "max_start": max_start,
+                }
+            else:
+                random_spec = {
+                    "model": model_name,
+                    "start_idx": random_start_generator.randint(1, max_start),
+                }
             self.sample_specs.extend(
-                [
-                    {"model": model_name, "start_idx": 0},
-                    {
-                        "model": model_name,
-                        "start_idx": -1,
-                        "min_start": 1,
-                        "max_start": max_start,
-                    },
-                ]
+                [{"model": model_name, "start_idx": 0}, random_spec]
             )
 
     def __len__(self):
