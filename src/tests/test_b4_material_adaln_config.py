@@ -48,6 +48,26 @@ class B4MaterialAdaLNConfigTest(unittest.TestCase):
                 "model_config.material_adaln_runtime_scale",
             },
         )
+        expected_b4_fields = {
+            "material_adaln_cond": True,
+            "material_adaln_hidden_dim": 64,
+            "material_adaln_e_center": 5.5,
+            "material_adaln_e_scale": 1.0,
+            "material_adaln_nu_center": 0.25,
+            "material_adaln_nu_scale": 0.15,
+            "material_adaln_runtime_scale": 1.0,
+        }
+        self.assertEqual(
+            candidate.output_dir,
+            "./outputs/mm3_b4_material_adaln_8L",
+        )
+        self.assertEqual(
+            {
+                key: candidate.model_config[key]
+                for key in expected_b4_fields
+            },
+            expected_b4_fields,
+        )
         self.assertEqual(candidate.max_train_steps, 90000)
         self.assertEqual(candidate.stop_after_steps, 45000)
         self.assertEqual(candidate.model_config.n_layers, 8)
