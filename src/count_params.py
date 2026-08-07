@@ -2,6 +2,7 @@ import sys
 sys.path.append('./')
 from omegaconf import OmegaConf
 from model.hybrid_state import HybridStateExchange
+from model.material_adaln import ContinuousMaterialConditioner
 from model.material_state import FactorizedMaterialStateAdapter
 from model.spacetime import MDM_ST, SpatialTemporalTransformerBlock
 
@@ -296,6 +297,83 @@ def validate_material_stage_gate_parameter_budget(b3a, b3b):
         "signed_delta": signed_delta,
         "gate_params": gate_params,
         "candidate_only": sorted(candidate_only),
+    }
+
+
+def validate_material_adaln_parameter_budget(baseline, candidate):
+    baseline_total = count(baseline)
+    candidate_total = count(candidate)
+    if baseline_total != count_trainable(baseline):
+        raise RuntimeError("baseline total params must equal trainable params")
+    if candidate_total != count_trainable(candidate):
+        raise RuntimeError("B4 total params must equal trainable params")
+
+    blocks = find_blocks(candidate)
+    block_types = [type(block).__name__ for block in blocks]
+    if len(blocks) != 8 or not all(
+        type(block) is SpatialTemporalTransformerBlock for block in blocks
+    ):
+        raise RuntimeError(
+            "B4 must retain eight original serial transformer blocks: "
+            f"{block_types}"
+        )
+
+    conditioners = [
+        module
+        for module in candidate.modules()
+        if isinstance(module, ContinuousMaterialConditioner)
+    ]
+    if len(conditioners) != 1:
+        raise RuntimeError(
+            "B4 must contain exactly one ContinuousMaterialConditioner; "
+            f"got {len(conditioners)}"
+        )
+    conditioner = conditioners[0]
+    conditioner_params = count(conditioner)
+    if conditioner_params != count_trainable(conditioner):
+        raise RuntimeError("B4 conditioner parameters must all be trainable")
+
+    baseline_parameters = dict(baseline.named_parameters())
+    candidate_parameters = dict(candidate.named_parameters())
+    baseline_only = set(baseline_parameters) - set(candidate_parameters)
+    candidate_only = set(candidate_parameters) - set(baseline_parameters)
+    conditioner_parameters = set(conditioner.parameters())
+    conditioner_parameter_names = {
+        name
+        for name, parameter in candidate.named_parameters()
+        if parameter in conditioner_parameters
+    }
+    if baseline_only or candidate_only != conditioner_parameter_names:
+        raise RuntimeError(
+            "B4-only parameters must be exactly the unique conditioner: "
+            f"baseline-only={sorted(baseline_only)}, "
+            f"candidate-only={sorted(candidate_only)}"
+        )
+    for name in baseline_parameters:
+        if baseline_parameters[name].shape != candidate_parameters[name].shape:
+            raise RuntimeError(f"B4 changed shared parameter shape: {name}")
+
+    signed_delta = candidate_total - baseline_total
+    if signed_delta != 16_832 or conditioner_params != 16_832:
+        raise RuntimeError(
+            "B4 parameter delta and unique conditioner must each be 16,832: "
+            f"delta={signed_delta}, conditioner={conditioner_params}"
+        )
+    if signed_delta != conditioner_params:
+        raise RuntimeError(
+            "B4 signed parameter delta must equal the unique conditioner params: "
+            f"{signed_delta} != {conditioner_params}"
+        )
+
+    return {
+        "baseline_total": baseline_total,
+        "candidate_total": candidate_total,
+        "signed_delta": signed_delta,
+        "delta_percent": 100.0 * signed_delta / baseline_total,
+        "conditioner_params": conditioner_params,
+        "conditioner_count": len(conditioners),
+        "block_count": len(blocks),
+        "block_types": block_types,
     }
 
 
@@ -602,6 +680,30 @@ def main():
         f'B3b={b3b_report["b3b_total"]:,}  '
         f'gate={b3b_report["gate_params"]:,}  '
         f'delta={b3b_report["signed_delta"]:+,}'
+    )
+
+    b4_mm3 = build_mm3(
+        'SpatialTemporalTransformerBlock',
+        contact_particle_cond=True,
+        contact_feature_sigma=0.04,
+        contact_injection_mode='separate',
+        material_adaln_cond=True,
+    )
+    b4_report = validate_material_adaln_parameter_budget(
+        separate_contact_mm3,
+        b4_mm3,
+    )
+    print('--- B4 continuous material AdaLN exact parameter budget ---')
+    print(
+        f'baseline={b4_report["baseline_total"]:,} '
+        f'candidate={b4_report["candidate_total"]:,} '
+        f'delta={b4_report["signed_delta"]:+,} '
+        f'({b4_report["delta_percent"]:.6f}%)'
+    )
+    print(
+        f'conditioner={b4_report["conditioner_params"]:,} '
+        f'copies={b4_report["conditioner_count"]} '
+        f'blocks={b4_report["block_count"]}'
     )
 
     # Preserve the historical five-output-frame v_xyz comparison.

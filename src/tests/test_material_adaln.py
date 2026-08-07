@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+import count_params
 from model.material_adaln import ContinuousMaterialConditioner
 
 
@@ -48,6 +49,34 @@ class ContinuousMaterialConditionerTest(unittest.TestCase):
         module(values).sum().backward()
         self.assertGreater(values.grad[0, 0].abs().item(), 0.0)
         self.assertGreater(values.grad[0, 1].abs().item(), 0.0)
+
+    def test_b4_model_has_exact_conditioner_parameter_budget(self):
+        baseline = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+            contact_injection_mode="separate",
+        )
+        candidate = count_params.build_mm3(
+            "SpatialTemporalTransformerBlock",
+            contact_particle_cond=True,
+            contact_feature_sigma=0.04,
+            contact_injection_mode="separate",
+            material_adaln_cond=True,
+        )
+
+        report = count_params.validate_material_adaln_parameter_budget(
+            baseline, candidate
+        )
+
+        self.assertEqual(report["signed_delta"], 16_832)
+        self.assertEqual(report["conditioner_params"], 16_832)
+        self.assertEqual(report["conditioner_count"], 1)
+        self.assertEqual(report["block_count"], 8)
+        self.assertEqual(
+            report["block_types"],
+            ["SpatialTemporalTransformerBlock"] * 8,
+        )
 
 
 if __name__ == "__main__":
