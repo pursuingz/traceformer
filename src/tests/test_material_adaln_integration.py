@@ -70,7 +70,10 @@ class ContinuousMaterialAdaLNIntegrationTest(unittest.TestCase):
         with torch.no_grad():
             expected = baseline(**inputs)
             actual = candidate(**inputs)
-        torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-7)
+        self.assertTrue(
+            torch.equal(actual, expected),
+            "Zero-initialized B4 output must be bitwise identical to baseline.",
+        )
 
     def test_runtime_zero_disables_nonzero_conditioner(self):
         torch.manual_seed(23)
@@ -86,8 +89,9 @@ class ContinuousMaterialAdaLNIntegrationTest(unittest.TestCase):
         model.dit.material_adaln_runtime_scale = 0.0
         disabled = model(**inputs)
         self.assertFalse(torch.equal(enabled, disabled))
-        torch.testing.assert_close(
-            disabled, baseline(**inputs), rtol=0.0, atol=1e-7
+        self.assertTrue(
+            torch.equal(disabled, baseline(**inputs)),
+            "Runtime scale zero must make B4 output bitwise identical to baseline.",
         )
 
     def test_rejects_b3_and_b4_combination(self):
