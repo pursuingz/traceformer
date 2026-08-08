@@ -230,6 +230,11 @@ _SUMMARY_COLUMNS = (
 )
 
 PARAMETER_COLUMNS = ("log10_e", "nu")
+_EXPECTED_SUMMARY_KEYS = tuple(
+    (material, parameter)
+    for material in MATERIAL_NAMES.values()
+    for parameter in PARAMETER_COLUMNS
+)
 _STATIC_NUISANCE_COLUMNS = tuple(
     column for column in NUISANCE_COLUMNS if column not in PARAMETER_COLUMNS
 )
@@ -1717,16 +1722,18 @@ def _as_finite_float(value: object) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
-def _has_invalid_marker(row: dict[str, object]) -> bool:
-    if row.get("valid") is False:
-        return True
-    if str(row.get("status", "")).startswith("invalid"):
-        return True
-    count = _as_finite_float(row.get("invalid_record_count", 0))
-    if count is not None and count > 0:
-        return True
-    invalid_records = row.get("invalid_records")
-    return bool(invalid_records) if invalid_records is not None else False
+def _validate_no_row_invalid_records(rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        if "invalid_record_count" in row:
+            count = _as_finite_float(row.get("invalid_record_count"))
+            if count is None or count != 0.0:
+                raise ValueError(
+                    "invalid file counts must come from metadata.invalid_records"
+                )
+        if row.get("invalid_records"):
+            raise ValueError(
+                "invalid file details must come from metadata.invalid_records"
+            )
 
 
 def _ordered_material_parameter_pairs(
@@ -1734,23 +1741,16 @@ def _ordered_material_parameter_pairs(
     confounding_rows: list[dict[str, object]],
     support_rows: list[dict[str, object]],
 ) -> list[tuple[str, str]]:
-    pairs = {
+    observed_pairs = {
         (str(row["material"]), str(row["parameter"]))
         for rows in (response_rows, confounding_rows, support_rows)
         for row in rows
         if "material" in row and "parameter" in row
     }
-    material_order = {name: index for index, name in enumerate(MATERIAL_NAMES.values())}
-    parameter_order = {name: index for index, name in enumerate(PARAMETER_COLUMNS)}
-    return sorted(
-        pairs,
-        key=lambda pair: (
-            material_order.get(pair[0], len(material_order)),
-            pair[0],
-            parameter_order.get(pair[1], len(parameter_order)),
-            pair[1],
-        ),
-    )
+    unexpected = sorted(observed_pairs - set(_EXPECTED_SUMMARY_KEYS))
+    if unexpected:
+        raise ValueError(f"unexpected material-parameter rows: {unexpected}")
+    return list(_EXPECTED_SUMMARY_KEYS)
 
 
 def _qualifies_primary_response(row: dict[str, object]) -> bool:
@@ -1788,12 +1788,67 @@ def _has_weak_response_evidence(row: dict[str, object]) -> bool:
     )
 
 
+_PRIMARY_CLASSIFICATION_FIELDS = (
+    "delta_r2",
+    "partial_spearman",
+    "permutation_p",
+    "bootstrap_ci_low",
+    "bootstrap_ci_high",
+    "q_value",
+)
+
+
+def _classification_completeness_reasons(
+    response_rows: list[dict[str, object]],
+    confounding_rows: list[dict[str, object]],
+) -> list[str]:
+    reasons: list[str] = []
+    primary_rows = [
+        row
+        for row in response_rows
+        if row.get("response_tier") == "primary"
+        and row.get("response") in PRIMARY_RESPONSE_COLUMNS
+    ]
+    primary_counts = {
+        response: sum(row.get("response") == response for row in primary_rows)
+        for response in PRIMARY_RESPONSE_COLUMNS
+    }
+    if any(count == 0 for count in primary_counts.values()):
+        reasons.append("missing_primary_responses")
+    if any(count > 1 for count in primary_counts.values()):
+        reasons.append("duplicate_primary_responses")
+    if any(
+        row.get("status") != "ok"
+        or any(_as_finite_float(row.get(field)) is None for field in _PRIMARY_CLASSIFICATION_FIELDS)
+        for row in primary_rows
+    ):
+        reasons.append("invalid_primary_statistics")
+
+    if not confounding_rows:
+        reasons.append("missing_confounding_summary")
+    elif len(confounding_rows) > 1:
+        reasons.append("duplicate_confounding_summary")
+    else:
+        confounding = confounding_rows[0]
+        if (
+            confounding.get("status") != "ok"
+            or _as_finite_float(confounding.get("cv_r2")) is None
+            or _as_finite_float(confounding.get("permutation_p")) is None
+            or not isinstance(confounding.get("confounded"), (bool, np.bool_))
+        ):
+            reasons.append("invalid_confounding_statistics")
+    return reasons
+
+
 def classify_identifiability(
     response_rows: list[dict[str, object]],
     confounding_rows: list[dict[str, object]],
     support_rows: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     """Classify material-local parameter evidence without conflating support shift."""
+    _validate_no_row_invalid_records(
+        [*response_rows, *confounding_rows, *support_rows]
+    )
     summary: list[dict[str, object]] = []
     for material, parameter in _ordered_material_parameter_pairs(
         response_rows, confounding_rows, support_rows
@@ -1808,23 +1863,16 @@ def classify_identifiability(
             for row in confounding_rows
             if row.get("material") == material
             and row.get("parameter") == parameter
-            and row.get("row_type", "summary") == "summary"
+            and row.get("row_type") == "summary"
         ]
         support_subset = [
             row
             for row in support_rows
             if row.get("material") == material and row.get("parameter") == parameter
         ]
-        invalid_record_count = max(
-            (
-                int(max(_as_finite_float(row.get("invalid_record_count", 0)) or 0, 0))
-                for row in (*response_subset, *confounding_subset, *support_subset)
-            ),
-            default=0,
-        )
-        invalid = any(
-            _has_invalid_marker(row)
-            for row in (*response_subset, *confounding_subset, *support_subset)
+        completeness_reasons = _classification_completeness_reasons(
+            response_subset,
+            confounding_subset,
         )
         confounded = any(
             bool(row.get("confounded", False)) for row in confounding_subset
@@ -1841,9 +1889,9 @@ def classify_identifiability(
             else "unknown"
         )
         reason_codes: list[str] = []
-        if invalid:
+        if completeness_reasons:
             status = "invalid"
-            reason_codes.append("invalid_records")
+            reason_codes.extend(completeness_reasons)
         elif confounded:
             status = "confounded"
             reason_codes.append("nuisance_predictable")
@@ -1890,7 +1938,7 @@ def classify_identifiability(
                 "status": status,
                 "support_status": support_status,
                 "reason_codes": tuple(dict.fromkeys(reason_codes)),
-                "invalid_record_count": invalid_record_count,
+                "invalid_record_count": 0,
             }
         )
     return summary
@@ -1966,6 +2014,109 @@ def _markdown_table(columns: tuple[str, ...], rows: list[dict[str, object]]) -> 
     return "\n".join(lines)
 
 
+def _metadata_invalid_records(metadata: dict) -> list[object]:
+    invalid_records = metadata.get("invalid_records", [])
+    if not isinstance(invalid_records, list):
+        raise TypeError("metadata.invalid_records must be a list")
+    return invalid_records
+
+
+def _summary_reason_codes(row: dict[str, object]) -> list[str]:
+    reason_codes = row.get("reason_codes", ())
+    if isinstance(reason_codes, str):
+        return [reason_codes]
+    if isinstance(reason_codes, (tuple, list)):
+        return [str(code) for code in reason_codes]
+    raise TypeError("summary reason_codes must be a string, tuple, or list")
+
+
+def _validate_and_order_summary_rows(
+    summary_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    rows_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in summary_rows:
+        key = (str(row.get("material", "")), str(row.get("parameter", "")))
+        rows_by_key.setdefault(key, []).append(row)
+    expected_keys = set(_EXPECTED_SUMMARY_KEYS)
+    missing = [key for key in _EXPECTED_SUMMARY_KEYS if key not in rows_by_key]
+    duplicate = [
+        key for key, rows in rows_by_key.items() if key in expected_keys and len(rows) > 1
+    ]
+    unexpected = [key for key in rows_by_key if key not in expected_keys]
+    problems: list[str] = []
+    if missing:
+        problems.append(f"missing={missing}")
+    if duplicate:
+        problems.append(f"duplicate={duplicate}")
+    if unexpected:
+        problems.append(f"unexpected={unexpected}")
+    if problems:
+        raise ValueError(
+            "summary must contain six unique material-parameter decisions: "
+            + "; ".join(problems)
+        )
+    return [dict(rows_by_key[key][0]) for key in _EXPECTED_SUMMARY_KEYS]
+
+
+def _apply_metadata_invalid_records(
+    summary_rows: list[dict[str, object]],
+    metadata: dict,
+) -> list[dict[str, object]]:
+    summary_rows = _validate_and_order_summary_rows(summary_rows)
+    invalid_record_count = len(_metadata_invalid_records(metadata))
+    prepared_rows: list[dict[str, object]] = []
+    for row in summary_rows:
+        existing_count = _as_finite_float(row.get("invalid_record_count", 0))
+        if (
+            existing_count is None
+            or existing_count < 0
+            or not float(existing_count).is_integer()
+            or int(existing_count) not in {0, invalid_record_count}
+        ):
+            raise ValueError(
+                "summary invalid_record_count conflicts with "
+                "metadata.invalid_records"
+            )
+        reason_codes = _summary_reason_codes(row)
+        if invalid_record_count == 0 and "invalid_records" in reason_codes:
+            raise ValueError(
+                "summary invalid_records reason conflicts with "
+                "metadata.invalid_records"
+            )
+        prepared = dict(row)
+        prepared["invalid_record_count"] = invalid_record_count
+        if invalid_record_count:
+            prepared["status"] = "invalid"
+            reason_codes.append("invalid_records")
+        prepared["reason_codes"] = tuple(dict.fromkeys(reason_codes))
+        prepared_rows.append(prepared)
+    return prepared_rows
+
+
+def _empty_test_response(value: object) -> bool:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    return isinstance(value, float) and not math.isfinite(value)
+
+
+def _validate_test_records_have_no_responses(
+    records: list[dict[str, object]],
+) -> None:
+    for record in records:
+        if record.get("split") != "test":
+            continue
+        for response in RESPONSE_COLUMNS:
+            if response in record and not _empty_test_response(record[response]):
+                raise ValueError(
+                    f"test record {record.get('model', '<unknown>')} contains "
+                    f"response column {response}"
+                )
+
+
 def render_markdown_report(
     summary_rows: list[dict[str, object]],
     coverage_rows: list[dict[str, object]],
@@ -1975,6 +2126,7 @@ def render_markdown_report(
     metadata: dict,
 ) -> str:
     """Render a Chinese research-decision report from precomputed audit rows."""
+    summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
     summary_table = _markdown_table(
         ("material", "parameter", "status", "support_status", "reason_codes"),
         summary_rows,
@@ -2013,8 +2165,7 @@ def render_markdown_report(
         ),
         primary_responses,
     )
-    invalid_records = metadata.get("invalid_records", [])
-    invalid_count = len(invalid_records) if isinstance(invalid_records, list) else "未知"
+    invalid_count = len(_metadata_invalid_records(metadata))
     return "\n".join(
         (
             "# B0.2 材质参数可辨识性审计",
@@ -2102,10 +2253,17 @@ def _activate_output_files(
                 f"audit output activation failed and rollback was incomplete; "
                 f"backups remain in {backup_dir}"
             ) from activation_error
-        shutil.rmtree(backup_dir)
+        _cleanup_transaction_directory(backup_dir)
         raise
     else:
-        shutil.rmtree(backup_dir)
+        _cleanup_transaction_directory(backup_dir)
+
+
+def _cleanup_transaction_directory(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
 
 
 def write_audit_outputs(
@@ -2130,6 +2288,8 @@ def write_audit_outputs(
                 f"refusing to overwrite existing audit output: {existing[0]}"
             )
     _validate_output_targets(output_dir, target_paths)
+    _validate_test_records_have_no_responses(records)
+    summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(

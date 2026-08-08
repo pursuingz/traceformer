@@ -1,5 +1,6 @@
 import csv
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -874,11 +875,29 @@ class ClassificationTests(unittest.TestCase):
             "permutation_p": 0.049,
             "q_value": 0.049,
             "bootstrap_ci_low": 0.001,
+            "bootstrap_ci_high": 0.1,
             "partial_spearman": 0.2,
             "status": "ok",
         }
         row.update(overrides)
         return row
+
+    @classmethod
+    def _complete_responses(cls, **target_overrides):
+        rows = [
+            cls._response(
+                response=response,
+                delta_r2=0.0,
+                permutation_p=1.0,
+                q_value=1.0,
+                bootstrap_ci_low=-0.1,
+                bootstrap_ci_high=0.1,
+                partial_spearman=0.0,
+            )
+            for response in PRIMARY_RESPONSE_COLUMNS
+        ]
+        rows[0].update(target_overrides)
+        return rows
 
     @staticmethod
     def _confounding(**overrides):
@@ -887,6 +906,8 @@ class ClassificationTests(unittest.TestCase):
             "material": "elastic",
             "parameter": "log10_e",
             "confounded": False,
+            "cv_r2": 0.0,
+            "permutation_p": 1.0,
             "status": "ok",
         }
         row.update(overrides)
@@ -904,7 +925,13 @@ class ClassificationTests(unittest.TestCase):
 
     def test_classification_uses_primary_fdr_qualified_response(self):
         summary = classify_identifiability(
-            [self._response()],
+            self._complete_responses(
+                delta_r2=0.05,
+                permutation_p=0.049,
+                q_value=0.049,
+                bootstrap_ci_low=0.001,
+                partial_spearman=0.2,
+            ),
             [self._confounding()],
             [self._support()],
         )
@@ -915,9 +942,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertIn("primary_delta_r2", row["reason_codes"])
 
     def test_classification_rejects_secondary_only_and_fdr_boundary_evidence(self):
-        secondary_only = self._response(response_tier="secondary")
+        secondary_only = self._response(
+            response="contact_onset_frame",
+            response_tier="secondary",
+        )
         summary = classify_identifiability(
-            [secondary_only],
+            [
+                *self._complete_responses(),
+                secondary_only,
+            ],
             [self._confounding()],
             [self._support()],
         )
@@ -926,9 +959,14 @@ class ClassificationTests(unittest.TestCase):
             "identifiable",
         )
 
-        fdr_boundary = self._response(q_value=0.05)
         summary = classify_identifiability(
-            [fdr_boundary],
+            self._complete_responses(
+                delta_r2=0.05,
+                permutation_p=0.049,
+                q_value=0.05,
+                bootstrap_ci_low=0.001,
+                partial_spearman=0.2,
+            ),
             [self._confounding()],
             [self._support()],
         )
@@ -944,8 +982,16 @@ class ClassificationTests(unittest.TestCase):
             {"bootstrap_ci_low": 0.0},
         ):
             with self.subTest(boundary=boundary):
+                qualified = {
+                    "delta_r2": 0.05,
+                    "permutation_p": 0.049,
+                    "q_value": 0.049,
+                    "bootstrap_ci_low": 0.001,
+                    "partial_spearman": 0.2,
+                    **boundary,
+                }
                 summary = classify_identifiability(
-                    [self._response(**boundary)],
+                    self._complete_responses(**qualified),
                     [self._confounding()],
                     [self._support()],
                 )
@@ -959,7 +1005,7 @@ class ClassificationTests(unittest.TestCase):
                 )
 
     def test_classification_distinguishes_weak_not_detected_and_confounded(self):
-        weak_rows = [self._response(delta_r2=0.01, permutation_p=1.0, q_value=1.0)]
+        weak_rows = self._complete_responses(delta_r2=0.01)
         summary = classify_identifiability(
             weak_rows,
             [self._confounding()],
@@ -970,15 +1016,7 @@ class ClassificationTests(unittest.TestCase):
             "weak",
         )
 
-        null_rows = [
-            self._response(
-                delta_r2=0.009,
-                permutation_p=1.0,
-                q_value=1.0,
-                bootstrap_ci_low=-0.01,
-                partial_spearman=float("nan"),
-            )
-        ]
+        null_rows = self._complete_responses(delta_r2=0.009)
         summary = classify_identifiability(
             null_rows,
             [self._confounding()],
@@ -990,7 +1028,13 @@ class ClassificationTests(unittest.TestCase):
         )
 
         summary = classify_identifiability(
-            [self._response()],
+            self._complete_responses(
+                delta_r2=0.05,
+                permutation_p=0.049,
+                q_value=0.049,
+                bootstrap_ci_low=0.001,
+                partial_spearman=0.2,
+            ),
             [self._confounding(confounded=True)],
             [self._support(support_status="out_of_support")],
         )
@@ -999,9 +1043,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(row["support_status"], "out_of_support")
         self.assertIn("nuisance_predictable", row["reason_codes"])
 
-    def test_classification_keeps_support_independent_and_propagates_invalid_records(self):
+    def test_classification_keeps_support_independent(self):
         summary = classify_identifiability(
-            [self._response()],
+            self._complete_responses(
+                delta_r2=0.05,
+                permutation_p=0.049,
+                q_value=0.049,
+                bootstrap_ci_low=0.001,
+                partial_spearman=0.2,
+            ),
             [self._confounding()],
             [self._support(support_status="out_of_support")],
         )
@@ -1009,30 +1059,119 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(row["status"], "identifiable")
         self.assertEqual(row["support_status"], "out_of_support")
 
+    def test_classification_rejects_invalid_file_counts_outside_metadata(self):
+        with self.assertRaisesRegex(ValueError, "metadata.invalid_records"):
+            classify_identifiability(
+                self._complete_responses(invalid_record_count=1),
+                [self._confounding(invalid_record_count=1)],
+                [self._support(invalid_record_count=1)],
+            )
+
+    def test_classification_marks_incomplete_statistics_invalid(self):
+        missing_primary = self._complete_responses()[:-1]
+        insufficient_primary = self._complete_responses(status="insufficient_data")
+        nonfinite_primary = self._complete_responses(partial_spearman=float("nan"))
+        missing_primary_status = self._complete_responses()
+        missing_primary_status[0].pop("status")
+        duplicate_primary = [
+            *self._complete_responses(),
+            self._response(delta_r2=0.0),
+        ]
+        missing_confounding_status = self._confounding()
+        missing_confounding_status.pop("status")
+        missing_confounding_row_type = self._confounding()
+        missing_confounding_row_type.pop("row_type")
+        cases = (
+            (
+                "missing primary",
+                missing_primary,
+                [self._confounding()],
+                "missing_primary_responses",
+            ),
+            (
+                "insufficient primary",
+                insufficient_primary,
+                [self._confounding()],
+                "invalid_primary_statistics",
+            ),
+            (
+                "missing primary status",
+                missing_primary_status,
+                [self._confounding()],
+                "invalid_primary_statistics",
+            ),
+            (
+                "nonfinite primary",
+                nonfinite_primary,
+                [self._confounding()],
+                "invalid_primary_statistics",
+            ),
+            (
+                "duplicate primary",
+                duplicate_primary,
+                [self._confounding()],
+                "duplicate_primary_responses",
+            ),
+            (
+                "missing confounding",
+                self._complete_responses(),
+                [],
+                "missing_confounding_summary",
+            ),
+            (
+                "insufficient confounding",
+                self._complete_responses(),
+                [self._confounding(status="insufficient_data", cv_r2=float("nan"))],
+                "invalid_confounding_statistics",
+            ),
+            (
+                "missing confounding status",
+                self._complete_responses(),
+                [missing_confounding_status],
+                "invalid_confounding_statistics",
+            ),
+            (
+                "missing confounding row type",
+                self._complete_responses(),
+                [missing_confounding_row_type],
+                "missing_confounding_summary",
+            ),
+        )
+
+        for label, response_rows, confounding_rows, reason_code in cases:
+            with self.subTest(label=label):
+                summary = classify_identifiability(
+                    response_rows,
+                    confounding_rows,
+                    [self._support()],
+                )
+                row = find_row(
+                    summary,
+                    material="elastic",
+                    parameter="log10_e",
+                )
+                self.assertEqual(row["status"], "invalid")
+                self.assertIn(reason_code, row["reason_codes"])
+
+    def test_classification_emits_all_six_decisions_for_partial_inputs(self):
         summary = classify_identifiability(
-            [self._response(invalid_record_count=1)],
+            self._complete_responses(),
             [self._confounding()],
             [self._support()],
         )
-        row = find_row(summary, material="elastic", parameter="log10_e")
-        self.assertEqual(row["status"], "invalid")
-        self.assertIn("invalid_records", row["reason_codes"])
 
-    def test_classification_does_not_multiply_shared_invalid_record_count(self):
-        response_rows = [
-            self._response(response="centered_shape_mse_f24", invalid_record_count=1),
-            self._response(response="velocity_rms_trajectory", invalid_record_count=1),
-        ]
-
-        summary = classify_identifiability(
-            response_rows,
-            [self._confounding(invalid_record_count=1)],
-            [self._support(invalid_record_count=1)],
+        self.assertEqual(
+            [(row["material"], row["parameter"]) for row in summary],
+            [
+                (material, parameter)
+                for material in ("elastic", "plasticine", "sand")
+                for parameter in ("log10_e", "nu")
+            ],
         )
-
-        row = find_row(summary, material="elastic", parameter="log10_e")
-        self.assertEqual(row["status"], "invalid")
-        self.assertEqual(row["invalid_record_count"], 1)
+        absent = find_row(summary, material="sand", parameter="nu")
+        self.assertEqual(absent["status"], "invalid")
+        self.assertIn("missing_primary_responses", absent["reason_codes"])
+        self.assertIn("missing_confounding_summary", absent["reason_codes"])
 
 
 class OutputTests(unittest.TestCase):
@@ -1062,12 +1201,14 @@ class OutputTests(unittest.TestCase):
         self.summary_rows = [
             {
                 "material": material,
-                "parameter": "log10_e",
+                "parameter": parameter,
                 "status": "not_detected",
                 "support_status": "in_support",
                 "reason_codes": ("no_detectable_response",),
+                "invalid_record_count": 0,
             }
             for material in ("elastic", "plasticine", "sand")
+            for parameter in ("log10_e", "nu")
         ]
         self.payload = {
             "records": self.records,
@@ -1123,6 +1264,17 @@ class OutputTests(unittest.TestCase):
             paths["metadata"].read_text(encoding="utf-8"),
         )
 
+        with paths["summary"].open(newline="", encoding="utf-8") as handle:
+            summary_rows = list(csv.DictReader(handle))
+        self.assertEqual({row["status"] for row in summary_rows}, {"invalid"})
+        self.assertEqual(
+            {row["invalid_record_count"] for row in summary_rows},
+            {"1"},
+        )
+        self.assertTrue(
+            all("invalid_records" in row["reason_codes"] for row in summary_rows)
+        )
+
         with paths["records"].open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             rows = list(reader)
@@ -1156,6 +1308,75 @@ class OutputTests(unittest.TestCase):
         self.assertFalse(
             self.output_dir.exists() and any(self.output_dir.glob("*"))
         )
+
+    def test_writer_rejects_summary_invalid_count_inconsistent_with_metadata(self):
+        inconsistent_payload = dict(self.payload)
+        inconsistent_payload["summary_rows"] = [
+            dict(self.summary_rows[0], invalid_record_count=2),
+            *self.summary_rows[1:],
+        ]
+
+        with self.assertRaisesRegex(ValueError, "metadata.invalid_records"):
+            write_audit_outputs(
+                self.output_dir,
+                overwrite=False,
+                **inconsistent_payload,
+            )
+
+        self.assertFalse(
+            self.output_dir.exists() and any(self.output_dir.glob("*"))
+        )
+
+    def test_writer_rejects_nonempty_test_response_columns(self):
+        leaking_payload = dict(self.payload)
+        leaking_payload["records"] = [dict(record) for record in self.records]
+        leaking_payload["records"][1]["centered_shape_mse_f24"] = 0.0
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "test.*centered_shape_mse_f24",
+        ):
+            write_audit_outputs(
+                self.output_dir,
+                overwrite=False,
+                **leaking_payload,
+            )
+
+        self.assertFalse(
+            self.output_dir.exists() and any(self.output_dir.glob("*"))
+        )
+
+    def test_renderer_and_writer_require_six_unique_summary_decisions(self):
+        invalid_summaries = (
+            ("missing", self.summary_rows[:-1]),
+            ("duplicate", [*self.summary_rows, dict(self.summary_rows[0])]),
+        )
+
+        for label, summary_rows in invalid_summaries:
+            with self.subTest(label=label, entrypoint="renderer"):
+                with self.assertRaisesRegex(ValueError, label):
+                    render_markdown_report(
+                        summary_rows,
+                        self.payload["coverage_rows"],
+                        self.payload["support_rows"],
+                        self.payload["confounding_rows"],
+                        self.payload["response_rows"],
+                        self.payload["metadata"],
+                    )
+
+            with self.subTest(label=label, entrypoint="writer"):
+                invalid_payload = dict(self.payload)
+                invalid_payload["summary_rows"] = summary_rows
+                invalid_output_dir = self.root / f"outputs-{label}"
+                with self.assertRaisesRegex(ValueError, label):
+                    write_audit_outputs(
+                        invalid_output_dir,
+                        overwrite=False,
+                        **invalid_payload,
+                    )
+                self.assertFalse(
+                    invalid_output_dir.exists() and any(invalid_output_dir.glob("*"))
+                )
 
     def test_writer_does_not_partially_replace_outputs_when_activation_is_blocked(self):
         self.output_dir.mkdir()
@@ -1236,6 +1457,39 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(
             {key: path.read_bytes() for key, path in paths.items()},
             old_contents,
+        )
+        self.assertFalse(
+            any(".backup." in path.name for path in self.root.iterdir())
+        )
+
+    def test_writer_does_not_fail_after_successful_activation_if_cleanup_fails(self):
+        paths = write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
+        replacement_payload = dict(self.payload)
+        replacement_payload["metadata"] = {"seed": 1, "invalid_records": []}
+        original_rmtree = shutil.rmtree
+        cleanup_attempted = False
+
+        def fail_backup_cleanup(path, *args, **kwargs):
+            nonlocal cleanup_attempted
+            if ".backup." in Path(path).name:
+                cleanup_attempted = True
+                raise OSError("injected backup cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(shutil, "rmtree", side_effect=fail_backup_cleanup):
+            replaced_paths = write_audit_outputs(
+                self.output_dir,
+                overwrite=True,
+                **replacement_payload,
+            )
+
+        self.assertTrue(cleanup_attempted)
+        self.assertEqual(replaced_paths, paths)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(metadata["seed"], 1)
+        self.assertEqual(
+            {path.name for path in self.output_dir.iterdir()},
+            set(OUTPUT_NAMES.values()),
         )
 
     def test_writer_replaces_complete_existing_output_set(self):
