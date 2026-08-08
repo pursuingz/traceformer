@@ -95,8 +95,9 @@ drag_force, drag_mask
 - `floor_height`；
 - drag force 数量和总模长；
 - drag mask 粒子比例；
-- 初始接触粒子比例；
-- 是否在预测 horizon 内发生接触。
+- 初始接触粒子比例。
+
+只有仿真开始前已经确定的场景量可以进入 nuisance。`horizon` 内是否接触、首次接触帧和后续接触比例可能受 `E/nu` 影响，属于 GT response，禁止作为回归控制变量，否则会把待测材料效应的一部分回归掉。
 
 接触阈值与模型 contact band 对齐。模型归一化空间中的 `sigma=0.04` 对应原始坐标 `0.08`，因此原始 H5 上使用：
 
