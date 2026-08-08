@@ -26,10 +26,12 @@ class RecordValidationError(ValueError):
 
 
 _FRAME_RESPONSE_PREFIXES = (
-    "centered_shape_mse",
+    "point_displacement_mse",
     "centroid_displacement",
-    "f_strain_norm",
-    "volumetric_strain",
+    "centered_shape_mse",
+    "extent_change_x",
+    "extent_change_y",
+    "extent_change_z",
     "future_contact_fraction",
 )
 
@@ -83,6 +85,15 @@ NUISANCE_COLUMNS = (
 )
 RESPONSE_COLUMNS = (
     "velocity_rms_trajectory",
+    "velocity_rms_f24",
+    "position_velocity_rms_trajectory",
+    "position_acceleration_rms_trajectory",
+    "f_strain_norm_f24",
+    "f_strain_norm_trajectory",
+    "volumetric_strain_f24",
+    "volumetric_strain_trajectory",
+    "c_norm_f24",
+    "c_norm_trajectory",
     "contact_onset_frame",
     "future_contact_fraction",
     *(
@@ -164,6 +175,15 @@ def _validate_initial_points(points: np.ndarray) -> None:
         raise RecordValidationError("x must be finite")
 
 
+def _validate_x_dataset(dataset: h5py.Dataset) -> None:
+    if dataset.ndim != 3 or dataset.shape[-1] != 3:
+        raise RecordValidationError("x must have shape (frames, particles, 3)")
+    if dataset.shape[0] == 0:
+        raise RecordValidationError("x must contain at least one frame")
+    if dataset.shape[1] == 0:
+        raise RecordValidationError("x must contain at least one particle")
+
+
 def _static_features(
     handle: h5py.File,
     initial_points: np.ndarray,
@@ -176,7 +196,9 @@ def _static_features(
     model: str,
 ) -> dict[str, object]:
     particle_count = initial_points.shape[0]
-    volume = np.asarray(handle["vol"][:], dtype=np.float64).reshape(-1)
+    volume = np.asarray(handle["vol"][:], dtype=np.float64)
+    if volume.ndim != 1:
+        raise RecordValidationError("vol must have shape (particles,)")
     if volume.shape[0] != particle_count:
         raise RecordValidationError("vol particle dimension must match x")
     if not np.isfinite(volume).all():
@@ -189,6 +211,14 @@ def _static_features(
 
     drag_force = np.asarray(handle["drag_force"][:], dtype=np.float64)
     drag_mask = np.asarray(handle["drag_mask"][:], dtype=np.float64)
+    if drag_force.ndim != 2 or drag_force.shape[1] != 3:
+        raise RecordValidationError("drag_force must have shape (forces, 3)")
+    if drag_mask.ndim != 2:
+        raise RecordValidationError("drag_mask must have shape (forces, particles)")
+    if drag_force.shape[0] != drag_mask.shape[0]:
+        raise RecordValidationError("drag_force and drag_mask force count must match")
+    if drag_mask.shape[1] != particle_count:
+        raise RecordValidationError("drag_mask particle dimension must match x")
     if not np.isfinite(drag_force).all() or not np.isfinite(drag_mask).all():
         raise RecordValidationError("drag_force and drag_mask must be finite")
 
@@ -221,7 +251,7 @@ def _static_features(
         "floor_gap": float(initial_points[:, 1].min() - floor_height),
         "gravity": gravity,
         "drag_magnitude": float(np.linalg.norm(drag_force)),
-        "drag_count": int(drag_force.shape[0]) if drag_force.ndim else 1,
+        "drag_count": int(drag_force.shape[0]),
         "drag_mask_ratio": float(np.count_nonzero(drag_mask) / drag_mask.size)
         if drag_mask.size
         else 0.0,
@@ -254,6 +284,7 @@ def _train_responses(
     x: np.ndarray,
     v: np.ndarray,
     f: np.ndarray,
+    c: np.ndarray,
     *,
     floor_height: float,
     settings: AuditSettings,
@@ -261,25 +292,45 @@ def _train_responses(
     identity = np.eye(3, dtype=f.dtype)
     f_strain = np.linalg.norm(f - identity, axis=(-2, -1))
     j_error = np.abs(np.linalg.det(f) - 1.0)
+    c_norm = np.linalg.norm(c, axis=(-2, -1))
     initial_centroid = x[0].mean(axis=0)
     initial_centered = x[0] - initial_centroid
+    initial_extents = np.ptp(x[0], axis=0)
     contact = x[:, :, 1] <= floor_height + settings.contact_band_raw
 
     response: dict[str, object] = {
         "velocity_rms_trajectory": float(np.sqrt(np.mean(v ** 2))),
+        "velocity_rms_f24": float(np.sqrt(np.mean(v[24] ** 2))),
+        "position_velocity_rms_trajectory": float(
+            np.sqrt(np.mean(np.diff(x, axis=0) ** 2))
+        ),
+        "position_acceleration_rms_trajectory": float(
+            np.sqrt(np.mean(np.diff(x, n=2, axis=0) ** 2))
+        ),
+        "f_strain_norm_f24": float(f_strain[24].mean()),
+        "f_strain_norm_trajectory": float(f_strain.mean()),
+        "volumetric_strain_f24": float(j_error[24].mean()),
+        "volumetric_strain_trajectory": float(j_error.mean()),
+        "c_norm_f24": float(c_norm[24].mean()),
+        "c_norm_trajectory": float(c_norm.mean()),
         "contact_onset_frame": _contact_onset_frame(contact),
         "future_contact_fraction": float(contact[1:25].mean()),
     }
     for frame in FRAME_INDICES:
         centered = x[frame] - x[frame].mean(axis=0)
+        extent_change = np.ptp(x[frame], axis=0) - initial_extents
+        response[f"point_displacement_mse_f{frame}"] = float(
+            np.mean((x[frame] - x[0]) ** 2)
+        )
         response[f"centered_shape_mse_f{frame}"] = float(
             np.mean((centered - initial_centered) ** 2)
         )
         response[f"centroid_displacement_f{frame}"] = float(
             np.linalg.norm(x[frame].mean(axis=0) - initial_centroid)
         )
-        response[f"f_strain_norm_f{frame}"] = float(f_strain[frame].mean())
-        response[f"volumetric_strain_f{frame}"] = float(j_error[frame].mean())
+        response[f"extent_change_x_f{frame}"] = float(extent_change[0])
+        response[f"extent_change_y_f{frame}"] = float(extent_change[1])
+        response[f"extent_change_z_f{frame}"] = float(extent_change[2])
         response[f"future_contact_fraction_f{frame}"] = float(contact[frame].mean())
     return response
 
@@ -303,6 +354,7 @@ def read_h5_record(
     with h5py.File(path, "r") as handle:
         _require_fields(handle, _STATIC_REQUIRED_FIELDS)
         e_value, nu, mat_type = _validate_metadata(handle)
+        _validate_x_dataset(handle["x"])
         initial_points = np.asarray(handle["x"][0], dtype=np.float64)
         _validate_initial_points(initial_points)
         record = _static_features(
@@ -329,6 +381,7 @@ def read_h5_record(
                 x,
                 v,
                 f,
+                c,
                 floor_height=_scalar(handle, "floor_height"),
                 settings=settings,
             )

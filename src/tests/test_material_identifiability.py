@@ -60,6 +60,37 @@ class MaterialRecordTests(unittest.TestCase):
                 handle["F"] = np.broadcast_to(eye, (frames, len(cube), 3, 3))
                 handle["C"] = np.zeros((frames, len(cube), 3, 3), dtype=np.float32)
 
+    @staticmethod
+    def _response_columns():
+        frame_columns = tuple(
+            f"{prefix}_f{frame}"
+            for prefix in (
+                "point_displacement_mse",
+                "centroid_displacement",
+                "centered_shape_mse",
+                "extent_change_x",
+                "extent_change_y",
+                "extent_change_z",
+                "future_contact_fraction",
+            )
+            for frame in (5, 10, 15, 20, 24)
+        )
+        return (
+            "velocity_rms_trajectory",
+            "velocity_rms_f24",
+            "position_velocity_rms_trajectory",
+            "position_acceleration_rms_trajectory",
+            "f_strain_norm_f24",
+            "f_strain_norm_trajectory",
+            "volumetric_strain_f24",
+            "volumetric_strain_trajectory",
+            "c_norm_f24",
+            "c_norm_trajectory",
+            "contact_onset_frame",
+            "future_contact_fraction",
+            *frame_columns,
+        )
+
     def test_test_record_reads_only_static_frame_without_dynamics(self):
         test_path = self.root / "test_static.h5"
         self.write_h5(test_path, frames=1, include_dynamics=False)
@@ -89,6 +120,75 @@ class MaterialRecordTests(unittest.TestCase):
         self.assertAlmostEqual(record["velocity_rms_trajectory"], 0.0)
         self.assertAlmostEqual(record["f_strain_norm_f24"], 0.0)
         self.assertAlmostEqual(record["volumetric_strain_f24"], 0.0)
+
+    def test_response_columns_freeze_complete_secondary_schema(self):
+        self.assertEqual(RESPONSE_COLUMNS, self._response_columns())
+        self.assertNotIn("contact_onset_frame", NUISANCE_COLUMNS)
+        self.assertNotIn("future_contact_fraction", NUISANCE_COLUMNS)
+
+    def test_train_record_computes_complete_secondary_response_values(self):
+        path = self.root / "secondary_responses.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            cube = handle["x"][0]
+            frames = np.arange(25, dtype=np.float64)
+            scale = 1.0 + 0.01 * frames[:, None, None]
+            translation = frames[:, None, None] * np.asarray(
+                [0.1, -0.02, 0.03], dtype=np.float64
+            )
+            x = cube[None, :, :] * scale + translation
+            v = np.broadcast_to(frames[:, None, None], x.shape).copy()
+            identity = np.eye(3, dtype=np.float64)
+            f = np.broadcast_to(
+                identity + frames[:, None, None, None] * 0.01 * identity,
+                (25, len(cube), 3, 3),
+            ).copy()
+            c = np.broadcast_to(
+                frames[:, None, None, None] * identity,
+                (25, len(cube), 3, 3),
+            ).copy()
+            for field, values in (("x", x), ("v", v), ("F", f), ("C", c)):
+                del handle[field]
+                handle[field] = values
+
+        record = read_h5_record(path, split="train", settings=AuditSettings())
+        f_strain = np.linalg.norm(f - np.eye(3), axis=(-2, -1))
+        j_error = np.abs(np.linalg.det(f) - 1.0)
+        c_norm = np.linalg.norm(c, axis=(-2, -1))
+
+        self.assertTrue(all(column in record for column in self._response_columns()))
+        self.assertAlmostEqual(
+            record["point_displacement_mse_f24"],
+            np.mean((x[24] - x[0]) ** 2),
+        )
+        self.assertAlmostEqual(
+            record["extent_change_x_f24"],
+            np.ptp(x[24, :, 0]) - np.ptp(x[0, :, 0]),
+        )
+        self.assertAlmostEqual(
+            record["extent_change_y_f24"],
+            np.ptp(x[24, :, 1]) - np.ptp(x[0, :, 1]),
+        )
+        self.assertAlmostEqual(
+            record["extent_change_z_f24"],
+            np.ptp(x[24, :, 2]) - np.ptp(x[0, :, 2]),
+        )
+        self.assertAlmostEqual(record["velocity_rms_trajectory"], np.sqrt(np.mean(v ** 2)))
+        self.assertAlmostEqual(record["velocity_rms_f24"], np.sqrt(np.mean(v[24] ** 2)))
+        self.assertAlmostEqual(
+            record["position_velocity_rms_trajectory"],
+            np.sqrt(np.mean(np.diff(x, axis=0) ** 2)),
+        )
+        self.assertAlmostEqual(
+            record["position_acceleration_rms_trajectory"],
+            np.sqrt(np.mean(np.diff(x, n=2, axis=0) ** 2)),
+        )
+        self.assertAlmostEqual(record["f_strain_norm_f24"], np.mean(f_strain[24]))
+        self.assertAlmostEqual(record["f_strain_norm_trajectory"], np.mean(f_strain))
+        self.assertAlmostEqual(record["volumetric_strain_f24"], np.mean(j_error[24]))
+        self.assertAlmostEqual(record["volumetric_strain_trajectory"], np.mean(j_error))
+        self.assertAlmostEqual(record["c_norm_f24"], np.mean(c_norm[24]))
+        self.assertAlmostEqual(record["c_norm_trajectory"], np.mean(c_norm))
 
     def test_train_record_requires_f_field(self):
         path_without_f = self.root / "missing_f.h5"
@@ -139,6 +239,62 @@ class MaterialRecordTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RecordValidationError, "particle dimension"):
             read_h5_record(misaligned_path, split="train", settings=AuditSettings())
+
+    def test_record_rejects_nonvector_particle_volumes(self):
+        path = self.root / "column_volume.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["vol"]
+            handle["vol"] = np.ones((8, 1), dtype=np.float32) / 8
+
+        with self.assertRaisesRegex(RecordValidationError, "vol.*shape"):
+            read_h5_record(path, split="test", settings=AuditSettings())
+
+    def test_record_rejects_invalid_drag_force_shape(self):
+        path = self.root / "invalid_drag_force.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["drag_force"]
+            del handle["drag_mask"]
+            handle["drag_force"] = np.zeros((1, 2), dtype=np.float32)
+            handle["drag_mask"] = np.zeros((1, 8), dtype=np.float32)
+
+        with self.assertRaisesRegex(RecordValidationError, "drag_force.*shape"):
+            read_h5_record(path, split="test", settings=AuditSettings())
+
+    def test_record_rejects_misaligned_drag_mask(self):
+        path = self.root / "misaligned_drag_mask.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["drag_force"]
+            del handle["drag_mask"]
+            handle["drag_force"] = np.zeros((1, 3), dtype=np.float32)
+            handle["drag_mask"] = np.zeros((2, 7), dtype=np.float32)
+
+        with self.assertRaisesRegex(RecordValidationError, "drag.*force count"):
+            read_h5_record(path, split="test", settings=AuditSettings())
+
+    def test_record_rejects_drag_mask_with_wrong_particle_dimension(self):
+        path = self.root / "wrong_drag_particle_dimension.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["drag_force"]
+            del handle["drag_mask"]
+            handle["drag_force"] = np.zeros((1, 3), dtype=np.float32)
+            handle["drag_mask"] = np.zeros((1, 7), dtype=np.float32)
+
+        with self.assertRaisesRegex(RecordValidationError, "drag_mask.*particle dimension"):
+            read_h5_record(path, split="test", settings=AuditSettings())
+
+    def test_record_rejects_zero_frame_x_before_reading_initial_frame(self):
+        path = self.root / "zero_frame.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["x"]
+            handle["x"] = np.zeros((0, 8, 3), dtype=np.float32)
+
+        with self.assertRaisesRegex(RecordValidationError, "x.*at least one frame"):
+            read_h5_record(path, split="test", settings=AuditSettings())
 
     def test_coplanar_record_retains_valid_fields_when_hull_is_degenerate(self):
         coplanar_path = self.root / "coplanar.h5"
