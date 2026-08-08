@@ -3,6 +3,8 @@ import json
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +27,10 @@ from utils.material_identifiability import (
     read_h5_record,
     render_markdown_report,
     write_audit_outputs,
+)
+from diagnose_material_identifiability import (
+    build_parser,
+    run_material_identifiability_audit,
 )
 
 
@@ -1523,6 +1529,190 @@ class OutputTests(unittest.TestCase):
 
         self.assertIn("B0.2", report)
         self.assertIn("不能证明反事实物理正确", report)
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.train_dir = self.root / "train"
+        self.test_dir = self.root / "test"
+        self.output_dir = self.root / "outputs"
+        self.train_dir.mkdir()
+        self.test_dir.mkdir()
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    @staticmethod
+    def _write_h5(
+        path: Path,
+        *,
+        material_code: int,
+        index: int,
+        include_dynamics: bool,
+    ) -> None:
+        cube = np.asarray(
+            [
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1],
+            ],
+            dtype=np.float32,
+        )
+        frames = 25 if include_dynamics else 1
+        displacement = 0.002 * (index + 1)
+        x = np.stack(
+            [cube + np.asarray([0, -displacement * frame, 0]) for frame in range(frames)]
+        )
+        with h5py.File(path, "w") as handle:
+            handle["x"] = x
+            handle["vol"] = np.ones(len(cube), dtype=np.float32) / len(cube)
+            handle["E"] = np.asarray(10.0 ** (4.0 + 0.1 * index))
+            handle["nu"] = np.asarray(0.05 + 0.05 * index)
+            handle["mat_type"] = np.asarray(material_code)
+            handle["gravity"] = np.asarray(1)
+            handle["floor_height"] = np.asarray(-0.1)
+            handle["drag_force"] = np.zeros((0, 3), dtype=np.float32)
+            handle["drag_mask"] = np.zeros((0, len(cube)), dtype=np.float32)
+            if include_dynamics:
+                handle["v"] = np.zeros_like(x)
+                eye = np.eye(3, dtype=np.float32)
+                handle["F"] = np.broadcast_to(eye, (frames, len(cube), 3, 3))
+                handle["C"] = np.zeros((frames, len(cube), 3, 3), dtype=np.float32)
+
+    def _create_smoke_fixture(self) -> None:
+        for material_code in range(3):
+            for index in range(6):
+                self._write_h5(
+                    self.train_dir / f"train-{material_code}-{5 - index}.h5",
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=True,
+                )
+            for index in range(2):
+                self._write_h5(
+                    self.test_dir / f"test-{material_code}-{1 - index}.h5",
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=False,
+                )
+        self._write_h5(
+            self.train_dir / "bad.h5",
+            material_code=0,
+            index=0,
+            include_dynamics=False,
+        )
+
+    def test_parser_uses_frozen_production_defaults(self):
+        args = build_parser().parse_args(
+            ["--train-dir", str(self.train_dir), "--test-dir", str(self.test_dir)]
+        )
+
+        self.assertEqual(args.seed, 0)
+        self.assertEqual(args.folds, 5)
+        self.assertEqual(args.permutations, 500)
+        self.assertEqual(args.bootstrap_samples, 1000)
+        self.assertEqual(args.contact_band_raw, 0.08)
+
+    def test_parser_rejects_invalid_statistical_settings(self):
+        parser = build_parser()
+        base = ["--train-dir", str(self.train_dir), "--test-dir", str(self.test_dir)]
+        invalid_options = (
+            ("--seed", "-1"),
+            ("--folds", "1"),
+            ("--permutations", "0"),
+            ("--bootstrap-samples", "0"),
+            ("--contact-band-raw", "0"),
+        )
+
+        for option, value in invalid_options:
+            with self.subTest(option=option):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([*base, option, value])
+
+    def test_runner_streams_sorted_h5_records_and_propagates_invalid_metadata(self):
+        self._create_smoke_fixture()
+        progress = StringIO()
+
+        with redirect_stdout(progress):
+            paths = run_material_identifiability_audit(
+                self.train_dir,
+                self.test_dir,
+                self.output_dir,
+                AuditSettings(
+                    seed=0,
+                    folds=2,
+                    permutations=2,
+                    bootstrap_samples=4,
+                ),
+            )
+
+        self.assertEqual(set(paths), set(OUTPUT_NAMES))
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(metadata["train_valid_count"], 18)
+        self.assertEqual(metadata["test_valid_count"], 6)
+        self.assertEqual(len(metadata["invalid_records"]), 1)
+        self.assertTrue(metadata["invalid_records"][0]["path"].endswith("bad.h5"))
+
+        with paths["records"].open(newline="", encoding="utf-8") as handle:
+            records = list(csv.DictReader(handle))
+        train_models = [row["model"] for row in records if row["split"] == "train"]
+        test_models = [row["model"] for row in records if row["split"] == "test"]
+        self.assertEqual(train_models, sorted(train_models))
+        self.assertEqual(test_models, sorted(test_models))
+        with paths["summary"].open(newline="", encoding="utf-8") as handle:
+            summary_rows = list(csv.DictReader(handle))
+        self.assertEqual({row["status"] for row in summary_rows}, {"invalid"})
+        self.assertTrue(all("invalid_records" in row["reason_codes"] for row in summary_rows))
+        self.assertIn("train 1/19", progress.getvalue())
+        self.assertIn("test 1/6", progress.getvalue())
+        self.assertIn("response", progress.getvalue())
+
+    def test_runner_aborts_before_statistics_when_a_material_has_too_few_train_records(self):
+        for material_code in (0, 1):
+            for index in range(2):
+                self._write_h5(
+                    self.train_dir / f"train-{material_code}-{index}.h5",
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=True,
+                )
+
+        with mock.patch(
+            "diagnose_material_identifiability.build_coverage_rows",
+            side_effect=AssertionError("statistical fitting started"),
+        ):
+            with self.assertRaisesRegex(ValueError, "sand"):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.test_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        self.assertFalse(self.output_dir.exists())
+
+    def test_runner_requires_overwrite_before_replacing_existing_outputs(self):
+        self._create_smoke_fixture()
+        settings = AuditSettings(folds=2, permutations=2, bootstrap_samples=4)
+        run_material_identifiability_audit(
+            self.train_dir, self.test_dir, self.output_dir, settings
+        )
+
+        with self.assertRaises(FileExistsError):
+            run_material_identifiability_audit(
+                self.train_dir, self.test_dir, self.output_dir, settings
+            )
+
+        paths = run_material_identifiability_audit(
+            self.train_dir,
+            self.test_dir,
+            self.output_dir,
+            settings,
+            overwrite=True,
+        )
+        self.assertTrue(all(path.is_file() for path in paths.values()))
 
 
 if __name__ == "__main__":
