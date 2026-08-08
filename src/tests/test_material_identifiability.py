@@ -403,6 +403,81 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(elastic_support["support_status"], "out_of_support")
         self.assertTrue(all(name not in elastic_support for name in RESPONSE_COLUMNS))
 
+    def test_test_nonfinite_nuisance_does_not_change_train_mahalanobis_reference(self):
+        clean_support = build_support_rows(
+            self.train_records,
+            self.test_records,
+            bins=5,
+        )
+        nonfinite_test_records = [dict(record) for record in self.test_records]
+        nonfinite_test_records[0]["floor_gap"] = float("nan")
+
+        nonfinite_support = build_support_rows(
+            self.train_records,
+            nonfinite_test_records,
+            bins=5,
+        )
+
+        clean_elastic = find_row(
+            clean_support,
+            material="elastic",
+            parameter="log10_e",
+        )
+        nonfinite_elastic = find_row(
+            nonfinite_support,
+            material="elastic",
+            parameter="log10_e",
+        )
+        self.assertEqual(
+            nonfinite_elastic["mahalanobis_feature_columns"],
+            clean_elastic["mahalanobis_feature_columns"],
+        )
+        self.assertAlmostEqual(
+            nonfinite_elastic["mahalanobis_train_p95"],
+            clean_elastic["mahalanobis_train_p95"],
+        )
+        self.assertAlmostEqual(
+            nonfinite_elastic["mahalanobis_nonfinite_test_fraction"],
+            1.0 / 3.0,
+        )
+        self.assertEqual(nonfinite_elastic["support_status"], "out_of_support")
+
+    def test_joint_grid_places_generation_maxima_in_final_bin(self):
+        train_records = [
+            self._record("elastic", 4.0, 0.05, floor_gap=0.0),
+            self._record("elastic", 7.0, 0.45, floor_gap=1.0),
+        ]
+
+        coverage = build_coverage_rows(train_records, [], bins=5)
+
+        elastic_e = find_row(
+            coverage,
+            split="train",
+            material="elastic",
+            parameter="log10_e",
+        )
+        self.assertAlmostEqual(elastic_e["joint_grid_occupancy"], 2.0 / 25.0)
+
+    def test_support_metrics_allow_unequal_train_and_test_sample_counts(self):
+        train_records = [
+            self._record("elastic", 4.0, 0.10, floor_gap=0.0),
+            self._record("elastic", 5.0, 0.20, floor_gap=1.0),
+            self._record("elastic", 6.0, 0.30, floor_gap=2.0),
+        ]
+        test_records = [
+            self._record("elastic", 4.0, 0.10, floor_gap=1.0),
+            self._record("elastic", 7.0, 0.30, floor_gap=3.0),
+        ]
+
+        support = build_support_rows(train_records, test_records, bins=5)
+
+        elastic_e = find_row(support, material="elastic", parameter="log10_e")
+        self.assertEqual(elastic_e["n_train"], 3)
+        self.assertEqual(elastic_e["n_test"], 2)
+        self.assertAlmostEqual(elastic_e["ks_statistic"], 0.5)
+        self.assertAlmostEqual(elastic_e["wasserstein_distance"], 5.0 / 6.0)
+        self.assertAlmostEqual(elastic_e["smd_floor_gap"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -510,36 +510,43 @@ def _joint_empty_bin_fraction(
     return float(sum(index not in occupied_train_bins for index in test_bins) / len(test_bins))
 
 
-def _mahalanobis_outside_fraction(
+def _mahalanobis_diagnostics(
     train_records: list[dict[str, object]], test_records: list[dict[str, object]]
-) -> float:
-    if not train_records or not test_records:
-        return float("nan")
+) -> dict[str, object]:
+    empty_diagnostics: dict[str, object] = {
+        "mahalanobis_feature_columns": (),
+        "mahalanobis_train_p95": float("nan"),
+        "mahalanobis_outside_fraction": float("nan"),
+        "mahalanobis_nonfinite_test_fraction": float("nan"),
+    }
+    if not train_records:
+        return empty_diagnostics
+
     feature_columns = (*PARAMETER_COLUMNS, *_STATIC_NUISANCE_COLUMNS)
     train_matrix = np.column_stack(
         [_column_values(train_records, column) for column in feature_columns]
     )
-    test_matrix = np.column_stack(
-        [_column_values(test_records, column) for column in feature_columns]
-    )
-    finite_columns = np.isfinite(train_matrix).all(axis=0) & np.isfinite(test_matrix).all(axis=0)
-    train_matrix = train_matrix[:, finite_columns]
-    test_matrix = test_matrix[:, finite_columns]
+    finite_train_columns = np.isfinite(train_matrix).all(axis=0)
+    train_matrix = train_matrix[:, finite_train_columns]
+    selected_columns = np.asarray(feature_columns, dtype=object)[finite_train_columns]
     if not train_matrix.shape[1]:
-        return float("nan")
+        return empty_diagnostics
 
     train_mean = train_matrix.mean(axis=0)
-    train_std = train_matrix.std(axis=0, ddof=1) if len(train_matrix) > 1 else np.zeros(train_matrix.shape[1])
+    train_std = (
+        train_matrix.std(axis=0, ddof=1)
+        if len(train_matrix) > 1
+        else np.zeros(train_matrix.shape[1])
+    )
     varying_columns = train_std > 0
     train_matrix = train_matrix[:, varying_columns]
-    test_matrix = test_matrix[:, varying_columns]
     train_mean = train_mean[varying_columns]
     train_std = train_std[varying_columns]
+    selected_columns = selected_columns[varying_columns]
     if not train_matrix.shape[1]:
-        return float("nan")
+        return empty_diagnostics
 
     train_standardized = (train_matrix - train_mean) / train_std
-    test_standardized = (test_matrix - train_mean) / train_std
     covariance = np.atleast_2d(np.cov(train_standardized, rowvar=False, ddof=1))
     covariance += 1e-6 * np.eye(covariance.shape[0])
     precision = np.linalg.inv(covariance)
@@ -548,9 +555,31 @@ def _mahalanobis_outside_fraction(
         return np.einsum("ij,jk,ik->i", values, precision, values)
 
     train_distances = distances(train_standardized)
-    test_distances = distances(test_standardized)
     threshold = np.percentile(train_distances, 95)
-    return float(np.mean(test_distances > threshold))
+    diagnostics = {
+        "mahalanobis_feature_columns": tuple(selected_columns.tolist()),
+        "mahalanobis_train_p95": float(threshold),
+        "mahalanobis_outside_fraction": float("nan"),
+        "mahalanobis_nonfinite_test_fraction": float("nan"),
+    }
+    if not test_records:
+        return diagnostics
+
+    test_matrix = np.column_stack(
+        [_column_values(test_records, column) for column in selected_columns]
+    )
+    finite_test_rows = np.isfinite(test_matrix).all(axis=1)
+    diagnostics["mahalanobis_nonfinite_test_fraction"] = float(
+        np.mean(~finite_test_rows)
+    )
+    test_outside = np.ones(len(test_matrix), dtype=bool)
+    if np.any(finite_test_rows):
+        test_standardized = (
+            test_matrix[finite_test_rows] - train_mean
+        ) / train_std
+        test_outside[finite_test_rows] = distances(test_standardized) > threshold
+    diagnostics["mahalanobis_outside_fraction"] = float(test_outside.mean())
+    return diagnostics
 
 
 def build_support_rows(
@@ -576,7 +605,7 @@ def build_support_rows(
             test_nu,
             bins=bins,
         )
-        mahalanobis_fraction = _mahalanobis_outside_fraction(
+        mahalanobis_diagnostics = _mahalanobis_diagnostics(
             train_material_records,
             test_material_records,
         )
@@ -618,12 +647,13 @@ def build_support_rows(
         out_of_support = (
             any(fraction > 0.05 for fraction in outside_fractions)
             or joint_empty_fraction > 0.20
-            or mahalanobis_fraction > 0.20
+            or mahalanobis_diagnostics["mahalanobis_outside_fraction"] > 0.20
+            or mahalanobis_diagnostics["mahalanobis_nonfinite_test_fraction"] > 0
         )
         diagnostics = {
             "joint_empty_bin_fraction": joint_empty_fraction,
-            "mahalanobis_outside_fraction": mahalanobis_fraction,
             "support_status": "out_of_support" if out_of_support else "in_support",
+            **mahalanobis_diagnostics,
             **_standardized_mean_differences(
                 train_material_records,
                 test_material_records,
