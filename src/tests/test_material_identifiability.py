@@ -1,9 +1,11 @@
 import csv
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -280,6 +282,36 @@ class MaterialRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordValidationError, "drag_force.*shape"):
             read_h5_record(path, split="test", settings=AuditSettings())
 
+    def test_record_normalizes_generator_empty_list_drag_arrays(self):
+        path = self.root / "zero_force_generator_schema.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["drag_force"]
+            del handle["drag_mask"]
+            handle["drag_force"] = []
+            handle["drag_mask"] = []
+
+        try:
+            record = read_h5_record(path, split="test", settings=AuditSettings())
+        except RecordValidationError as error:
+            self.fail(f"generator empty-list drag arrays were rejected: {error}")
+
+        self.assertEqual(record["drag_count"], 0)
+        self.assertEqual(record["drag_magnitude"], 0.0)
+        self.assertEqual(record["drag_mask_ratio"], 0.0)
+
+    def test_record_rejects_nonempty_one_dimensional_drag_arrays(self):
+        path = self.root / "nonempty_one_dimensional_drag.h5"
+        self.write_h5(path)
+        with h5py.File(path, "a") as handle:
+            del handle["drag_force"]
+            del handle["drag_mask"]
+            handle["drag_force"] = [1.0, 0.0, 0.0]
+            handle["drag_mask"] = [0.0] * 8
+
+        with self.assertRaisesRegex(RecordValidationError, "drag_force.*shape"):
+            read_h5_record(path, split="test", settings=AuditSettings())
+
     def test_record_rejects_misaligned_drag_mask(self):
         path = self.root / "misaligned_drag_mask.h5"
         self.write_h5(path)
@@ -494,6 +526,19 @@ class CoverageTests(unittest.TestCase):
         self.assertAlmostEqual(elastic_e["wasserstein_distance"], 5.0 / 6.0)
         self.assertAlmostEqual(elastic_e["smd_floor_gap"], 1.0)
 
+    def test_support_rows_mark_material_without_test_records_unknown(self):
+        train_records = [
+            self._record("elastic", 4.0, 0.10, floor_gap=0.0),
+            self._record("elastic", 5.0, 0.20, floor_gap=1.0),
+            self._record("elastic", 6.0, 0.30, floor_gap=2.0),
+        ]
+
+        support = build_support_rows(train_records, [], bins=5)
+
+        elastic_e = find_row(support, material="elastic", parameter="log10_e")
+        self.assertEqual(elastic_e["n_test"], 0)
+        self.assertEqual(elastic_e["support_status"], "unknown")
+
 
 class StatisticsHelperTests(unittest.TestCase):
     def test_audit_settings_freeze_production_sampling_defaults(self):
@@ -637,6 +682,22 @@ class StatisticsHelperTests(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
 
+    def test_conditional_residual_permutation_reconstructs_parameter(self):
+        self.assertTrue(
+            hasattr(material_identifiability, "_permute_conditional_residuals"),
+            "conditional residual permutation helper is missing",
+        )
+        parameter = np.asarray([10.0, 20.0, 30.0, 40.0])
+        conditional_prediction = np.asarray([9.0, 22.0, 27.0, 44.0])
+
+        reconstructed = material_identifiability._permute_conditional_residuals(
+            parameter,
+            conditional_prediction,
+            rng=np.random.default_rng(7),
+        )
+
+        np.testing.assert_allclose(reconstructed, [10.0, 25.0, 25.0, 40.0])
+
     def test_benjamini_hochberg_preserves_order_and_boundaries(self):
         pvalues = np.asarray([0.01, 0.04, 0.03, 0.002])
 
@@ -729,6 +790,42 @@ class IdentifiabilityStatisticsTests(unittest.TestCase):
             records.append(record)
         return records
 
+    @staticmethod
+    def make_correlated_parameter_records(*, n, seed, material="elastic"):
+        rng = np.random.default_rng(seed)
+        latent = rng.uniform(-1.0, 1.0, size=n)
+        log10_e = 5.5 + 1.20 * latent + rng.normal(0.0, 0.002, size=n)
+        nu = 0.25 + 0.16 * latent + rng.normal(0.0, 0.0002, size=n)
+        nuisance = rng.normal(size=(n, 4))
+        varying_columns = (
+            "initial_centroid_x",
+            "initial_centroid_y",
+            "initial_centroid_z",
+            "initial_extent_x",
+        )
+        records = []
+        for index in range(n):
+            record = {
+                "model": f"{material}-correlated-{index:04d}.h5",
+                "split": "train",
+                "material": material,
+                "valid": True,
+                "log10_e": float(log10_e[index]),
+                "nu": float(nu[index]),
+                "centered_shape_mse_f24": float(nu[index]),
+                "centroid_displacement_f24": float(log10_e[index]),
+            }
+            record.update(
+                {
+                    column: float(nuisance[index, column_index])
+                    for column_index, column in enumerate(varying_columns)
+                }
+            )
+            for column in NUISANCE_COLUMNS:
+                record.setdefault(column, 1.0 if column == "gravity" else 0.0)
+            records.append(record)
+        return records
+
     def test_strong_parameter_signal_is_detected_with_reproducible_statistics(self):
         records = self.make_records(n=180, seed=123, response_kind="strong")
 
@@ -752,6 +849,42 @@ class IdentifiabilityStatisticsTests(unittest.TestCase):
         self.assertEqual(strong["response_tier"], "primary")
         self.assertEqual(strong["status"], "ok")
         self.assertIn("r2_mboth", strong)
+        self.assertEqual(strong.get("reference_model"), "Mnu")
+        self.assertEqual(strong.get("augmented_model"), "Mboth")
+        self.assertEqual(strong["r2_augmented"], strong["r2_mboth"])
+
+    def test_correlated_parameters_do_not_create_pseudo_conditional_effects(self):
+        records = self.make_correlated_parameter_records(
+            n=120,
+            seed=2026,
+        )
+        settings = AuditSettings(
+            seed=0,
+            folds=5,
+            permutations=9,
+            bootstrap_samples=16,
+        )
+
+        rows = material_identifiability.analyze_responses(records, settings)
+        pseudo_effects = (
+            find_row(
+                rows,
+                material="elastic",
+                parameter="log10_e",
+                response="centered_shape_mse_f24",
+            ),
+            find_row(
+                rows,
+                material="elastic",
+                parameter="nu",
+                response="centroid_displacement_f24",
+            ),
+        )
+
+        for row in pseudo_effects:
+            with self.subTest(parameter=row["parameter"]):
+                self.assertLess(row["delta_r2"], 0.05)
+                self.assertEqual(row["augmented_model"], "Mboth")
 
     def test_null_parameter_signal_remains_below_identifiability_threshold(self):
         records = self.make_records(n=180, seed=456, response_kind="null")
@@ -803,17 +936,17 @@ class IdentifiabilityStatisticsTests(unittest.TestCase):
         )
         parameter_prediction = material_identifiability._nested_cv_predictions(
             nuisance,
-            {},
+            {"log10_e": parameter, "nu": np.asarray([record["nu"] for record in records])},
             parameter,
             folds,
-            augmented_parameter=None,
+            augmented_parameter="nu",
         )
         response_prediction = material_identifiability._nested_cv_predictions(
             nuisance,
             {"log10_e": parameter, "nu": np.asarray([record["nu"] for record in records])},
             response,
             folds,
-            augmented_parameter=None,
+            augmented_parameter="nu",
         )
         expected = float(
             spearmanr(
@@ -1009,6 +1142,61 @@ class ClassificationTests(unittest.TestCase):
                     )["status"],
                     "weak",
                 )
+
+    def test_classification_treats_constant_primary_as_legal_no_evidence(self):
+        responses = self._complete_responses(
+            delta_r2=0.05,
+            permutation_p=0.049,
+            q_value=0.049,
+            bootstrap_ci_low=0.001,
+            partial_spearman=0.2,
+        )
+        responses[1].update(
+            {
+                "status": "constant_response",
+                "delta_r2": 0.0,
+                "permutation_p": 1.0,
+                "q_value": 1.0,
+                "bootstrap_ci_low": 0.0,
+                "bootstrap_ci_high": 0.0,
+                "partial_spearman": float("nan"),
+            }
+        )
+
+        summary = classify_identifiability(
+            responses,
+            [self._confounding()],
+            [self._support()],
+        )
+
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "identifiable")
+        self.assertNotIn("invalid_primary_statistics", row["reason_codes"])
+
+        constant_responses = [
+            self._response(
+                response=response,
+                status="constant_response",
+                delta_r2=0.0,
+                permutation_p=1.0,
+                q_value=1.0,
+                bootstrap_ci_low=0.0,
+                bootstrap_ci_high=0.0,
+                partial_spearman=float("nan"),
+            )
+            for response in PRIMARY_RESPONSE_COLUMNS
+        ]
+        constant_summary = classify_identifiability(
+            constant_responses,
+            [self._confounding()],
+            [self._support()],
+        )
+        constant_row = find_row(
+            constant_summary,
+            material="elastic",
+            parameter="log10_e",
+        )
+        self.assertEqual(constant_row["status"], "not_detected")
 
     def test_classification_distinguishes_weak_not_detected_and_confounded(self):
         weak_rows = self._complete_responses(delta_r2=0.01)
@@ -1265,6 +1453,15 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(len(metadata["invalid_records"]), 1)
         self.assertEqual(metadata["invalid_records"][0]["path"], "bad.h5")
         self.assertEqual(metadata["seed"], 0)
+        self.assertEqual(metadata.get("audit_integrity_status"), "train_invalid")
+        self.assertEqual(metadata.get("schema_version"), "1.0")
+        generated_at = metadata.get("generated_at")
+        self.assertIsInstance(generated_at, str)
+        parsed_generated_at = datetime.fromisoformat(
+            generated_at.replace("Z", "+00:00")
+        )
+        self.assertEqual(parsed_generated_at.tzinfo, timezone.utc)
+        self.assertTrue(generated_at.endswith("Z"))
         self.assertIn(
             "无效记录",
             paths["metadata"].read_text(encoding="utf-8"),
@@ -1278,8 +1475,9 @@ class OutputTests(unittest.TestCase):
             {"1"},
         )
         self.assertTrue(
-            all("invalid_records" in row["reason_codes"] for row in summary_rows)
+            all("train_invalid_records" in row["reason_codes"] for row in summary_rows)
         )
+        self.assertEqual({row["support_status"] for row in summary_rows}, {"in_support"})
 
         with paths["records"].open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -1303,6 +1501,76 @@ class OutputTests(unittest.TestCase):
         self.assertIn("不能证明反事实物理正确", report)
         self.assertIn("不能构成配对反事实样本", report)
         self.assertIn("不使用 test 动力学", report)
+        self.assertIn("observational conditional incremental association", report)
+        self.assertIn("不是 counterfactual causality", report)
+        self.assertIn("audit_integrity_status: train_invalid", report)
+        self.assertIn("train invalid records: 1", report)
+        self.assertIn("test invalid records: 0", report)
+
+        with paths["response"].open(newline="", encoding="utf-8") as handle:
+            response_reader = csv.DictReader(handle)
+            list(response_reader)
+        self.assertIn("reference_model", response_reader.fieldnames)
+        self.assertIn("augmented_model", response_reader.fieldnames)
+
+    def test_test_invalid_records_do_not_overwrite_train_status(self):
+        payload = dict(self.payload)
+        payload["metadata"] = {
+            "seed": 0,
+            "invalid_records": [
+                {"path": "bad-test.h5", "split": "test", "error": "missing E"}
+            ],
+        }
+        payload["summary_rows"] = [dict(row) for row in self.summary_rows]
+        for row in payload["summary_rows"]:
+            row["reason_codes"] = (
+                *row["reason_codes"],
+                "test_parameter_in_support",
+            )
+        payload["summary_rows"][0]["status"] = "identifiable"
+        payload["summary_rows"][0]["reason_codes"] = (
+            "primary_delta_r2",
+            "test_parameter_in_support",
+        )
+
+        paths = write_audit_outputs(
+            self.output_dir,
+            overwrite=False,
+            **payload,
+        )
+
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(metadata.get("audit_integrity_status"), "test_invalid")
+        with paths["summary"].open(newline="", encoding="utf-8") as handle:
+            summary_rows = list(csv.DictReader(handle))
+        elastic_e = find_row(
+            summary_rows,
+            material="elastic",
+            parameter="log10_e",
+        )
+        self.assertEqual(elastic_e["status"], "identifiable")
+        self.assertEqual({row["status"] for row in summary_rows[1:]}, {"not_detected"})
+        self.assertEqual({row["support_status"] for row in summary_rows}, {"unknown"})
+        self.assertTrue(
+            all("test_invalid_records" in row["reason_codes"] for row in summary_rows)
+        )
+        self.assertTrue(
+            all("test_support_unknown" in row["reason_codes"] for row in summary_rows)
+        )
+        self.assertTrue(
+            all(
+                "test_parameter_in_support" not in row["reason_codes"]
+                and "test_parameter_extrapolation" not in row["reason_codes"]
+                for row in summary_rows
+            )
+        )
+        self.assertTrue(
+            all("train_invalid_records" not in row["reason_codes"] for row in summary_rows)
+        )
+        report = paths["report"].read_text(encoding="utf-8")
+        self.assertIn("audit_integrity_status: test_invalid", report)
+        self.assertIn("train invalid records: 0", report)
+        self.assertIn("test invalid records: 1", report)
 
     def test_writer_leaves_final_paths_untouched_when_rendering_fails(self):
         broken_payload = dict(self.payload)
@@ -1422,6 +1690,33 @@ class OutputTests(unittest.TestCase):
 
         self.assertTrue(blocked_path.is_dir())
         self.assertEqual(list(self.output_dir.iterdir()), [blocked_path])
+
+    def test_writer_rechecks_output_targets_immediately_before_activation(self):
+        raced_path = self.output_dir / OUTPUT_NAMES["summary"]
+        original_render = material_identifiability.render_markdown_report
+
+        def render_after_raced_target(*args, **kwargs):
+            self.output_dir.mkdir()
+            raced_path.write_text("concurrent output\n", encoding="utf-8")
+            return original_render(*args, **kwargs)
+
+        with mock.patch.object(
+            material_identifiability,
+            "render_markdown_report",
+            side_effect=render_after_raced_target,
+        ):
+            with self.assertRaises(FileExistsError):
+                write_audit_outputs(
+                    self.output_dir,
+                    overwrite=False,
+                    **self.payload,
+                )
+
+        self.assertEqual(
+            raced_path.read_text(encoding="utf-8"),
+            "concurrent output\n",
+        )
+        self.assertEqual(list(self.output_dir.iterdir()), [raced_path])
 
     def test_writer_restores_all_old_outputs_after_mid_activation_failure(self):
         paths = write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
@@ -1603,6 +1898,64 @@ class CliTests(unittest.TestCase):
             include_dynamics=False,
         )
 
+    def test_runner_rejects_same_resolved_split_directory_before_reading(self):
+        (self.train_dir / "shared.h5").touch()
+
+        with mock.patch(
+            "diagnose_material_identifiability._read_split_records",
+            return_value=[],
+        ) as reader:
+            with self.assertRaisesRegex(ValueError, "same resolved directory"):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.train_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        reader.assert_not_called()
+
+    def test_runner_rejects_overlapping_resolved_h5_files_before_reading(self):
+        train_path = self.train_dir / "train-object.h5"
+        test_alias = self.test_dir / "test-alias.h5"
+        train_path.touch()
+        os.link(train_path, test_alias)
+
+        with mock.patch(
+            "diagnose_material_identifiability._read_split_records",
+            return_value=[],
+        ) as reader:
+            with self.assertRaisesRegex(ValueError, "overlapping resolved H5"):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.test_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        reader.assert_not_called()
+
+    def test_runner_rejects_overlapping_object_filenames_before_reading(self):
+        (self.train_dir / "same-object.h5").touch()
+        (self.test_dir / "same-object.h5").touch()
+
+        with mock.patch(
+            "diagnose_material_identifiability._read_split_records",
+            return_value=[],
+        ) as reader:
+            with self.assertRaisesRegex(
+                ValueError,
+                "object/model ID.*same-object.h5",
+            ):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.test_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        reader.assert_not_called()
+
     def test_parser_uses_frozen_production_defaults(self):
         args = build_parser().parse_args(
             ["--train-dir", str(self.train_dir), "--test-dir", str(self.test_dir)]
@@ -1664,6 +2017,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(metadata["test_valid_count"], 6)
         self.assertEqual(len(metadata["invalid_records"]), 1)
         self.assertTrue(metadata["invalid_records"][0]["path"].endswith("bad.h5"))
+        self.assertEqual(metadata.get("audit_integrity_status"), "train_invalid")
 
         with paths["records"].open(newline="", encoding="utf-8") as handle:
             records = list(csv.DictReader(handle))
@@ -1674,7 +2028,9 @@ class CliTests(unittest.TestCase):
         with paths["summary"].open(newline="", encoding="utf-8") as handle:
             summary_rows = list(csv.DictReader(handle))
         self.assertEqual({row["status"] for row in summary_rows}, {"invalid"})
-        self.assertTrue(all("invalid_records" in row["reason_codes"] for row in summary_rows))
+        self.assertTrue(
+            all("train_invalid_records" in row["reason_codes"] for row in summary_rows)
+        )
         self.assertIn("train 1/19", progress.getvalue())
         self.assertIn("test 1/6", progress.getvalue())
         self.assertIn("response", progress.getvalue())
@@ -1707,6 +2063,38 @@ class CliTests(unittest.TestCase):
                     AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
                 )
 
+        self.assertFalse(self.output_dir.exists())
+
+    def test_runner_rejects_missing_valid_test_material_before_statistics(self):
+        for material_code in range(3):
+            for index in range(2):
+                self._write_h5(
+                    self.train_dir / f"train-{material_code}-{index}.h5",
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=True,
+                )
+        for material_code in (0, 1):
+            self._write_h5(
+                self.test_dir / f"test-{material_code}.h5",
+                material_code=material_code,
+                index=0,
+                include_dynamics=False,
+            )
+
+        with mock.patch(
+            "diagnose_material_identifiability.build_coverage_rows",
+            side_effect=ValueError("statistical fitting started"),
+        ) as statistics:
+            with self.assertRaisesRegex(ValueError, "sand.*0 valid test"):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.test_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        statistics.assert_not_called()
         self.assertFalse(self.output_dir.exists())
 
     def test_runner_rejects_empty_test_h5_directory_before_statistics_or_outputs(self):
@@ -1768,6 +2156,28 @@ class CliTests(unittest.TestCase):
             overwrite=True,
         )
         self.assertTrue(all(path.is_file() for path in paths.values()))
+
+    def test_runner_preflights_existing_output_before_reading_records(self):
+        (self.train_dir / "train-only.h5").touch()
+        (self.test_dir / "test-only.h5").touch()
+        self.output_dir.mkdir()
+        existing_target = self.output_dir / OUTPUT_NAMES["response"]
+        existing_target.write_text("existing\n", encoding="utf-8")
+
+        with mock.patch(
+            "diagnose_material_identifiability._read_split_records",
+            side_effect=FileExistsError("record reading started"),
+        ) as reader:
+            with self.assertRaisesRegex(FileExistsError, "response"):
+                run_material_identifiability_audit(
+                    self.train_dir,
+                    self.test_dir,
+                    self.output_dir,
+                    AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+                )
+
+        reader.assert_not_called()
+        self.assertEqual(existing_target.read_text(encoding="utf-8"), "existing\n")
 
 
 if __name__ == "__main__":

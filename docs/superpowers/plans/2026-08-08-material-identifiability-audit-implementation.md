@@ -17,7 +17,11 @@
 - 只有仿真开始前确定的量可进入 nuisance；未来接触属于 response。
 - 接触阈值使用原始坐标 `0.08`。
 - 固定默认 `seed=0`、5 folds、500 permutations、1000 bootstrap samples。
+- 冻结条件效应：`log10(E)` 使用 `Mnu -> Mboth`，`nu` 使用 `ME -> Mboth`；partial Spearman、置换与 bootstrap 均使用同一 conditional reference。
+- 响应统计只表述为 observational conditional incremental association，不表述为 counterfactual causality。
+- train/test resolved 目录、底层 H5 与 object/model filename 必须互斥，且两个 split 都必须覆盖三种材质。
 - 不覆盖既有输出，除非 CLI 显式传入 `--overwrite`。
+- metadata 固定 `schema_version="1.0"` 和 UTC ISO-8601 `generated_at`；train/test invalid 分轴传播并输出顶层 `audit_integrity_status`。
 - 不修改数据生成代码，不运行 B4 sweep，不训练新模型。
 - commit 作者只能是 Will，不添加 AI co-author/contributor；不执行 `git push`。
 
@@ -226,6 +230,8 @@ self.assertTrue(record["valid"])
 
 Missing mandatory physics fields must raise `RecordValidationError`. A degenerate hull is a recorded missing descriptor, not a reason to discard all other valid fields.
 
+Add a direct generator-schema regression that writes both `drag_force` and `drag_mask` from empty Python lists. The resulting `(0,)` datasets are accepted only when both are empty and are normalized to `(0,3)` / `(0,N)` before validation. Non-empty one-dimensional drag arrays remain invalid.
+
 - [ ] **Step 6: Run Task 1 tests and verify GREEN**
 
 ```bash
@@ -309,7 +315,7 @@ train_min, train_max, test_min, test_max, outside_train_fraction,
 ks_statistic, ks_pvalue, wasserstein_distance
 ```
 
-Also report joint empty-bin fraction, standardized mean differences for static nuisance columns, and a material-local joint Mahalanobis diagnostic. Remove train-constant columns, standardize from train only, regularize covariance as `cov + 1e-6 * I`, and report the fraction of test distances above the train 95th percentile as `mahalanobis_outside_fraction`. `support_status="out_of_support"` if any parameter has more than 5% out-of-range test samples, more than 20% of test samples fall in train-empty joint bins, or more than 20% exceed the train Mahalanobis 95th-percentile threshold; otherwise `in_support`.
+Also report joint empty-bin fraction, standardized mean differences for static nuisance columns, and a material-local joint Mahalanobis diagnostic. Remove train-constant columns, standardize from train only, regularize covariance as `cov + 1e-6 * I`, and report the fraction of test distances above the train 95th percentile as `mahalanobis_outside_fraction`. `support_status="out_of_support"` if any parameter has more than 5% out-of-range test samples, more than 20% of test samples fall in train-empty joint bins, or more than 20% exceed the train Mahalanobis 95th-percentile threshold; otherwise `in_support`. If `n_test=0` (or the train reference is absent), return `unknown`, never `in_support`.
 
 - [ ] **Step 5: Run Task 1-2 tests**
 
@@ -347,6 +353,7 @@ git commit -m "Add material parameter coverage audit"
   - `_piecewise_basis(train_values: np.ndarray, eval_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]`
   - `_nested_cv_predictions(nuisance: np.ndarray, parameters: dict[str, np.ndarray], response: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]], *, augmented_parameter: str | None) -> np.ndarray`
   - `_permutation_pvalue(observed: float, null_values: np.ndarray) -> float`
+  - `_permute_conditional_residuals(parameter: np.ndarray, conditional_prediction: np.ndarray, *, rng) -> np.ndarray`
   - `_bootstrap_delta_r2(base_prediction: np.ndarray, augmented_prediction: np.ndarray, response: np.ndarray, *, samples: int, seed: int) -> tuple[float, float]`
 
 - [ ] **Step 1: Write failing fold and basis tests**
@@ -451,6 +458,8 @@ self.assertNotIn("future_contact_fraction", NUISANCE_COLUMNS)
 
 Tests use reduced `permutations=20` and `bootstrap_samples=40`; construct a large signal so the tests are deterministic rather than relying on marginal p-values.
 
+Add a correlated-parameter counterexample with two responses: one generated only from `nu`, one only from `log10(E)`. Highly correlated `E/nu` must not create `delta_R2 >= 0.05` for the non-generating parameter in either direction. Assert explicit `reference_model` / `augmented_model` fields.
+
 - [ ] **Step 5: Implement confounding analysis**
 
 For each material and each parameter:
@@ -468,19 +477,21 @@ For each material and response, fit `M0/ME/Mnu/Mboth` on identical folds. Emit:
 
 ```text
 material, parameter, response, response_tier, n,
-r2_m0, r2_augmented, delta_r2,
+reference_model, augmented_model,
+r2_m0, r2_me, r2_mnu, r2_mboth, r2_augmented, delta_r2,
 partial_spearman, permutation_p,
 bootstrap_ci_low, bootstrap_ci_high, q_value
 ```
 
 Statistical details are fixed:
 
-- `delta_r2 = pooled_oof_r2_augmented - pooled_oof_r2_m0`;
+- for `log10(E)`, `reference_model=Mnu`, `augmented_model=Mboth`, and `delta_r2=R2(Mboth)-R2(Mnu)`;
+- for `nu`, `reference_model=ME`, `augmented_model=Mboth`, and `delta_r2=R2(Mboth)-R2(ME)`;
 - if the held-out response total sum of squares is below `1e-12`, emit `status=constant_response` and do not classify it as evidence;
-- partial Spearman uses two cross-fitted residual vectors: residualize the parameter from nuisance and the response from nuisance using train-fold-only fits, then compute Spearman on pooled held-out residuals;
-- a parameter permutation is performed within material before rebuilding its basis; nuisance, response, folds and model names remain fixed;
+- partial Spearman uses two cross-fitted residual vectors: residualize the target parameter and response from static nuisance plus the other parameter (`E` controls `nu`; `nu` controls `E`) using train-fold-only fits, then compute Spearman on pooled held-out residuals;
+- conditional residual permutation first cross-fit predicts the target parameter from static nuisance plus the other parameter basis, permutes only its pooled residual, reconstructs `prediction + permuted_residual`, and computes the same conditional reference-to-`Mboth` null increment; nuisance, response, folds and model names remain fixed;
 - permutation p-value is `(1 + count(null_delta >= observed_delta)) / (1 + permutations)`, so it is never zero;
-- bootstrap resamples object-level pooled out-of-fold tuples with replacement using deterministic derived seeds and recomputes `delta_r2`; it does not silently refit on individual frames or particles;
+- bootstrap resamples object-level tuples of conditional reference prediction, `Mboth` prediction and response with replacement using deterministic derived seeds and recomputes `delta_r2`; it does not silently refit on individual frames or particles;
 - bootstrap is stratified implicitly because every analysis call already contains exactly one material group.
 
 Compute FDR independently for each `material x parameter` family across responses. Secondary responses receive full statistics but cannot independently trigger `identifiable`.
@@ -553,6 +564,8 @@ response_tier=primary, delta_r2=0.05, permutation_p=0.049,
 q_value=0.049, bootstrap_ci_low>0, confounded=False
 ```
 
+Add a completeness fixture with one `constant_response` primary and another fully qualifying primary; it must remain `identifiable`. An all-constant primary family is valid no-evidence and becomes `not_detected`. Missing responses, fit failures, or non-finite fields on `status=ok` remain `invalid`.
+
 - [ ] **Step 2: Run classification tests and verify RED**
 
 ```bash
@@ -565,7 +578,9 @@ python -m unittest \
 For each `material x parameter`:
 
 ```text
-if confounded:
+if primary/confounding statistics are missing, failed, or unexpectedly non-finite:
+    status = invalid
+elif confounded:
     status = confounded
 elif any qualifying primary response:
     status = identifiable
@@ -575,7 +590,7 @@ else:
     status = not_detected
 ```
 
-Always copy `support_status` as a separate column. Include machine-readable `reason_codes`, e.g. `primary_delta_r2`, `nuisance_predictable`, `test_parameter_extrapolation`.
+Always copy `support_status` as a separate column. Include machine-readable `reason_codes`, e.g. `primary_delta_r2`, `nuisance_predictable`, `test_parameter_extrapolation`. `constant_response` rows are skipped as legal no-evidence rows. During output preparation, train invalid records may force `status=invalid`; test invalid records must leave `status` unchanged and force support to `unknown` when the affected material cannot be located reliably.
 
 - [ ] **Step 4: Write failing output tests**
 
@@ -593,6 +608,9 @@ metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
 self.assertEqual(len(metadata["invalid_records"]), 1)
 self.assertEqual(metadata["invalid_records"][0]["path"], "bad.h5")
 self.assertEqual(metadata["seed"], 0)
+self.assertEqual(metadata["schema_version"], "1.0")
+self.assertEqual(metadata["audit_integrity_status"], "train_invalid")
+# generated_at parses as timezone-aware UTC ISO-8601.
 
 with paths["records"].open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle))
@@ -605,7 +623,11 @@ self.assertIn("elastic", report)
 self.assertIn("plasticine", report)
 self.assertIn("sand", report)
 self.assertIn("不能证明反事实物理正确", report)
+self.assertIn("observational conditional incremental association", report)
+self.assertIn("不是 counterfactual causality", report)
 ```
+
+Add a test-invalid payload whose train statuses include an `identifiable` row. Writing it must preserve every train `status`, set all support rows to `unknown`, emit `audit_integrity_status=test_invalid`, and report train/test invalid counts separately. Add a TOCTOU regression that creates a target during rendering and verifies the writer refuses activation without replacing it.
 
 - [ ] **Step 5: Implement CSV/JSON/Markdown writers**
 
@@ -623,7 +645,7 @@ OUTPUT_NAMES = {
 }
 ```
 
-Before writing, check all seven target paths. If any exists and `overwrite=False`, raise `FileExistsError` before writing any file. Write JSON with UTF-8 and `ensure_ascii=False`; write CSV with stable explicit column order.
+Before rendering, check all seven target paths. If any exists and `overwrite=False`, raise `FileExistsError` before writing any file. After rendering and immediately before activation, repeat the same check so a concurrently created target cannot be overwritten. Write JSON with UTF-8 and `ensure_ascii=False`; write CSV with stable explicit column order. Metadata output adds fixed `schema_version="1.0"`, UTC ISO-8601 `generated_at`, split invalid counts, and derived top-level `audit_integrity_status`.
 
 `coverage.csv` contains both distribution and support rows, distinguished by `row_type=distribution/support`; `support_rows` must not create an eighth file. Render all seven files completely in a temporary sibling directory first, then move them into the final output directory only after every render succeeds. A render exception must leave the final target paths unchanged.
 
@@ -688,7 +710,7 @@ self.assertEqual(len(metadata["invalid_records"]), 1)
 self.assertTrue(metadata["invalid_records"][0]["path"].endswith("bad.h5"))
 ```
 
-Create a separate fixture with no sand train records and assert `run_material_identifiability_audit` raises `ValueError` naming `sand` before statistical fitting.
+Create separate fixtures with no sand train records and no sand test records; each must raise `ValueError` naming `sand` before statistical fitting. Add pre-read failures for the same resolved directory, overlapping resolved/identical H5 files, duplicate object/model filenames, and an existing output target.
 
 The smoke fixture creates at least 6 train objects and 2 test objects per material, then uses `folds=2`, `permutations=2`, `bootstrap_samples=4`. It verifies plumbing and schema, not statistical power.
 
@@ -726,12 +748,14 @@ The runner must:
 
 1. resolve and validate both directories;
 2. sort `*.h5` paths;
-3. process train with dynamics and test statically;
-4. catch only `RecordValidationError`, append `{path, split, error}` to `invalid_records`, and continue;
-5. abort before statistics if any material has fewer records than `folds`;
-6. build coverage, support, confounding, response and summary rows;
-7. write all seven outputs atomically after computation;
-8. print progress as `train i/n`, `test i/n`, and each statistical stage.
+3. reject equal resolved directories, overlapping resolved/identical H5 files, and duplicate filename IDs;
+4. preflight all seven output targets before reading any H5;
+5. process train with dynamics and test statically;
+6. catch only `RecordValidationError`, append `{path, split, error}` to `invalid_records`, and continue;
+7. abort before statistics unless every train material has at least `folds` valid records and every test material has at least one valid record;
+8. build coverage, support, confounding, response and summary rows;
+9. write all seven outputs atomically after computation, retaining the writer's final activation preflight;
+10. print progress as `train i/n`, `test i/n`, and each statistical stage.
 
 Unexpected I/O/programming exceptions must propagate rather than being mislabeled as invalid data.
 
@@ -795,6 +819,10 @@ The detailed entry must copy the frozen thresholds and explicitly state:
 - test GT dynamics are forbidden;
 - no B5 training is registered before the report is interpreted;
 - `np.random.randint(0,1)` is recorded as a protocol fact but not fixed here.
+- response evidence is conditional (`E: Mnu -> Mboth`; `nu: ME -> Mboth`) and observational, not counterfactual causal;
+- `constant_response` is valid no-evidence rather than invalid statistics;
+- train/test invalid records affect `status` and `support_status` separately;
+- both splits must cover all three materials and must not overlap.
 
 - [ ] **Step 2: Add the exact server command**
 
@@ -855,13 +883,19 @@ Review against the design checklist:
 ```text
 [ ] test never reads dynamics
 [ ] object-level folds only
+[ ] E uses Mnu -> Mboth; nu uses ME -> Mboth
+[ ] conditional residual permutation preserves E/nu correlation structure
 [ ] future contact excluded from nuisance
 [ ] train-only statistics
 [ ] no model/CUDA imports
 [ ] fixed seeds/folds/permutations/bootstrap
 [ ] primary vs secondary response enforced
+[ ] constant primary is legal no-evidence
 [ ] support shift separate from confounding
-[ ] output refusal is atomic
+[ ] test invalid never overwrites train status
+[ ] split overlap and missing test material fail before statistics
+[ ] output refusal is early, final, and atomic
+[ ] metadata schema_version/generated_at/audit_integrity_status are present
 [ ] exact seven-file schema
 ```
 

@@ -7,6 +7,7 @@ import math
 import shutil
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -206,6 +207,8 @@ _RESPONSE_OUTPUT_COLUMNS = (
     "folds",
     "nuisance_features",
     "fitted_features",
+    "reference_model",
+    "augmented_model",
     "r2_m0",
     "r2_me",
     "r2_mnu",
@@ -227,6 +230,8 @@ _SUMMARY_COLUMNS = (
     "support_status",
     "reason_codes",
     "invalid_record_count",
+    "train_invalid_record_count",
+    "test_invalid_record_count",
 )
 
 PARAMETER_COLUMNS = ("log10_e", "nu")
@@ -242,6 +247,7 @@ _LOG10_E_RANGE = (4.0, 7.0)
 _NU_RANGE = (0.05, 0.45)
 _RIDGE_ALPHAS = 10.0 ** np.arange(-4, 4)
 _STAT_EPSILON = 1e-12
+_SCHEMA_VERSION = "1.0"
 
 _STATIC_REQUIRED_FIELDS = (
     "x",
@@ -344,6 +350,14 @@ def _static_features(
 
     drag_force = np.asarray(handle["drag_force"][:], dtype=np.float64)
     drag_mask = np.asarray(handle["drag_mask"][:], dtype=np.float64)
+    if (
+        drag_force.ndim == 1
+        and drag_force.size == 0
+        and drag_mask.ndim == 1
+        and drag_mask.size == 0
+    ):
+        drag_force = drag_force.reshape(0, 3)
+        drag_mask = drag_mask.reshape(0, particle_count)
     if drag_force.ndim != 2 or drag_force.shape[1] != 3:
         raise RecordValidationError("drag_force must have shape (forces, 3)")
     if drag_mask.ndim != 2:
@@ -775,9 +789,13 @@ def build_support_rows(
             or mahalanobis_diagnostics["mahalanobis_outside_fraction"] > 0.20
             or mahalanobis_diagnostics["mahalanobis_nonfinite_test_fraction"] > 0
         )
+        if not train_material_records or not test_material_records:
+            support_status = "unknown"
+        else:
+            support_status = "out_of_support" if out_of_support else "in_support"
         diagnostics = {
             "joint_empty_bin_fraction": joint_empty_fraction,
-            "support_status": "out_of_support" if out_of_support else "in_support",
+            "support_status": support_status,
             **mahalanobis_diagnostics,
             **_standardized_mean_differences(
                 train_material_records,
@@ -1199,6 +1217,24 @@ def _bootstrap_delta_r2(
     return float(lower), float(upper)
 
 
+def _permute_conditional_residuals(
+    parameter: np.ndarray,
+    conditional_prediction: np.ndarray,
+    *,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Permute cross-fitted residuals while retaining the conditional prediction."""
+    values = np.asarray(parameter, dtype=np.float64)
+    prediction = np.asarray(conditional_prediction, dtype=np.float64)
+    if values.ndim != 1 or values.shape != prediction.shape:
+        raise ValueError(
+            "parameter and conditional_prediction must be aligned one-dimensional arrays"
+        )
+    if not np.isfinite(values).all() or not np.isfinite(prediction).all():
+        raise ValueError("conditional residual permutation inputs must be finite")
+    return prediction + rng.permutation(values - prediction)
+
+
 def _derived_seed(seed: int, *parts: str) -> int:
     payload = "|".join((str(seed), *map(str, parts))).encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
@@ -1427,6 +1463,7 @@ def _empty_response_row(
     status: str,
 ) -> dict[str, object]:
     constant = status == "constant_response"
+    reference_model = "Mnu" if parameter == "log10_e" else "ME"
     return {
         "material": material,
         "parameter": parameter,
@@ -1437,6 +1474,8 @@ def _empty_response_row(
         "folds": folds,
         "nuisance_features": _STATIC_NUISANCE_COLUMNS,
         "fitted_features": (),
+        "reference_model": reference_model,
+        "augmented_model": "Mboth",
         "r2_m0": float("nan"),
         "r2_me": float("nan"),
         "r2_mnu": float("nan"),
@@ -1559,19 +1598,25 @@ def analyze_responses(
                 for name, prediction in predictions.items()
             }
             for parameter in PARAMETER_COLUMNS:
-                augmented_model = "me" if parameter == "log10_e" else "mnu"
-                augmented_prediction = predictions[augmented_model]
-                delta_r2 = model_r2[augmented_model] - model_r2["m0"]
+                if parameter == "log10_e":
+                    reference_model = "mnu"
+                    other_parameter = "nu"
+                else:
+                    reference_model = "me"
+                    other_parameter = "log10_e"
+                reference_prediction = predictions[reference_model]
+                augmented_prediction = predictions["mboth"]
+                delta_r2 = model_r2["mboth"] - model_r2[reference_model]
                 parameter_prediction = _nested_cv_predictions(
                     nuisance,
-                    {},
+                    parameters,
                     parameters[parameter],
                     folds,
-                    augmented_parameter=None,
+                    augmented_parameter=other_parameter,
                 )
                 _, _, partial_spearman = _safe_correlations(
                     parameters[parameter] - parameter_prediction,
-                    response_values - predictions["m0"],
+                    response_values - reference_prediction,
                 )
                 rng = np.random.default_rng(
                     _derived_seed(
@@ -1586,19 +1631,21 @@ def analyze_responses(
                 null_values = np.empty(settings.permutations, dtype=np.float64)
                 for permutation_index in range(settings.permutations):
                     permuted_parameters = dict(parameters)
-                    permuted_parameters[parameter] = rng.permutation(
-                        parameters[parameter]
+                    permuted_parameters[parameter] = _permute_conditional_residuals(
+                        parameters[parameter],
+                        parameter_prediction,
+                        rng=rng,
                     )
                     null_prediction = _nested_cv_predictions(
                         nuisance,
                         permuted_parameters,
                         response_values,
                         folds,
-                        augmented_parameter=parameter,
+                        augmented_parameter="both",
                     )
                     null_values[permutation_index] = (
                         _pooled_oof_r2(response_values, null_prediction)
-                        - model_r2["m0"]
+                        - model_r2[reference_model]
                     )
                 permutation_p = _permutation_pvalue(delta_r2, null_values)
                 bootstrap_seed = _derived_seed(
@@ -1610,7 +1657,7 @@ def analyze_responses(
                     "bootstrap",
                 )
                 bootstrap_ci_low, bootstrap_ci_high = _bootstrap_delta_r2(
-                    predictions["m0"],
+                    reference_prediction,
                     augmented_prediction,
                     response_values,
                     samples=settings.bootstrap_samples,
@@ -1629,11 +1676,15 @@ def analyze_responses(
                         "folds": effective_folds,
                         "nuisance_features": _STATIC_NUISANCE_COLUMNS,
                         "fitted_features": fitted_features,
+                        "reference_model": "Mnu"
+                        if reference_model == "mnu"
+                        else "ME",
+                        "augmented_model": "Mboth",
                         "r2_m0": model_r2["m0"],
                         "r2_me": model_r2["me"],
                         "r2_mnu": model_r2["mnu"],
                         "r2_mboth": model_r2["mboth"],
-                        "r2_augmented": model_r2[augmented_model],
+                        "r2_augmented": model_r2["mboth"],
                         "delta_r2": delta_r2,
                         "partial_spearman": partial_spearman,
                         "permutation_p": permutation_p,
@@ -1818,8 +1869,14 @@ def _classification_completeness_reasons(
     if any(count > 1 for count in primary_counts.values()):
         reasons.append("duplicate_primary_responses")
     if any(
-        row.get("status") != "ok"
-        or any(_as_finite_float(row.get(field)) is None for field in _PRIMARY_CLASSIFICATION_FIELDS)
+        row.get("status") not in {"ok", "constant_response"}
+        or (
+            row.get("status") == "ok"
+            and any(
+                _as_finite_float(row.get(field)) is None
+                for field in _PRIMARY_CLASSIFICATION_FIELDS
+            )
+        )
         for row in primary_rows
     ):
         reasons.append("invalid_primary_statistics")
@@ -2021,6 +2078,59 @@ def _metadata_invalid_records(metadata: dict) -> list[object]:
     return invalid_records
 
 
+def _metadata_with_audit_integrity(metadata: dict) -> dict:
+    prepared = dict(metadata)
+    invalid_records = _metadata_invalid_records(prepared)
+    split_counts = {"train": 0, "test": 0, "unknown": 0}
+    for record in invalid_records:
+        split = record.get("split") if isinstance(record, dict) else None
+        if split in {"train", "test"}:
+            split_counts[str(split)] += 1
+        else:
+            split_counts["unknown"] += 1
+
+    train_blocking = split_counts["train"] > 0 or split_counts["unknown"] > 0
+    test_blocking = split_counts["test"] > 0 or split_counts["unknown"] > 0
+    if train_blocking and test_blocking:
+        integrity_status = "train_and_test_invalid"
+    elif train_blocking:
+        integrity_status = "train_invalid"
+    elif test_blocking:
+        integrity_status = "test_invalid"
+    else:
+        integrity_status = "ok"
+
+    supplied_status = prepared.get("audit_integrity_status")
+    if supplied_status is not None and supplied_status != integrity_status:
+        raise ValueError(
+            "metadata.audit_integrity_status conflicts with invalid_records"
+        )
+    prepared.update(
+        {
+            "audit_integrity_status": integrity_status,
+            "train_invalid_record_count": split_counts["train"],
+            "test_invalid_record_count": split_counts["test"],
+            "unknown_split_invalid_record_count": split_counts["unknown"],
+        }
+    )
+    return prepared
+
+
+def _metadata_with_output_fields(metadata: dict) -> dict:
+    prepared = _metadata_with_audit_integrity(metadata)
+    supplied_version = prepared.get("schema_version")
+    if supplied_version is not None and supplied_version != _SCHEMA_VERSION:
+        raise ValueError(
+            f"metadata.schema_version must be {_SCHEMA_VERSION}"
+        )
+    prepared["schema_version"] = _SCHEMA_VERSION
+    if "generated_at" not in prepared:
+        prepared["generated_at"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+    return prepared
+
+
 def _summary_reason_codes(row: dict[str, object]) -> list[str]:
     reason_codes = row.get("reason_codes", ())
     if isinstance(reason_codes, str):
@@ -2062,8 +2172,16 @@ def _apply_metadata_invalid_records(
     summary_rows: list[dict[str, object]],
     metadata: dict,
 ) -> list[dict[str, object]]:
+    metadata = _metadata_with_audit_integrity(metadata)
     summary_rows = _validate_and_order_summary_rows(summary_rows)
     invalid_record_count = len(_metadata_invalid_records(metadata))
+    train_invalid_record_count = int(metadata["train_invalid_record_count"])
+    test_invalid_record_count = int(metadata["test_invalid_record_count"])
+    unknown_split_invalid_count = int(
+        metadata["unknown_split_invalid_record_count"]
+    )
+    train_blocking = train_invalid_record_count > 0 or unknown_split_invalid_count > 0
+    test_blocking = test_invalid_record_count > 0 or unknown_split_invalid_count > 0
     prepared_rows: list[dict[str, object]] = []
     for row in summary_rows:
         existing_count = _as_finite_float(row.get("invalid_record_count", 0))
@@ -2078,16 +2196,28 @@ def _apply_metadata_invalid_records(
                 "metadata.invalid_records"
             )
         reason_codes = _summary_reason_codes(row)
-        if invalid_record_count == 0 and "invalid_records" in reason_codes:
-            raise ValueError(
-                "summary invalid_records reason conflicts with "
-                "metadata.invalid_records"
-            )
         prepared = dict(row)
         prepared["invalid_record_count"] = invalid_record_count
-        if invalid_record_count:
+        prepared["train_invalid_record_count"] = train_invalid_record_count
+        prepared["test_invalid_record_count"] = test_invalid_record_count
+        if train_blocking:
             prepared["status"] = "invalid"
-            reason_codes.append("invalid_records")
+            reason_codes.append("train_invalid_records")
+        if test_blocking:
+            prepared["support_status"] = "unknown"
+            reason_codes = [
+                code
+                for code in reason_codes
+                if code
+                not in {
+                    "test_parameter_extrapolation",
+                    "test_parameter_in_support",
+                }
+            ]
+            reason_codes.append("test_support_unknown")
+            reason_codes.append("test_invalid_records")
+        if unknown_split_invalid_count:
+            reason_codes.append("invalid_record_split_unknown")
         prepared["reason_codes"] = tuple(dict.fromkeys(reason_codes))
         prepared_rows.append(prepared)
     return prepared_rows
@@ -2126,6 +2256,7 @@ def render_markdown_report(
     metadata: dict,
 ) -> str:
     """Render a Chinese research-decision report from precomputed audit rows."""
+    metadata = _metadata_with_output_fields(metadata)
     summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
     summary_table = _markdown_table(
         ("material", "parameter", "status", "support_status", "reason_codes"),
@@ -2157,6 +2288,8 @@ def render_markdown_report(
             "material",
             "parameter",
             "response",
+            "reference_model",
+            "augmented_model",
             "delta_r2",
             "permutation_p",
             "q_value",
@@ -2166,12 +2299,18 @@ def render_markdown_report(
         primary_responses,
     )
     invalid_count = len(_metadata_invalid_records(metadata))
+    train_invalid_count = int(metadata["train_invalid_record_count"])
+    test_invalid_count = int(metadata["test_invalid_record_count"])
+    unknown_split_invalid_count = int(
+        metadata["unknown_split_invalid_record_count"]
+    )
     return "\n".join(
         (
             "# B0.2 材质参数可辨识性审计",
             "",
             "## 审计边界",
             "本审计只在各材质内部分析 `log10(E)` 与 `nu`，train 使用 GT 动力学响应，test 只用于参数和静态 nuisance 的 support 检查。",
+            "响应统计量是 observational conditional incremental association：`log10(E)` 使用 `Mnu -> Mboth`，`nu` 使用 `ME -> Mboth`；它不是 counterfactual causality。",
             "该 observational audit 不能证明反事实物理正确；三种材质来自不同 UID 区间，不能构成配对反事实样本。",
             "报告不使用 test 动力学，也不以 test 轨迹响应选择模型。",
             "",
@@ -2182,7 +2321,7 @@ def render_markdown_report(
             "## 可辨识性裁决",
             summary_table,
             "",
-            "`status` 只描述 train 内统计证据；`support_status` 独立描述 test 是否位于 train 支持范围内。`invalid` 表示存在未被静默忽略的无效记录，不能据此作出参数结论。",
+            "`status` 只描述 train 内统计证据；train invalid 可使其不可裁决。`support_status` 独立描述 test 是否位于 train 支持范围内；test invalid 只使 support 不可裁决，不覆盖 train `status`。",
             "",
             "## Train/Test Support",
             support_table,
@@ -2194,7 +2333,9 @@ def render_markdown_report(
             response_table,
             "",
             "## 数据完整性与下一步",
-            f"invalid records: {invalid_count}。无效记录必须先定位并处理，再依据对应材质和参数的状态安排后续实验。",
+            f"audit_integrity_status: {metadata['audit_integrity_status']}。",
+            f"invalid records: {invalid_count}；train invalid records: {train_invalid_count}；test invalid records: {test_invalid_count}；unknown-split invalid records: {unknown_split_invalid_count}。",
+            "无法可靠定位材质的 test invalid 会保守地把全部 support 标为 `unknown`，但不会改写 train 可辨识性结论。",
             "若参数被判为 confounded，应优先修订数据生成协议；若 train 内有信号但 test 为 out_of_support，应先修订 split/coverage；若无可检测信号，应改变场景、载荷或参数采样，而不是把结果解释为模型条件注入失败。",
         )
     ) + "\n"
@@ -2208,6 +2349,24 @@ def _validate_output_targets(output_dir: Path, target_paths: dict[str, Path]) ->
             raise IsADirectoryError(
                 f"audit output target is not a regular file: {target_path}"
             )
+
+
+def preflight_audit_output_targets(
+    output_dir: Path,
+    *,
+    overwrite: bool,
+) -> dict[str, Path]:
+    """Validate the exact seven output targets without creating or replacing them."""
+    output_dir = Path(output_dir)
+    target_paths = {key: output_dir / name for key, name in OUTPUT_NAMES.items()}
+    if not overwrite:
+        existing = [path for path in target_paths.values() if path.exists()]
+        if existing:
+            raise FileExistsError(
+                f"refusing to overwrite existing audit output: {existing[0]}"
+            )
+    _validate_output_targets(output_dir, target_paths)
+    return target_paths
 
 
 def _activate_output_files(
@@ -2280,15 +2439,12 @@ def write_audit_outputs(
 ) -> dict[str, Path]:
     """Render all B0.2 artifacts before atomically activating any target file."""
     output_dir = Path(output_dir)
-    target_paths = {key: output_dir / name for key, name in OUTPUT_NAMES.items()}
-    if not overwrite:
-        existing = [path for path in target_paths.values() if path.exists()]
-        if existing:
-            raise FileExistsError(
-                f"refusing to overwrite existing audit output: {existing[0]}"
-            )
-    _validate_output_targets(output_dir, target_paths)
+    target_paths = preflight_audit_output_targets(
+        output_dir,
+        overwrite=overwrite,
+    )
     _validate_test_records_have_no_responses(records)
+    metadata = _metadata_with_output_fields(metadata)
     summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -2344,6 +2500,7 @@ def write_audit_outputs(
         )
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        preflight_audit_output_targets(output_dir, overwrite=overwrite)
         _activate_output_files(temporary_dir, target_paths)
     finally:
         shutil.rmtree(temporary_dir, ignore_errors=True)

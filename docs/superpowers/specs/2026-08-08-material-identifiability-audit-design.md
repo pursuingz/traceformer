@@ -49,6 +49,10 @@ B0.2 是无训练、无 checkpoint 的数据诊断。它只回答以下问题：
 
 禁止使用 `mm3_test` 的后续轨迹、`F/C` 或任何 GT 动力学响应来决定下一结构。当前 41-model test 已多次参与方法诊断，本设计不进一步把它变成调参集。
 
+### 3.3 split 完整性
+
+train/test 必须是两个不同的 resolved 目录，且不得包含相同的 resolved H5、指向同一底层文件的别名，或重复的 object/model ID（最低限度按大小写无关文件名检查）。这些条件必须在读取 H5 和执行统计前验证；任一重叠都使审计无效。
+
 ## 4. 输入与样本单位
 
 输入目录：
@@ -67,7 +71,7 @@ x, v, F, C, vol, E, nu, mat_type, gravity, floor_height,
 drag_force, drag_mask
 ```
 
-字段缺失、形状不一致、NaN/Inf、粒子数或帧数异常必须明确报错或登记为 invalid record；不得静默填零后继续。
+字段缺失、形状不一致、NaN/Inf、粒子数或帧数异常必须明确报错或登记为 invalid record；不得静默填零后继续。真实 zero-force 样本由空 Python list 写出 `drag_force.shape == drag_mask.shape == (0,)`；仅当两者同时确实为空时，reader 将其规范化为 `(0,3)` 与 `(0,N)` 后再校验。任何非空一维 drag 数组仍必须拒绝。
 
 ## 5. 每个 object 的特征提取
 
@@ -179,11 +183,14 @@ Mboth = nuisance + basis(log10(E)) + basis(nu) + E*nu
 - 四个模型使用完全相同 folds；
 - 连续输入只用 train fold 的统计量标准化；
 - ridge 的 alpha 从固定网格 `[1e-4, 1e-3, ..., 1e3]` 中只在 train fold 内选择，不能查看 held-out fold；
-- 主要量为相对 M0 的 held-out `delta_R2`；
-- 同时报告 cross-fitted residual partial Spearman；
-- 每种材质内部执行 500 次参数置换；
-- 执行 1000 次 object bootstrap，报告 95% CI；
+- `log10(E)` 的条件 reference 为 `Mnu`，augmented model 为 `Mboth`，主要量为 `R2(Mboth)-R2(Mnu)`；
+- `nu` 的条件 reference 为 `ME`，augmented model 为 `Mboth`，主要量为 `R2(Mboth)-R2(ME)`；
+- partial Spearman 对参数与响应同时做 cross-fit residualization：`log10(E)` 控制静态 nuisance 与 `nu`，`nu` 控制静态 nuisance 与 `log10(E)`；
+- 每种材质内部执行 500 次 conditional residual permutation：先用固定 object folds 和 train-fold-only preprocessing，以静态 nuisance 与另一参数的 basis 预测目标参数，再置换 cross-fitted residual，并用 `prediction + permuted_residual` 重建参数；null statistic 使用与 observed 相同的 conditional reference 到 `Mboth` 增量；
+- 执行 1000 次 object bootstrap，比较 conditional reference prediction 与 `Mboth` prediction 并报告 95% CI；
 - 多响应检验使用 Benjamini-Hochberg FDR，报告 `q_value`。
+
+该统计量只能解释为 **observational conditional incremental association**，不是 counterfactual causality；即使条件增量显著，也不能据此声称反事实物理因果正确。
 
 预先冻结的**主要响应**为：
 
@@ -230,7 +237,11 @@ Mboth = nuisance + basis(log10(E)) + basis(nu) + E*nu
 
 - nuisance 能显著预测该参数。
 
-Train/test 支持范围另设独立的 `support_status = in_support/out_of_support`，不把分布外问题误称为参数混杂。即使 train 内参数为 `identifiable`，只要 test 为 `out_of_support`，也禁止据此解释模型 test 响应。
+`constant_response` 是合法的“该响应无证据”行，不是统计损坏；分类完整性检查跳过其非有限统计。只要另一条 primary response 满足全部门槛，参数仍可判为 `identifiable`。只有 primary 缺失、拟合失败，或 `status=ok` 时本应有限的分类统计出现非有限值，才使 train 可辨识性不可裁决。
+
+Train/test 支持范围另设独立的 `support_status = in_support/out_of_support/unknown`，不把分布外问题误称为参数混杂。没有有效 test 样本时必须为 `unknown`，不得默认为 `in_support`。CLI 要求 train/test 各自覆盖 elastic、plasticine、sand；train 每种材质至少满足 fold 数，test 每种材质至少一条有效记录。
+
+invalid records 分为两轴：train invalid 可使 train `status` 变为 `invalid`；test invalid 不得覆盖 train `status`，只能使 support 不可裁决。reader 无法可靠定位 test invalid 的材质时，全部 support 保守标为 `unknown`。metadata 顶层 `audit_integrity_status` 使用 `ok/train_invalid/test_invalid/train_and_test_invalid` 明示全局完整性。
 
 方向合理性作为额外证据，不替代可辨识性：例如更高 `E` 在可比外力下通常应降低形变强度，更高 `nu` 通常应降低体积应变。对 plasticine/sand 的方向解释必须结合其本构模型，不能直接套用线弹性结论。
 
@@ -268,7 +279,7 @@ material_identifiability_b02.md
 
 ### `response.csv`
 
-保存 material x parameter x response 的 M0/ME/Mnu/Mboth CV 指标、`delta_R2`、partial Spearman、bootstrap CI、`p/q`。
+保存 material x parameter x response 的 M0/ME/Mnu/Mboth CV 指标、显式 `reference_model/augmented_model`、条件 `delta_R2`、partial Spearman、bootstrap CI、`p/q`。
 
 ### `summary.csv`
 
@@ -276,7 +287,7 @@ material_identifiability_b02.md
 
 ### `metadata.json`
 
-保存命令参数、seed、fold、置换/bootstraps 数量、数据目录、文件数量、无效文件、字段版本和生成时间。
+保存命令参数、seed、fold、置换/bootstraps 数量、数据目录、文件数量、按 split 区分的无效文件、`audit_integrity_status`、固定 `schema_version="1.0"` 和 UTC ISO-8601 `generated_at`。
 
 ### `material_identifiability_b02.md`
 
@@ -317,7 +328,8 @@ src/tests/test_material_identifiability.py
 - H5 按文件流式读取，不把全部粒子轨迹常驻内存；
 - 所有随机过程由 seed 控制；
 - 生成既有文件时默认拒绝覆盖，必须显式指定 overwrite；
-- 任一物理字段异常必须进入 invalid-record 清单并影响最终状态，不能静默跳过。
+- CLI 在读取 H5 或执行统计前检查全部七个 output targets；无 `overwrite` 且任一目标存在时立即失败；writer 在激活临时产物前再次检查，封闭 TOCTOU 窗口；
+- 任一物理字段异常必须进入按 train/test 分离的 invalid-record 清单，不能静默跳过或混淆两条裁决轴。
 
 ## 11. 验证策略
 
@@ -326,10 +338,10 @@ src/tests/test_material_identifiability.py
 1. 人工构造 H5 的特征提取单元测试；
 2. test split 不读取轨迹响应的回归测试；
 3. object-level 样本计数测试，防止按帧/粒子伪增样本；
-4. 固定 seed 的 fold/置换/bootstrap 可复现测试；
-5. synthetic identifiable / confounded / not-detected 三类统计测试；
-6. FDR 和分类边界测试；
-7. 输出 schema、invalid record 和拒绝覆盖测试；
+4. 固定 seed 的 fold、conditional residual permutation 和 bootstrap 可复现测试；
+5. synthetic identifiable / confounded / not-detected，以及相关 `E/nu` 伪边际信号反例测试；
+6. FDR、`constant_response` 和分类边界测试；
+7. split overlap、缺 test 材质、双轴 invalid、metadata schema/timestamp 和 early/final overwrite preflight 测试；
 8. `py_compile` 与 `git diff --check`。
 
 ## 12. 明确不做

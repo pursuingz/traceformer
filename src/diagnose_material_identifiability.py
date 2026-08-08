@@ -13,6 +13,7 @@ from utils.material_identifiability import (
     build_coverage_rows,
     build_support_rows,
     classify_identifiability,
+    preflight_audit_output_targets,
     read_h5_record,
     write_audit_outputs,
 )
@@ -88,6 +89,46 @@ def _validate_input_paths(paths: list[Path], *, split: str) -> None:
         raise ValueError(f"{split} directory contains no *.h5 files")
 
 
+def _validate_split_isolation(
+    train_dir: Path,
+    test_dir: Path,
+    train_paths: list[Path],
+    test_paths: list[Path],
+) -> None:
+    if train_dir == test_dir:
+        raise ValueError(
+            f"train and test use the same resolved directory: {train_dir}"
+        )
+
+    resolved_train = {path.resolve(): path for path in train_paths}
+    resolved_test = {path.resolve(): path for path in test_paths}
+    overlapping_paths = sorted(
+        resolved_train.keys() & resolved_test.keys(),
+        key=str,
+    )
+    if not overlapping_paths:
+        overlapping_paths = [
+            train_path.resolve()
+            for train_path in train_paths
+            if any(train_path.samefile(test_path) for test_path in test_paths)
+        ]
+    if overlapping_paths:
+        raise ValueError(
+            "train/test contain overlapping resolved H5 files: "
+            f"{overlapping_paths[0]}"
+        )
+
+    train_object_ids = {path.name.casefold(): path.name for path in train_paths}
+    test_object_ids = {path.name.casefold(): path.name for path in test_paths}
+    overlapping_ids = sorted(train_object_ids.keys() & test_object_ids.keys())
+    if overlapping_ids:
+        object_name = train_object_ids[overlapping_ids[0]]
+        raise ValueError(
+            "train/test split overlap by object/model ID filename: "
+            f"{object_name}"
+        )
+
+
 def _read_split_records(
     paths: list[Path],
     *,
@@ -107,8 +148,9 @@ def _read_split_records(
     return records
 
 
-def _validate_train_material_counts(
+def _validate_material_counts(
     train_records: list[dict[str, object]],
+    test_records: list[dict[str, object]],
     *,
     folds: int,
 ) -> None:
@@ -118,6 +160,13 @@ def _validate_train_material_counts(
             raise ValueError(
                 f"material {material} has {count} valid train records; "
                 f"at least {folds} are required"
+            )
+    for material in MATERIAL_NAMES.values():
+        count = sum(record["material"] == material for record in test_records)
+        if count < 1:
+            raise ValueError(
+                f"material {material} has {count} valid test records; "
+                "at least 1 is required"
             )
 
 
@@ -158,6 +207,8 @@ def run_material_identifiability_audit(
     test_paths = sorted(test_dir.glob("*.h5"))
     _validate_input_paths(train_paths, split="train")
     _validate_input_paths(test_paths, split="test")
+    _validate_split_isolation(train_dir, test_dir, train_paths, test_paths)
+    preflight_audit_output_targets(Path(output_dir), overwrite=overwrite)
     invalid_records: list[dict[str, str]] = []
 
     train_records = _read_split_records(
@@ -172,7 +223,11 @@ def run_material_identifiability_audit(
         settings=settings,
         invalid_records=invalid_records,
     )
-    _validate_train_material_counts(train_records, folds=settings.folds)
+    _validate_material_counts(
+        train_records,
+        test_records,
+        folds=settings.folds,
+    )
 
     print("coverage")
     coverage_rows = build_coverage_rows(train_records, test_records)
