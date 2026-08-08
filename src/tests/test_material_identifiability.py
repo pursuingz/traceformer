@@ -4,7 +4,9 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+from scipy.stats import spearmanr
 
+import utils.material_identifiability as material_identifiability
 from utils.material_identifiability import (
     AuditSettings,
     NUISANCE_COLUMNS,
@@ -477,6 +479,380 @@ class CoverageTests(unittest.TestCase):
         self.assertAlmostEqual(elastic_e["ks_statistic"], 0.5)
         self.assertAlmostEqual(elastic_e["wasserstein_distance"], 5.0 / 6.0)
         self.assertAlmostEqual(elastic_e["smd_floor_gap"], 1.0)
+
+
+class StatisticsHelperTests(unittest.TestCase):
+    def test_audit_settings_freeze_production_sampling_defaults(self):
+        settings = AuditSettings()
+
+        self.assertEqual(settings.folds, 5)
+        self.assertEqual(settings.permutations, 500)
+        self.assertEqual(settings.bootstrap_samples, 1000)
+
+    def test_object_folds_are_reproducible_complete_disjoint_and_name_stable(self):
+        model_names = [f"object-{index:02d}.h5" for index in range(13)]
+
+        folds_a = material_identifiability.make_object_folds(
+            model_names, folds=5, seed=0
+        )
+        folds_b = material_identifiability.make_object_folds(
+            model_names, folds=5, seed=0
+        )
+
+        self.assertEqual(serialise_folds(folds_a), serialise_folds(folds_b))
+        self.assertEqual(
+            sorted(np.concatenate([test for _, test in folds_a]).tolist()),
+            list(range(len(model_names))),
+        )
+        for train, test in folds_a:
+            self.assertTrue(set(train).isdisjoint(set(test)))
+
+        reversed_names = list(reversed(model_names))
+        reversed_folds = material_identifiability.make_object_folds(
+            reversed_names, folds=5, seed=0
+        )
+        held_out_names = [
+            tuple(sorted(model_names[index] for index in test))
+            for _, test in folds_a
+        ]
+        reversed_held_out_names = [
+            tuple(sorted(reversed_names[index] for index in test))
+            for _, test in reversed_folds
+        ]
+        self.assertEqual(held_out_names, reversed_held_out_names)
+
+    def test_piecewise_basis_uses_only_train_statistics(self):
+        train_values = np.asarray([0.0, 1.0, 2.0, 3.0])
+        train_basis, eval_basis = material_identifiability._piecewise_basis(
+            train_values,
+            np.asarray([100.0]),
+        )
+        train_basis_again, _ = material_identifiability._piecewise_basis(
+            train_values,
+            np.asarray([10000.0]),
+        )
+
+        self.assertEqual(train_basis.shape[1], 4)
+        self.assertEqual(eval_basis.shape[1], 4)
+        np.testing.assert_allclose(train_basis, train_basis_again)
+        self.assertAlmostEqual(
+            eval_basis[0, 0],
+            (100.0 - train_values.mean()) / train_values.std(ddof=0),
+        )
+
+    def test_nested_predictions_do_not_use_sibling_held_out_values(self):
+        model_names = [f"object-{index:02d}.h5" for index in range(20)]
+        folds = material_identifiability.make_object_folds(
+            model_names, folds=5, seed=3
+        )
+        held_out = folds[0][1]
+        target_index, changed_index = int(held_out[0]), int(held_out[1])
+        latent = np.linspace(-2.0, 2.0, len(model_names))
+        nuisance = latent[:, None].copy()
+        nuisance[target_index, 0] = np.nan
+        response = 1.5 * latent + 0.1 * latent ** 2
+
+        prediction_a = material_identifiability._nested_cv_predictions(
+            nuisance,
+            {},
+            response,
+            folds,
+            augmented_parameter=None,
+        )
+        changed_nuisance = nuisance.copy()
+        changed_nuisance[changed_index, 0] = 1e9
+        changed_response = response.copy()
+        changed_response[changed_index] = -1e9
+        prediction_b = material_identifiability._nested_cv_predictions(
+            changed_nuisance,
+            {},
+            changed_response,
+            folds,
+            augmented_parameter=None,
+        )
+
+        self.assertAlmostEqual(
+            prediction_a[target_index], prediction_b[target_index], places=12
+        )
+
+    def test_permutation_pvalue_uses_inclusive_plus_one_formula(self):
+        observed = 0.5
+        null_values = np.asarray([0.5, 0.49, 0.8])
+
+        p_value = material_identifiability._permutation_pvalue(
+            observed, null_values
+        )
+
+        self.assertAlmostEqual(p_value, 0.75)
+        self.assertAlmostEqual(
+            material_identifiability._permutation_pvalue(
+                2.0, np.asarray([0.0, 1.0, 1.5])
+            ),
+            0.25,
+        )
+
+    def test_bootstrap_resamples_paired_object_level_oof_tuples(self):
+        base_prediction = np.asarray([0.0, 0.2, 0.5, 1.0, 1.5, 2.0])
+        augmented_prediction = np.asarray([0.0, 1.1, 1.8, 3.2, 5.1, 8.2])
+        response = np.asarray([0.0, 1.0, 2.0, 3.0, 5.0, 8.0])
+        samples = 40
+        seed = 17
+
+        actual = material_identifiability._bootstrap_delta_r2(
+            base_prediction,
+            augmented_prediction,
+            response,
+            samples=samples,
+            seed=seed,
+        )
+        rng = np.random.default_rng(seed)
+        deltas = []
+        for indices in rng.integers(0, len(response), size=(samples, len(response))):
+            sampled_response = response[indices]
+            total = np.sum((sampled_response - sampled_response.mean()) ** 2)
+            if total < 1e-12:
+                continue
+            base_r2 = 1.0 - np.sum(
+                (sampled_response - base_prediction[indices]) ** 2
+            ) / total
+            augmented_r2 = 1.0 - np.sum(
+                (sampled_response - augmented_prediction[indices]) ** 2
+            ) / total
+            deltas.append(augmented_r2 - base_r2)
+        expected = tuple(np.percentile(deltas, [2.5, 97.5]))
+
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+    def test_benjamini_hochberg_preserves_order_and_boundaries(self):
+        pvalues = np.asarray([0.01, 0.04, 0.03, 0.002])
+
+        qvalues = material_identifiability.benjamini_hochberg(pvalues)
+
+        np.testing.assert_allclose(qvalues, [0.02, 0.04, 0.04, 0.008])
+        self.assertTrue(np.all((qvalues >= 0.0) & (qvalues <= 1.0)))
+        self.assertEqual(qvalues.shape, (4,))
+        np.testing.assert_allclose(
+            material_identifiability.benjamini_hochberg(
+                np.asarray([0.0, 1.0])
+            ),
+            [0.0, 1.0],
+        )
+
+    def test_confounding_summary_reports_only_train_fold_varying_features(self):
+        records = IdentifiabilityStatisticsTests.make_records(
+            n=60,
+            seed=9,
+            response_kind="strong",
+        )
+
+        rows = material_identifiability.analyze_confounding(
+            records,
+            AuditSettings(seed=4, folds=5, permutations=4, bootstrap_samples=4),
+        )
+        summary = find_row(
+            rows,
+            row_type="summary",
+            material="elastic",
+            parameter="log10_e",
+        )
+
+        self.assertIn("initial_centroid_x", summary["fitted_features"])
+        self.assertNotIn("gravity", summary["fitted_features"])
+
+
+class IdentifiabilityStatisticsTests(unittest.TestCase):
+    TEST_SETTINGS = AuditSettings(
+        seed=0,
+        folds=5,
+        permutations=20,
+        bootstrap_samples=40,
+    )
+
+    @staticmethod
+    def make_records(*, n, seed, response_kind, material="elastic"):
+        rng = np.random.default_rng(seed)
+        nuisance = rng.normal(size=(n, 4))
+        log10_e = rng.uniform(4.0, 7.0, size=n)
+        nu = rng.uniform(0.05, 0.45, size=n)
+        if response_kind == "strong":
+            response = (
+                2.0 * log10_e
+                + 0.2 * nuisance[:, 0]
+                + rng.normal(0.0, 0.1, n)
+            )
+        elif response_kind == "null":
+            response = nuisance[:, 0] + rng.normal(0.0, 1.0, n)
+        elif response_kind == "constant":
+            response = np.ones(n)
+        else:
+            raise ValueError(response_kind)
+
+        varying_columns = (
+            "initial_centroid_x",
+            "initial_centroid_y",
+            "initial_centroid_z",
+            "initial_extent_x",
+        )
+        records = []
+        for index in range(n):
+            record = {
+                "model": f"{material}-{index:04d}.h5",
+                "split": "train",
+                "material": material,
+                "valid": True,
+                "log10_e": float(log10_e[index]),
+                "nu": float(nu[index]),
+                "centered_shape_mse_f24": float(response[index]),
+            }
+            record.update(
+                {
+                    column: float(nuisance[index, column_index])
+                    for column_index, column in enumerate(varying_columns)
+                }
+            )
+            for column in NUISANCE_COLUMNS:
+                record.setdefault(column, 1.0 if column == "gravity" else 0.0)
+            records.append(record)
+        return records
+
+    def test_strong_parameter_signal_is_detected_with_reproducible_statistics(self):
+        records = self.make_records(n=180, seed=123, response_kind="strong")
+
+        rows = material_identifiability.analyze_responses(
+            records, self.TEST_SETTINGS
+        )
+        repeated_rows = material_identifiability.analyze_responses(
+            records, self.TEST_SETTINGS
+        )
+        strong = find_row(
+            rows,
+            material="elastic",
+            parameter="log10_e",
+            response="centered_shape_mse_f24",
+        )
+
+        self.assertEqual(rows, repeated_rows)
+        self.assertGreater(strong["delta_r2"], 0.05)
+        self.assertLessEqual(strong["permutation_p"], 0.05)
+        self.assertGreater(strong["bootstrap_ci_low"], 0.0)
+        self.assertEqual(strong["response_tier"], "primary")
+        self.assertEqual(strong["status"], "ok")
+        self.assertIn("r2_mboth", strong)
+
+    def test_null_parameter_signal_remains_below_identifiability_threshold(self):
+        records = self.make_records(n=180, seed=456, response_kind="null")
+
+        rows = material_identifiability.analyze_responses(
+            records, self.TEST_SETTINGS
+        )
+        null = find_row(
+            rows,
+            material="elastic",
+            parameter="nu",
+            response="centered_shape_mse_f24",
+        )
+
+        self.assertLess(null["delta_r2"], 0.05)
+
+    def test_partial_spearman_uses_rank_correlation_of_cross_fitted_residuals(self):
+        records = self.make_records(n=60, seed=654, response_kind="strong")
+        settings = AuditSettings(
+            seed=2,
+            folds=5,
+            permutations=4,
+            bootstrap_samples=8,
+        )
+
+        rows = material_identifiability.analyze_responses(records, settings)
+        row = find_row(
+            rows,
+            material="elastic",
+            parameter="log10_e",
+            response="centered_shape_mse_f24",
+        )
+        nuisance_columns = tuple(
+            column
+            for column in NUISANCE_COLUMNS
+            if column not in ("log10_e", "nu")
+        )
+        nuisance = np.asarray(
+            [[float(record[column]) for column in nuisance_columns] for record in records]
+        )
+        parameter = np.asarray([float(record["log10_e"]) for record in records])
+        response = np.asarray(
+            [float(record["centered_shape_mse_f24"]) for record in records]
+        )
+        folds = material_identifiability.make_object_folds(
+            [str(record["model"]) for record in records],
+            folds=settings.folds,
+            seed=settings.seed,
+        )
+        parameter_prediction = material_identifiability._nested_cv_predictions(
+            nuisance,
+            {},
+            parameter,
+            folds,
+            augmented_parameter=None,
+        )
+        response_prediction = material_identifiability._nested_cv_predictions(
+            nuisance,
+            {"log10_e": parameter, "nu": np.asarray([record["nu"] for record in records])},
+            response,
+            folds,
+            augmented_parameter=None,
+        )
+        expected = float(
+            spearmanr(
+                parameter - parameter_prediction,
+                response - response_prediction,
+            )[0]
+        )
+
+        self.assertAlmostEqual(row["partial_spearman"], expected, places=12)
+
+    def test_nuisance_predictable_parameter_is_marked_confounding(self):
+        records = self.make_records(n=180, seed=789, response_kind="null")
+        rng = np.random.default_rng(987)
+        for record in records:
+            record["log10_e"] = float(
+                5.5
+                + 0.8 * record["initial_centroid_x"]
+                + rng.normal(0.0, 0.05)
+            )
+
+        rows = material_identifiability.analyze_confounding(
+            records, self.TEST_SETTINGS
+        )
+        summary = find_row(
+            rows,
+            row_type="summary",
+            material="elastic",
+            parameter="log10_e",
+        )
+
+        self.assertTrue(summary["confounded"])
+        self.assertGreater(summary["cv_r2"], 0.05)
+        self.assertLess(summary["permutation_p"], 0.05)
+
+    def test_constant_response_is_not_emitted_as_evidence(self):
+        records = self.make_records(n=60, seed=321, response_kind="constant")
+
+        rows = material_identifiability.analyze_responses(
+            records,
+            AuditSettings(seed=0, folds=5, permutations=4, bootstrap_samples=8),
+        )
+        row = find_row(
+            rows,
+            material="elastic",
+            parameter="log10_e",
+            response="centered_shape_mse_f24",
+        )
+
+        self.assertEqual(row["status"], "constant_response")
+        self.assertEqual(row["delta_r2"], 0.0)
+        self.assertEqual(row["permutation_p"], 1.0)
+        self.assertEqual(row["q_value"], 1.0)
+        self.assertNotIn("future_contact_fraction", NUISANCE_COLUMNS)
 
 
 if __name__ == "__main__":

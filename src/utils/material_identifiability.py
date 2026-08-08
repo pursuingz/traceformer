@@ -1,5 +1,6 @@
 """H5 record extraction for the material identifiability audit."""
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,6 +118,8 @@ _STATIC_NUISANCE_COLUMNS = tuple(
 )
 _LOG10_E_RANGE = (4.0, 7.0)
 _NU_RANGE = (0.05, 0.45)
+_RIDGE_ALPHAS = 10.0 ** np.arange(-4, 4)
+_STAT_EPSILON = 1e-12
 
 _STATIC_REQUIRED_FIELDS = (
     "x",
@@ -662,6 +665,881 @@ def build_support_rows(
         for parameter_row in parameter_rows:
             parameter_row.update(diagnostics)
             rows.append(parameter_row)
+    return rows
+
+
+def make_object_folds(
+    model_names: list[str] | tuple[str, ...] | np.ndarray,
+    *,
+    folds: int,
+    seed: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build deterministic object folds after sorting names before shuffling."""
+    names = np.asarray(model_names, dtype=object)
+    if names.ndim != 1:
+        raise ValueError("model_names must be one-dimensional")
+    if not isinstance(folds, int) or isinstance(folds, bool) or folds < 2:
+        raise ValueError("folds must be an integer greater than one")
+    if folds > len(names):
+        raise ValueError("folds cannot exceed the number of objects")
+    normalized_names = np.asarray([str(name) for name in names], dtype=object)
+    if len(set(normalized_names.tolist())) != len(normalized_names):
+        raise ValueError("model_names must be unique")
+
+    sorted_indices = np.argsort(normalized_names, kind="stable")
+    shuffled_indices = np.random.default_rng(seed).permutation(sorted_indices)
+    all_indices = np.arange(len(names), dtype=np.int64)
+    object_folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for test_indices in np.array_split(shuffled_indices, folds):
+        test_indices = np.asarray(test_indices, dtype=np.int64)
+        train_indices = np.setdiff1d(all_indices, test_indices, assume_unique=True)
+        object_folds.append((train_indices, test_indices))
+    return object_folds
+
+
+def benjamini_hochberg(pvalues: np.ndarray) -> np.ndarray:
+    """Return BH-adjusted q-values in the input order."""
+    values = np.asarray(pvalues, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError("pvalues must be one-dimensional")
+    finite = np.isfinite(values)
+    if np.any((values[finite] < 0.0) | (values[finite] > 1.0)):
+        raise ValueError("finite pvalues must lie in [0, 1]")
+    adjusted = np.full(values.shape, np.nan, dtype=np.float64)
+    if not np.any(finite):
+        return adjusted
+
+    finite_indices = np.flatnonzero(finite)
+    order = np.argsort(values[finite], kind="stable")
+    sorted_values = values[finite][order]
+    count = len(sorted_values)
+    ranked = sorted_values * count / np.arange(1, count + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    restored = np.empty(count, dtype=np.float64)
+    restored[order] = np.clip(ranked, 0.0, 1.0)
+    adjusted[finite_indices] = restored
+    return adjusted
+
+
+def _piecewise_basis(
+    train_values: np.ndarray,
+    eval_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a four-column hinge basis using train-only scaling and knots."""
+    train = np.asarray(train_values, dtype=np.float64)
+    evaluation = np.asarray(eval_values, dtype=np.float64)
+    if train.ndim != 1 or evaluation.ndim != 1:
+        raise ValueError("piecewise basis values must be one-dimensional")
+    if not train.size or not np.isfinite(train).all() or not np.isfinite(evaluation).all():
+        raise ValueError("piecewise basis values must be finite with non-empty train data")
+
+    mean = float(train.mean())
+    scale = float(train.std(ddof=0))
+    if scale < _STAT_EPSILON:
+        scale = 1.0
+    standardized_train = (train - mean) / scale
+    standardized_eval = (evaluation - mean) / scale
+    knots = np.quantile(standardized_train, [0.25, 0.50, 0.75])
+
+    def basis(values: np.ndarray) -> np.ndarray:
+        return np.column_stack(
+            [values, *(np.maximum(values - knot, 0.0) for knot in knots)]
+        )
+
+    return basis(standardized_train), basis(standardized_eval)
+
+
+def _prepare_nuisance_features(
+    train_values: np.ndarray,
+    eval_values: np.ndarray,
+    *,
+    feature_names: tuple[str, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    """Impute, expand, select, and scale nuisance columns from train only."""
+    train = np.asarray(train_values, dtype=np.float64)
+    evaluation = np.asarray(eval_values, dtype=np.float64)
+    if train.ndim != 2 or evaluation.ndim != 2:
+        raise ValueError("nuisance values must be two-dimensional")
+    if train.shape[1] != evaluation.shape[1]:
+        raise ValueError("train and eval nuisance columns must match")
+    if feature_names is None:
+        names = tuple(f"nuisance_{index}" for index in range(train.shape[1]))
+    else:
+        names = tuple(feature_names)
+        if len(names) != train.shape[1]:
+            raise ValueError("feature_names must match nuisance columns")
+
+    train_columns: list[np.ndarray] = []
+    eval_columns: list[np.ndarray] = []
+    selected_names: list[str] = []
+    for index, name in enumerate(names):
+        train_column = train[:, index]
+        eval_column = evaluation[:, index]
+        finite_train = np.isfinite(train_column)
+        if not np.any(finite_train):
+            continue
+        median = float(np.median(train_column[finite_train]))
+        imputed_train = np.where(finite_train, train_column, median)
+        imputed_eval = np.where(np.isfinite(eval_column), eval_column, median)
+        candidates = [(imputed_train, imputed_eval, name)]
+        if np.any(~finite_train):
+            candidates.append(
+                (
+                    (~finite_train).astype(np.float64),
+                    (~np.isfinite(eval_column)).astype(np.float64),
+                    f"{name}__missing",
+                )
+            )
+        for candidate_train, candidate_eval, candidate_name in candidates:
+            mean = float(candidate_train.mean())
+            scale = float(candidate_train.std(ddof=0))
+            if scale < _STAT_EPSILON:
+                continue
+            train_columns.append((candidate_train - mean) / scale)
+            eval_columns.append((candidate_eval - mean) / scale)
+            selected_names.append(candidate_name)
+
+    if not train_columns:
+        return (
+            np.empty((len(train), 0), dtype=np.float64),
+            np.empty((len(evaluation), 0), dtype=np.float64),
+            (),
+        )
+    return (
+        np.column_stack(train_columns),
+        np.column_stack(eval_columns),
+        tuple(selected_names),
+    )
+
+
+def _parameter_features(
+    train_indices: np.ndarray,
+    eval_indices: np.ndarray,
+    parameters: dict[str, np.ndarray],
+    augmented_parameter: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if augmented_parameter is None:
+        return (
+            np.empty((len(train_indices), 0), dtype=np.float64),
+            np.empty((len(eval_indices), 0), dtype=np.float64),
+        )
+    if augmented_parameter in PARAMETER_COLUMNS:
+        if augmented_parameter not in parameters:
+            raise ValueError(f"missing parameter {augmented_parameter}")
+        values = np.asarray(parameters[augmented_parameter], dtype=np.float64)
+        return _piecewise_basis(values[train_indices], values[eval_indices])
+    if augmented_parameter != "both":
+        raise ValueError(f"unknown augmented_parameter {augmented_parameter}")
+    if any(parameter not in parameters for parameter in PARAMETER_COLUMNS):
+        raise ValueError("both parameter model requires log10_e and nu")
+
+    e_values = np.asarray(parameters["log10_e"], dtype=np.float64)
+    nu_values = np.asarray(parameters["nu"], dtype=np.float64)
+    train_e, eval_e = _piecewise_basis(
+        e_values[train_indices], e_values[eval_indices]
+    )
+    train_nu, eval_nu = _piecewise_basis(
+        nu_values[train_indices], nu_values[eval_indices]
+    )
+    train_interaction = (train_e[:, 0] * train_nu[:, 0])[:, None]
+    eval_interaction = (eval_e[:, 0] * eval_nu[:, 0])[:, None]
+    return (
+        np.column_stack((train_e, train_nu, train_interaction)),
+        np.column_stack((eval_e, eval_nu, eval_interaction)),
+    )
+
+
+def _design_matrices(
+    nuisance: np.ndarray,
+    parameters: dict[str, np.ndarray],
+    train_indices: np.ndarray,
+    eval_indices: np.ndarray,
+    augmented_parameter: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    nuisance_train, nuisance_eval, _ = _prepare_nuisance_features(
+        nuisance[train_indices], nuisance[eval_indices]
+    )
+    parameter_train, parameter_eval = _parameter_features(
+        train_indices,
+        eval_indices,
+        parameters,
+        augmented_parameter,
+    )
+    train = np.column_stack((nuisance_train, parameter_train))
+    evaluation = np.column_stack((nuisance_eval, parameter_eval))
+    if not train.shape[1]:
+        return train, evaluation
+    varying = train.std(axis=0, ddof=0) >= _STAT_EPSILON
+    return train[:, varying], evaluation[:, varying]
+
+
+def _ridge_prediction(
+    train_features: np.ndarray,
+    train_response: np.ndarray,
+    eval_features: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    response = np.asarray(train_response, dtype=np.float64)
+    response_mean = float(response.mean())
+    if not train_features.shape[1]:
+        return np.full(len(eval_features), response_mean, dtype=np.float64)
+
+    feature_mean = train_features.mean(axis=0)
+    centered_features = train_features - feature_mean
+    centered_response = response - response_mean
+    gram = centered_features.T @ centered_features
+    regularized = gram + alpha * np.eye(gram.shape[0], dtype=np.float64)
+    rhs = centered_features.T @ centered_response
+    try:
+        coefficients = np.linalg.solve(regularized, rhs)
+    except np.linalg.LinAlgError:
+        coefficients = np.linalg.pinv(regularized) @ rhs
+    return response_mean + (eval_features - feature_mean) @ coefficients
+
+
+def _inner_splits(
+    outer_train: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    outer_set = set(outer_train.tolist())
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    for _, candidate_validation in folds:
+        validation = np.asarray(
+            [index for index in candidate_validation if index in outer_set],
+            dtype=np.int64,
+        )
+        if not validation.size:
+            continue
+        train = np.setdiff1d(outer_train, validation, assume_unique=True)
+        if train.size:
+            splits.append((train, validation))
+    if len(splits) >= 2:
+        return splits
+
+    inner_count = min(max(2, len(folds) - 1), len(outer_train))
+    splits = []
+    for validation in np.array_split(np.asarray(outer_train), inner_count):
+        train = np.setdiff1d(outer_train, validation, assume_unique=True)
+        if train.size and validation.size:
+            splits.append((train, np.asarray(validation, dtype=np.int64)))
+    return splits
+
+
+def _select_ridge_alpha(
+    nuisance: np.ndarray,
+    parameters: dict[str, np.ndarray],
+    response: np.ndarray,
+    outer_train: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+    augmented_parameter: str | None,
+) -> float:
+    splits = _inner_splits(outer_train, folds)
+    if not splits:
+        return float(_RIDGE_ALPHAS[0])
+    squared_errors = np.zeros(len(_RIDGE_ALPHAS), dtype=np.float64)
+    validation_count = 0
+    for inner_train, inner_validation in splits:
+        train_features, validation_features = _design_matrices(
+            nuisance,
+            parameters,
+            inner_train,
+            inner_validation,
+            augmented_parameter,
+        )
+        validation_response = response[inner_validation]
+        validation_count += len(inner_validation)
+        for alpha_index, alpha in enumerate(_RIDGE_ALPHAS):
+            prediction = _ridge_prediction(
+                train_features,
+                response[inner_train],
+                validation_features,
+                float(alpha),
+            )
+            squared_errors[alpha_index] += float(
+                np.sum((validation_response - prediction) ** 2)
+            )
+    if not validation_count:
+        return float(_RIDGE_ALPHAS[0])
+    return float(_RIDGE_ALPHAS[int(np.argmin(squared_errors / validation_count))])
+
+
+def _nested_cv_predictions(
+    nuisance: np.ndarray,
+    parameters: dict[str, np.ndarray],
+    response: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    augmented_parameter: str | None,
+) -> np.ndarray:
+    """Return pooled outer-fold predictions with inner-fold ridge tuning."""
+    nuisance_values = np.asarray(nuisance, dtype=np.float64)
+    response_values = np.asarray(response, dtype=np.float64)
+    if nuisance_values.ndim != 2:
+        raise ValueError("nuisance must be a two-dimensional array")
+    if response_values.ndim != 1 or len(response_values) != len(nuisance_values):
+        raise ValueError("response must align with nuisance rows")
+    if not np.isfinite(response_values).all():
+        raise ValueError("response must be finite")
+    parameter_values = {
+        name: np.asarray(values, dtype=np.float64)
+        for name, values in parameters.items()
+    }
+    if any(values.shape != response_values.shape for values in parameter_values.values()):
+        raise ValueError("parameter arrays must align with response")
+
+    predictions = np.full(len(response_values), np.nan, dtype=np.float64)
+    held_out_counts = np.zeros(len(response_values), dtype=np.int64)
+    for train_indices, test_indices in folds:
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        test_indices = np.asarray(test_indices, dtype=np.int64)
+        if set(train_indices.tolist()).intersection(test_indices.tolist()):
+            raise ValueError("train and held-out fold indices must be disjoint")
+        alpha = _select_ridge_alpha(
+            nuisance_values,
+            parameter_values,
+            response_values,
+            train_indices,
+            folds,
+            augmented_parameter,
+        )
+        train_features, test_features = _design_matrices(
+            nuisance_values,
+            parameter_values,
+            train_indices,
+            test_indices,
+            augmented_parameter,
+        )
+        predictions[test_indices] = _ridge_prediction(
+            train_features,
+            response_values[train_indices],
+            test_features,
+            alpha,
+        )
+        held_out_counts[test_indices] += 1
+    if not np.all(held_out_counts == 1):
+        raise ValueError("folds must hold out every object exactly once")
+    return predictions
+
+
+def _pooled_oof_r2(response: np.ndarray, prediction: np.ndarray) -> float:
+    response_values = np.asarray(response, dtype=np.float64)
+    prediction_values = np.asarray(prediction, dtype=np.float64)
+    if response_values.shape != prediction_values.shape:
+        raise ValueError("response and prediction shapes must match")
+    total_sum_squares = float(
+        np.sum((response_values - response_values.mean()) ** 2)
+    )
+    if total_sum_squares < _STAT_EPSILON:
+        return float("nan")
+    residual_sum_squares = float(np.sum((response_values - prediction_values) ** 2))
+    return float(1.0 - residual_sum_squares / total_sum_squares)
+
+
+def _permutation_pvalue(observed: float, null_values: np.ndarray) -> float:
+    null = np.asarray(null_values, dtype=np.float64)
+    if null.ndim != 1:
+        raise ValueError("null_values must be one-dimensional")
+    if not np.isfinite(observed):
+        return float("nan")
+    return float((1 + np.count_nonzero(null >= observed)) / (1 + len(null)))
+
+
+def _bootstrap_delta_r2(
+    base_prediction: np.ndarray,
+    augmented_prediction: np.ndarray,
+    response: np.ndarray,
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, float]:
+    """Bootstrap paired pooled OOF object tuples without refitting models."""
+    base = np.asarray(base_prediction, dtype=np.float64)
+    augmented = np.asarray(augmented_prediction, dtype=np.float64)
+    response_values = np.asarray(response, dtype=np.float64)
+    if base.shape != augmented.shape or base.shape != response_values.shape:
+        raise ValueError("bootstrap arrays must have matching shapes")
+    if base.ndim != 1 or not len(base):
+        raise ValueError("bootstrap arrays must be non-empty and one-dimensional")
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+        raise ValueError("samples must be a positive integer")
+
+    rng = np.random.default_rng(seed)
+    deltas: list[float] = []
+    for indices in rng.integers(0, len(response_values), size=(samples, len(response_values))):
+        sampled_response = response_values[indices]
+        base_r2 = _pooled_oof_r2(sampled_response, base[indices])
+        augmented_r2 = _pooled_oof_r2(sampled_response, augmented[indices])
+        if np.isfinite(base_r2) and np.isfinite(augmented_r2):
+            deltas.append(augmented_r2 - base_r2)
+    if not deltas:
+        return float("nan"), float("nan")
+    lower, upper = np.percentile(deltas, [2.5, 97.5])
+    return float(lower), float(upper)
+
+
+def _derived_seed(seed: int, *parts: str) -> int:
+    payload = "|".join((str(seed), *map(str, parts))).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+
+
+def _validate_analysis_settings(settings: AuditSettings) -> None:
+    if not isinstance(settings.folds, int) or isinstance(settings.folds, bool) or settings.folds < 2:
+        raise ValueError("settings.folds must be an integer greater than one")
+    if (
+        not isinstance(settings.permutations, int)
+        or isinstance(settings.permutations, bool)
+        or settings.permutations < 1
+    ):
+        raise ValueError("settings.permutations must be a positive integer")
+    if (
+        not isinstance(settings.bootstrap_samples, int)
+        or isinstance(settings.bootstrap_samples, bool)
+        or settings.bootstrap_samples < 1
+    ):
+        raise ValueError("settings.bootstrap_samples must be a positive integer")
+
+
+def _analysis_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    selected = [
+        record
+        for record in records
+        if bool(record.get("valid", True)) and record.get("split", "train") == "train"
+    ]
+    return sorted(selected, key=lambda record: (str(record["material"]), str(record["model"])))
+
+
+def _analysis_materials(records: list[dict[str, object]]) -> tuple[str, ...]:
+    observed = {str(record["material"]) for record in records}
+    known = tuple(name for name in MATERIAL_NAMES.values() if name in observed)
+    return (*known, *sorted(observed.difference(known)))
+
+
+def _nuisance_matrix(records: list[dict[str, object]]) -> np.ndarray:
+    return np.asarray(
+        [
+            [float(record.get(column, float("nan"))) for column in _STATIC_NUISANCE_COLUMNS]
+            for record in records
+        ],
+        dtype=np.float64,
+    )
+
+
+def _fitted_nuisance_names(
+    nuisance: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[str, ...]:
+    selected: set[str] = set()
+    empty_eval = np.empty((0, nuisance.shape[1]), dtype=np.float64)
+    for train_indices, _ in folds:
+        _, _, names = _prepare_nuisance_features(
+            nuisance[train_indices],
+            empty_eval,
+            feature_names=_STATIC_NUISANCE_COLUMNS,
+        )
+        selected.update(names)
+    ordered_names = tuple(
+        name
+        for column in _STATIC_NUISANCE_COLUMNS
+        for name in (column, f"{column}__missing")
+        if name in selected
+    )
+    return ordered_names
+
+
+def _safe_correlations(x: np.ndarray, y: np.ndarray) -> tuple[int, float, float]:
+    finite = np.isfinite(x) & np.isfinite(y)
+    x_values = np.asarray(x[finite], dtype=np.float64)
+    y_values = np.asarray(y[finite], dtype=np.float64)
+    if (
+        len(x_values) < 2
+        or np.ptp(x_values) < _STAT_EPSILON
+        or np.ptp(y_values) < _STAT_EPSILON
+    ):
+        return len(x_values), float("nan"), float("nan")
+    return (
+        len(x_values),
+        float(np.corrcoef(x_values, y_values)[0, 1]),
+        float(spearmanr(x_values, y_values)[0]),
+    )
+
+
+def analyze_confounding(
+    records: list[dict[str, object]],
+    settings: AuditSettings,
+) -> list[dict[str, object]]:
+    """Audit whether static nuisance features predict each material parameter."""
+    _validate_analysis_settings(settings)
+    selected_records = _analysis_records(records)
+    rows: list[dict[str, object]] = []
+    for material in _analysis_materials(selected_records):
+        material_records = [
+            record for record in selected_records if record["material"] == material
+        ]
+        for parameter in PARAMETER_COLUMNS:
+            parameter_records = [
+                record
+                for record in material_records
+                if np.isfinite(float(record[parameter]))
+            ]
+            parameter_values = _column_values(parameter_records, parameter)
+            nuisance = _nuisance_matrix(parameter_records)
+            for feature_index, feature in enumerate(_STATIC_NUISANCE_COLUMNS):
+                pair_n, pearson, spearman = _safe_correlations(
+                    parameter_values,
+                    nuisance[:, feature_index] if len(nuisance) else np.asarray([]),
+                )
+                rows.append(
+                    {
+                        "row_type": "correlation",
+                        "material": material,
+                        "parameter": parameter,
+                        "feature": feature,
+                        "feature_names": (feature,),
+                        "fitted_features": (),
+                        "n": int(len(parameter_records)),
+                        "pair_n": int(pair_n),
+                        "pearson": pearson,
+                        "spearman": spearman,
+                        "cv_r2": float("nan"),
+                        "permutation_p": float("nan"),
+                        "confounded": False,
+                        "status": "correlation",
+                        "seed": settings.seed,
+                        "folds": min(settings.folds, len(parameter_records)),
+                    }
+                )
+
+            if len(parameter_records) < 2:
+                rows.append(
+                    {
+                        "row_type": "summary",
+                        "material": material,
+                        "parameter": parameter,
+                        "feature": "all_nuisance",
+                        "feature_names": _STATIC_NUISANCE_COLUMNS,
+                        "fitted_features": (),
+                        "n": int(len(parameter_records)),
+                        "pair_n": int(len(parameter_records)),
+                        "pearson": float("nan"),
+                        "spearman": float("nan"),
+                        "cv_r2": float("nan"),
+                        "permutation_p": 1.0,
+                        "confounded": False,
+                        "status": "insufficient_data",
+                        "seed": settings.seed,
+                        "folds": min(settings.folds, len(parameter_records)),
+                    }
+                )
+                continue
+
+            effective_folds = min(settings.folds, len(parameter_records))
+            folds = make_object_folds(
+                [str(record["model"]) for record in parameter_records],
+                folds=effective_folds,
+                seed=settings.seed,
+            )
+            fitted_features = _fitted_nuisance_names(nuisance, folds)
+            if np.sum((parameter_values - parameter_values.mean()) ** 2) < _STAT_EPSILON:
+                cv_r2 = float("nan")
+                permutation_p = 1.0
+                status = "constant_parameter"
+            else:
+                prediction = _nested_cv_predictions(
+                    nuisance,
+                    {},
+                    parameter_values,
+                    folds,
+                    augmented_parameter=None,
+                )
+                cv_r2 = _pooled_oof_r2(parameter_values, prediction)
+                rng = np.random.default_rng(
+                    _derived_seed(settings.seed, "confounding", material, parameter)
+                )
+                null_values = np.empty(settings.permutations, dtype=np.float64)
+                for permutation_index in range(settings.permutations):
+                    permuted = rng.permutation(parameter_values)
+                    null_prediction = _nested_cv_predictions(
+                        nuisance,
+                        {},
+                        permuted,
+                        folds,
+                        augmented_parameter=None,
+                    )
+                    null_values[permutation_index] = _pooled_oof_r2(
+                        permuted, null_prediction
+                    )
+                permutation_p = _permutation_pvalue(cv_r2, null_values)
+                status = "ok"
+            confounded = bool(cv_r2 > 0.05 and permutation_p < 0.05)
+            rows.append(
+                {
+                    "row_type": "summary",
+                    "material": material,
+                    "parameter": parameter,
+                    "feature": "all_nuisance",
+                    "feature_names": _STATIC_NUISANCE_COLUMNS,
+                    "fitted_features": fitted_features,
+                    "n": int(len(parameter_records)),
+                    "pair_n": int(len(parameter_records)),
+                    "pearson": float("nan"),
+                    "spearman": float("nan"),
+                    "cv_r2": cv_r2,
+                    "permutation_p": permutation_p,
+                    "confounded": confounded,
+                    "status": status,
+                    "seed": settings.seed,
+                    "folds": effective_folds,
+                }
+            )
+    return rows
+
+
+def _empty_response_row(
+    *,
+    material: str,
+    parameter: str,
+    response: str,
+    n: int,
+    folds: int,
+    settings: AuditSettings,
+    status: str,
+) -> dict[str, object]:
+    constant = status == "constant_response"
+    return {
+        "material": material,
+        "parameter": parameter,
+        "response": response,
+        "response_tier": "primary" if response in PRIMARY_RESPONSE_COLUMNS else "secondary",
+        "n": n,
+        "seed": settings.seed,
+        "folds": folds,
+        "nuisance_features": _STATIC_NUISANCE_COLUMNS,
+        "fitted_features": (),
+        "r2_m0": float("nan"),
+        "r2_me": float("nan"),
+        "r2_mnu": float("nan"),
+        "r2_mboth": float("nan"),
+        "r2_augmented": float("nan"),
+        "delta_r2": 0.0 if constant else float("nan"),
+        "partial_spearman": float("nan"),
+        "permutation_p": 1.0,
+        "bootstrap_ci_low": 0.0 if constant else float("nan"),
+        "bootstrap_ci_high": 0.0 if constant else float("nan"),
+        "q_value": 1.0,
+        "status": status,
+    }
+
+
+def analyze_responses(
+    records: list[dict[str, object]],
+    settings: AuditSettings,
+) -> list[dict[str, object]]:
+    """Estimate material-local incremental parameter signal in GT responses."""
+    _validate_analysis_settings(settings)
+    selected_records = _analysis_records(records)
+    rows: list[dict[str, object]] = []
+    for material in _analysis_materials(selected_records):
+        material_records = [
+            record for record in selected_records if record["material"] == material
+        ]
+        available_responses = [
+            response
+            for response in RESPONSE_COLUMNS
+            if any(response in record for record in material_records)
+        ]
+        for response_name in available_responses:
+            response_records = [
+                record
+                for record in material_records
+                if response_name in record
+                and np.isfinite(float(record[response_name]))
+                and all(
+                    np.isfinite(float(record[parameter]))
+                    for parameter in PARAMETER_COLUMNS
+                )
+            ]
+            n = len(response_records)
+            effective_folds = min(settings.folds, n)
+            if n < 2:
+                for parameter in PARAMETER_COLUMNS:
+                    rows.append(
+                        _empty_response_row(
+                            material=material,
+                            parameter=parameter,
+                            response=response_name,
+                            n=n,
+                            folds=effective_folds,
+                            settings=settings,
+                            status="insufficient_data",
+                        )
+                    )
+                continue
+
+            response_values = _column_values(response_records, response_name)
+            if np.sum((response_values - response_values.mean()) ** 2) < _STAT_EPSILON:
+                for parameter in PARAMETER_COLUMNS:
+                    rows.append(
+                        _empty_response_row(
+                            material=material,
+                            parameter=parameter,
+                            response=response_name,
+                            n=n,
+                            folds=effective_folds,
+                            settings=settings,
+                            status="constant_response",
+                        )
+                    )
+                continue
+
+            nuisance = _nuisance_matrix(response_records)
+            parameters = {
+                parameter: _column_values(response_records, parameter)
+                for parameter in PARAMETER_COLUMNS
+            }
+            folds = make_object_folds(
+                [str(record["model"]) for record in response_records],
+                folds=effective_folds,
+                seed=settings.seed,
+            )
+            fitted_features = _fitted_nuisance_names(nuisance, folds)
+            predictions = {
+                "m0": _nested_cv_predictions(
+                    nuisance,
+                    parameters,
+                    response_values,
+                    folds,
+                    augmented_parameter=None,
+                ),
+                "me": _nested_cv_predictions(
+                    nuisance,
+                    parameters,
+                    response_values,
+                    folds,
+                    augmented_parameter="log10_e",
+                ),
+                "mnu": _nested_cv_predictions(
+                    nuisance,
+                    parameters,
+                    response_values,
+                    folds,
+                    augmented_parameter="nu",
+                ),
+                "mboth": _nested_cv_predictions(
+                    nuisance,
+                    parameters,
+                    response_values,
+                    folds,
+                    augmented_parameter="both",
+                ),
+            }
+            model_r2 = {
+                name: _pooled_oof_r2(response_values, prediction)
+                for name, prediction in predictions.items()
+            }
+            for parameter in PARAMETER_COLUMNS:
+                augmented_model = "me" if parameter == "log10_e" else "mnu"
+                augmented_prediction = predictions[augmented_model]
+                delta_r2 = model_r2[augmented_model] - model_r2["m0"]
+                parameter_prediction = _nested_cv_predictions(
+                    nuisance,
+                    {},
+                    parameters[parameter],
+                    folds,
+                    augmented_parameter=None,
+                )
+                _, _, partial_spearman = _safe_correlations(
+                    parameters[parameter] - parameter_prediction,
+                    response_values - predictions["m0"],
+                )
+                rng = np.random.default_rng(
+                    _derived_seed(
+                        settings.seed,
+                        "response",
+                        material,
+                        parameter,
+                        response_name,
+                        "permutation",
+                    )
+                )
+                null_values = np.empty(settings.permutations, dtype=np.float64)
+                for permutation_index in range(settings.permutations):
+                    permuted_parameters = dict(parameters)
+                    permuted_parameters[parameter] = rng.permutation(
+                        parameters[parameter]
+                    )
+                    null_prediction = _nested_cv_predictions(
+                        nuisance,
+                        permuted_parameters,
+                        response_values,
+                        folds,
+                        augmented_parameter=parameter,
+                    )
+                    null_values[permutation_index] = (
+                        _pooled_oof_r2(response_values, null_prediction)
+                        - model_r2["m0"]
+                    )
+                permutation_p = _permutation_pvalue(delta_r2, null_values)
+                bootstrap_seed = _derived_seed(
+                    settings.seed,
+                    "response",
+                    material,
+                    parameter,
+                    response_name,
+                    "bootstrap",
+                )
+                bootstrap_ci_low, bootstrap_ci_high = _bootstrap_delta_r2(
+                    predictions["m0"],
+                    augmented_prediction,
+                    response_values,
+                    samples=settings.bootstrap_samples,
+                    seed=bootstrap_seed,
+                )
+                rows.append(
+                    {
+                        "material": material,
+                        "parameter": parameter,
+                        "response": response_name,
+                        "response_tier": "primary"
+                        if response_name in PRIMARY_RESPONSE_COLUMNS
+                        else "secondary",
+                        "n": n,
+                        "seed": settings.seed,
+                        "folds": effective_folds,
+                        "nuisance_features": _STATIC_NUISANCE_COLUMNS,
+                        "fitted_features": fitted_features,
+                        "r2_m0": model_r2["m0"],
+                        "r2_me": model_r2["me"],
+                        "r2_mnu": model_r2["mnu"],
+                        "r2_mboth": model_r2["mboth"],
+                        "r2_augmented": model_r2[augmented_model],
+                        "delta_r2": delta_r2,
+                        "partial_spearman": partial_spearman,
+                        "permutation_p": permutation_p,
+                        "bootstrap_ci_low": bootstrap_ci_low,
+                        "bootstrap_ci_high": bootstrap_ci_high,
+                        "q_value": float("nan"),
+                        "status": "ok",
+                    }
+                )
+
+    families = {
+        (str(row["material"]), str(row["parameter"]))
+        for row in rows
+    }
+    for material, parameter in sorted(families):
+        family_indices = [
+            index
+            for index, row in enumerate(rows)
+            if row["material"] == material and row["parameter"] == parameter
+        ]
+        q_values = benjamini_hochberg(
+            np.asarray(
+                [float(rows[index]["permutation_p"]) for index in family_indices],
+                dtype=np.float64,
+            )
+        )
+        for index, q_value in zip(family_indices, q_values):
+            rows[index]["q_value"] = float(q_value)
     return rows
 
 
