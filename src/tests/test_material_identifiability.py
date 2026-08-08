@@ -12,6 +12,8 @@ from utils.material_identifiability import (
     RESPONSE_COLUMNS,
     STATIC_COLUMNS,
     RecordValidationError,
+    build_coverage_rows,
+    build_support_rows,
     read_h5_record,
 )
 
@@ -309,6 +311,97 @@ class MaterialRecordTests(unittest.TestCase):
 
         self.assertTrue(np.isnan(record["initial_hull_volume"]))
         self.assertTrue(record["valid"])
+
+
+class CoverageTests(unittest.TestCase):
+    @staticmethod
+    def _record(material, log10_e, nu, *, floor_gap=0.0):
+        return {
+            "model": f"{material}-{log10_e}-{nu}",
+            "split": "train",
+            "material": material,
+            "valid": True,
+            "log10_e": log10_e,
+            "nu": nu,
+            "initial_centroid_x": 0.0,
+            "initial_centroid_y": 0.0,
+            "initial_centroid_z": 0.0,
+            "initial_extent_x": 1.0,
+            "initial_extent_y": 1.0,
+            "initial_extent_z": 1.0,
+            "initial_cov_eig_0": 0.1,
+            "initial_cov_eig_1": 0.2,
+            "initial_cov_eig_2": 0.3,
+            "radius_of_gyration": 0.4,
+            "initial_hull_volume": 0.5,
+            "total_particle_volume": 1.0,
+            "floor_gap": floor_gap,
+            "gravity": 1.0,
+            "drag_magnitude": 0.0,
+            "drag_count": 0,
+            "drag_mask_ratio": 0.0,
+            "initial_contact_fraction": 0.0,
+            "centered_shape_mse_f24": 999.0,
+        }
+
+    def setUp(self):
+        materials = ("elastic", "plasticine", "sand")
+        self.train_records = []
+        self.test_records = []
+        for material_index, material in enumerate(materials):
+            train_e = (4.0, 5.0, 6.0)
+            test_e = (3.0, 5.0, 7.0) if material == "elastic" else train_e
+            self.train_records.extend(
+                self._record(
+                    material,
+                    log10_e,
+                    0.10 + 0.10 * index,
+                    floor_gap=float(material_index + index),
+                )
+                for index, log10_e in enumerate(train_e)
+            )
+            self.test_records.extend(
+                self._record(
+                    material,
+                    log10_e,
+                    0.10 + 0.10 * index,
+                    floor_gap=float(material_index + index) + 10.0,
+                )
+                for index, log10_e in enumerate(test_e)
+            )
+
+    def test_coverage_rows_report_material_local_parameter_distributions(self):
+        coverage = build_coverage_rows(self.train_records, self.test_records, bins=5)
+        elastic_train_e = (4.0, 5.0, 6.0)
+        elastic_e = find_row(
+            coverage,
+            split="train",
+            material="elastic",
+            parameter="log10_e",
+        )
+
+        self.assertEqual(elastic_e["unique_n"], len(set(elastic_train_e)))
+        self.assertAlmostEqual(elastic_e["p50"], float(np.median(elastic_train_e)))
+        self.assertGreaterEqual(elastic_e["joint_grid_occupancy"], 0.0)
+        self.assertLessEqual(elastic_e["joint_grid_occupancy"], 1.0)
+        self.assertAlmostEqual(elastic_e["pearson_e_nu"], 1.0)
+        self.assertAlmostEqual(elastic_e["spearman_e_nu"], 1.0)
+
+    def test_support_rows_separate_parameter_support_from_static_nuisance_shift(self):
+        support = build_support_rows(self.train_records, self.test_records, bins=5)
+        elastic_support = find_row(
+            support,
+            material="elastic",
+            parameter="log10_e",
+        )
+
+        self.assertAlmostEqual(elastic_support["outside_train_fraction"], 2.0 / 3.0)
+        self.assertIn("ks_statistic", elastic_support)
+        self.assertIn("wasserstein_distance", elastic_support)
+        self.assertIn("mahalanobis_outside_fraction", elastic_support)
+        self.assertAlmostEqual(elastic_support["smd_floor_gap"], 10.0)
+        self.assertEqual(elastic_support["support_status"], "out_of_support")
+        self.assertTrue(all(name not in elastic_support for name in RESPONSE_COLUMNS))
 
 
 if __name__ == "__main__":

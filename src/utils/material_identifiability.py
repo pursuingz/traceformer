@@ -6,6 +6,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
+from scipy.stats import ks_2samp, spearmanr, wasserstein_distance
 
 
 MATERIAL_NAMES = {0: "elastic", 1: "plasticine", 2: "sand"}
@@ -109,6 +110,13 @@ PRIMARY_RESPONSE_COLUMNS = (
     "f_strain_norm_f24",
     "volumetric_strain_f24",
 )
+
+PARAMETER_COLUMNS = ("log10_e", "nu")
+_STATIC_NUISANCE_COLUMNS = tuple(
+    column for column in NUISANCE_COLUMNS if column not in PARAMETER_COLUMNS
+)
+_LOG10_E_RANGE = (4.0, 7.0)
+_NU_RANGE = (0.05, 0.45)
 
 _STATIC_REQUIRED_FIELDS = (
     "x",
@@ -338,6 +346,293 @@ def _train_responses(
 def _contact_onset_frame(contact: np.ndarray) -> float:
     contact_frames = np.flatnonzero(contact.any(axis=1))
     return float(contact_frames[0]) if contact_frames.size else float("nan")
+
+
+def _validate_bins(bins: int) -> None:
+    if not isinstance(bins, int) or isinstance(bins, bool) or bins < 1:
+        raise ValueError("bins must be a positive integer")
+
+
+def _audit_materials(
+    train_records: list[dict[str, object]], test_records: list[dict[str, object]]
+) -> tuple[str, ...]:
+    observed = {str(record["material"]) for record in (*train_records, *test_records)}
+    known = tuple(name for name in MATERIAL_NAMES.values() if name in observed)
+    return (*known, *sorted(observed.difference(known)))
+
+
+def _material_records(
+    records: list[dict[str, object]], material: str
+) -> list[dict[str, object]]:
+    return [record for record in records if record["material"] == material]
+
+
+def _column_values(records: list[dict[str, object]], column: str) -> np.ndarray:
+    return np.asarray([float(record[column]) for record in records], dtype=np.float64)
+
+
+def _distribution_summary(values: np.ndarray) -> dict[str, float | int]:
+    if not values.size:
+        return {
+            "n": 0,
+            "unique_n": 0,
+            "min": float("nan"),
+            "p05": float("nan"),
+            "p25": float("nan"),
+            "mean": float("nan"),
+            "std": float("nan"),
+            "p50": float("nan"),
+            "p75": float("nan"),
+            "p95": float("nan"),
+            "max": float("nan"),
+        }
+    return {
+        "n": int(values.size),
+        "unique_n": int(np.unique(values).size),
+        "min": float(values.min()),
+        "p05": float(np.percentile(values, 5)),
+        "p25": float(np.percentile(values, 25)),
+        "mean": float(values.mean()),
+        "std": float(values.std(ddof=0)),
+        "p50": float(np.median(values)),
+        "p75": float(np.percentile(values, 75)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(values.max()),
+    }
+
+
+def _correlations(log10_e: np.ndarray, nu: np.ndarray) -> tuple[float, float]:
+    if log10_e.size < 2 or np.ptp(log10_e) == 0 or np.ptp(nu) == 0:
+        return float("nan"), float("nan")
+    return (
+        float(np.corrcoef(log10_e, nu)[0, 1]),
+        float(spearmanr(log10_e, nu)[0]),
+    )
+
+
+def _joint_bin_indices(
+    log10_e: np.ndarray,
+    nu: np.ndarray,
+    *,
+    bins: int,
+) -> list[tuple[int, int] | None]:
+    log10_e_edges = np.linspace(*_LOG10_E_RANGE, bins + 1)
+    nu_edges = np.linspace(*_NU_RANGE, bins + 1)
+    indices: list[tuple[int, int] | None] = []
+    for e_value, nu_value in zip(log10_e, nu):
+        if not (
+            _LOG10_E_RANGE[0] <= e_value <= _LOG10_E_RANGE[1]
+            and _NU_RANGE[0] <= nu_value <= _NU_RANGE[1]
+        ):
+            indices.append(None)
+            continue
+        e_bin = min(np.searchsorted(log10_e_edges, e_value, side="right") - 1, bins - 1)
+        nu_bin = min(np.searchsorted(nu_edges, nu_value, side="right") - 1, bins - 1)
+        indices.append((int(e_bin), int(nu_bin)))
+    return indices
+
+
+def _joint_grid_occupancy(log10_e: np.ndarray, nu: np.ndarray, *, bins: int) -> float:
+    if not log10_e.size:
+        return float("nan")
+    occupied = {index for index in _joint_bin_indices(log10_e, nu, bins=bins) if index is not None}
+    return float(len(occupied) / (bins * bins))
+
+
+def build_coverage_rows(
+    train_records: list[dict[str, object]],
+    test_records: list[dict[str, object]],
+    *,
+    bins: int = 5,
+) -> list[dict[str, object]]:
+    """Summarize material-local parameter coverage for train and test objects."""
+    _validate_bins(bins)
+    rows: list[dict[str, object]] = []
+    for split, records in (("train", train_records), ("test", test_records)):
+        for material in _audit_materials(train_records, test_records):
+            material_records = _material_records(records, material)
+            log10_e = _column_values(material_records, "log10_e")
+            nu = _column_values(material_records, "nu")
+            pearson_e_nu, spearman_e_nu = _correlations(log10_e, nu)
+            joint_grid_occupancy = _joint_grid_occupancy(log10_e, nu, bins=bins)
+            for parameter in PARAMETER_COLUMNS:
+                rows.append(
+                    {
+                        "split": split,
+                        "material": material,
+                        "parameter": parameter,
+                        **_distribution_summary(_column_values(material_records, parameter)),
+                        "pearson_e_nu": pearson_e_nu,
+                        "spearman_e_nu": spearman_e_nu,
+                        "joint_grid_occupancy": joint_grid_occupancy,
+                    }
+                )
+    return rows
+
+
+def _standardized_mean_differences(
+    train_records: list[dict[str, object]], test_records: list[dict[str, object]]
+) -> dict[str, float]:
+    differences: dict[str, float] = {}
+    for column in _STATIC_NUISANCE_COLUMNS:
+        train_values = _column_values(train_records, column)
+        test_values = _column_values(test_records, column)
+        finite_train = train_values[np.isfinite(train_values)]
+        finite_test = test_values[np.isfinite(test_values)]
+        if finite_train.size < 2 or not finite_test.size:
+            differences[f"smd_{column}"] = float("nan")
+            continue
+        train_std = float(finite_train.std(ddof=1))
+        differences[f"smd_{column}"] = (
+            float((finite_test.mean() - finite_train.mean()) / train_std)
+            if train_std > 0
+            else float("nan")
+        )
+    return differences
+
+
+def _joint_empty_bin_fraction(
+    train_log10_e: np.ndarray,
+    train_nu: np.ndarray,
+    test_log10_e: np.ndarray,
+    test_nu: np.ndarray,
+    *,
+    bins: int,
+) -> float:
+    if not test_log10_e.size:
+        return float("nan")
+    occupied_train_bins = {
+        index
+        for index in _joint_bin_indices(train_log10_e, train_nu, bins=bins)
+        if index is not None
+    }
+    test_bins = _joint_bin_indices(test_log10_e, test_nu, bins=bins)
+    return float(sum(index not in occupied_train_bins for index in test_bins) / len(test_bins))
+
+
+def _mahalanobis_outside_fraction(
+    train_records: list[dict[str, object]], test_records: list[dict[str, object]]
+) -> float:
+    if not train_records or not test_records:
+        return float("nan")
+    feature_columns = (*PARAMETER_COLUMNS, *_STATIC_NUISANCE_COLUMNS)
+    train_matrix = np.column_stack(
+        [_column_values(train_records, column) for column in feature_columns]
+    )
+    test_matrix = np.column_stack(
+        [_column_values(test_records, column) for column in feature_columns]
+    )
+    finite_columns = np.isfinite(train_matrix).all(axis=0) & np.isfinite(test_matrix).all(axis=0)
+    train_matrix = train_matrix[:, finite_columns]
+    test_matrix = test_matrix[:, finite_columns]
+    if not train_matrix.shape[1]:
+        return float("nan")
+
+    train_mean = train_matrix.mean(axis=0)
+    train_std = train_matrix.std(axis=0, ddof=1) if len(train_matrix) > 1 else np.zeros(train_matrix.shape[1])
+    varying_columns = train_std > 0
+    train_matrix = train_matrix[:, varying_columns]
+    test_matrix = test_matrix[:, varying_columns]
+    train_mean = train_mean[varying_columns]
+    train_std = train_std[varying_columns]
+    if not train_matrix.shape[1]:
+        return float("nan")
+
+    train_standardized = (train_matrix - train_mean) / train_std
+    test_standardized = (test_matrix - train_mean) / train_std
+    covariance = np.atleast_2d(np.cov(train_standardized, rowvar=False, ddof=1))
+    covariance += 1e-6 * np.eye(covariance.shape[0])
+    precision = np.linalg.inv(covariance)
+
+    def distances(values: np.ndarray) -> np.ndarray:
+        return np.einsum("ij,jk,ik->i", values, precision, values)
+
+    train_distances = distances(train_standardized)
+    test_distances = distances(test_standardized)
+    threshold = np.percentile(train_distances, 95)
+    return float(np.mean(test_distances > threshold))
+
+
+def build_support_rows(
+    train_records: list[dict[str, object]],
+    test_records: list[dict[str, object]],
+    *,
+    bins: int = 5,
+) -> list[dict[str, object]]:
+    """Compare each material's test parameters and static nuisances to train."""
+    _validate_bins(bins)
+    rows: list[dict[str, object]] = []
+    for material in _audit_materials(train_records, test_records):
+        train_material_records = _material_records(train_records, material)
+        test_material_records = _material_records(test_records, material)
+        train_log10_e = _column_values(train_material_records, "log10_e")
+        train_nu = _column_values(train_material_records, "nu")
+        test_log10_e = _column_values(test_material_records, "log10_e")
+        test_nu = _column_values(test_material_records, "nu")
+        joint_empty_fraction = _joint_empty_bin_fraction(
+            train_log10_e,
+            train_nu,
+            test_log10_e,
+            test_nu,
+            bins=bins,
+        )
+        mahalanobis_fraction = _mahalanobis_outside_fraction(
+            train_material_records,
+            test_material_records,
+        )
+        outside_fractions: list[float] = []
+        parameter_rows: list[dict[str, object]] = []
+        for parameter in PARAMETER_COLUMNS:
+            train_values = _column_values(train_material_records, parameter)
+            test_values = _column_values(test_material_records, parameter)
+            if train_values.size and test_values.size:
+                outside_fraction = float(
+                    np.mean((test_values < train_values.min()) | (test_values > train_values.max()))
+                )
+                ks_result = ks_2samp(train_values, test_values)
+                ks_statistic = float(ks_result.statistic)
+                ks_pvalue = float(ks_result.pvalue)
+                wasserstein = float(wasserstein_distance(train_values, test_values))
+            else:
+                outside_fraction = float("nan")
+                ks_statistic = float("nan")
+                ks_pvalue = float("nan")
+                wasserstein = float("nan")
+            outside_fractions.append(outside_fraction)
+            parameter_rows.append(
+                {
+                    "material": material,
+                    "parameter": parameter,
+                    "n_train": int(train_values.size),
+                    "n_test": int(test_values.size),
+                    "train_min": float(train_values.min()) if train_values.size else float("nan"),
+                    "train_max": float(train_values.max()) if train_values.size else float("nan"),
+                    "test_min": float(test_values.min()) if test_values.size else float("nan"),
+                    "test_max": float(test_values.max()) if test_values.size else float("nan"),
+                    "outside_train_fraction": outside_fraction,
+                    "ks_statistic": ks_statistic,
+                    "ks_pvalue": ks_pvalue,
+                    "wasserstein_distance": wasserstein,
+                }
+            )
+        out_of_support = (
+            any(fraction > 0.05 for fraction in outside_fractions)
+            or joint_empty_fraction > 0.20
+            or mahalanobis_fraction > 0.20
+        )
+        diagnostics = {
+            "joint_empty_bin_fraction": joint_empty_fraction,
+            "mahalanobis_outside_fraction": mahalanobis_fraction,
+            "support_status": "out_of_support" if out_of_support else "in_support",
+            **_standardized_mean_differences(
+                train_material_records,
+                test_material_records,
+            ),
+        }
+        for parameter_row in parameter_rows:
+            parameter_row.update(diagnostics)
+            rows.append(parameter_row)
+    return rows
 
 
 def read_h5_record(
