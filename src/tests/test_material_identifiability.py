@@ -1607,12 +1607,22 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(
             ["--train-dir", str(self.train_dir), "--test-dir", str(self.test_dir)]
         )
+        reduced_resampling_args = build_parser().parse_args(
+            [
+                "--train-dir", str(self.train_dir),
+                "--test-dir", str(self.test_dir),
+                "--permutations", "2",
+                "--bootstrap-samples", "4",
+            ]
+        )
 
         self.assertEqual(args.seed, 0)
         self.assertEqual(args.folds, 5)
         self.assertEqual(args.permutations, 500)
         self.assertEqual(args.bootstrap_samples, 1000)
         self.assertEqual(args.contact_band_raw, 0.08)
+        self.assertEqual(reduced_resampling_args.permutations, 2)
+        self.assertEqual(reduced_resampling_args.bootstrap_samples, 4)
 
     def test_parser_rejects_invalid_statistical_settings(self):
         parser = build_parser()
@@ -1678,6 +1688,12 @@ class CliTests(unittest.TestCase):
                     index=index,
                     include_dynamics=True,
                 )
+        self._write_h5(
+            self.test_dir / "test-0.h5",
+            material_code=0,
+            index=0,
+            include_dynamics=False,
+        )
 
         with mock.patch(
             "diagnose_material_identifiability.build_coverage_rows",
@@ -1692,6 +1708,45 @@ class CliTests(unittest.TestCase):
                 )
 
         self.assertFalse(self.output_dir.exists())
+
+    def test_runner_rejects_empty_test_h5_directory_before_statistics_or_outputs(self):
+        for material_code in range(3):
+            for index in range(2):
+                self._write_h5(
+                    self.train_dir / f"train-{material_code}-{index}.h5",
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=True,
+                )
+
+        with self.assertRaisesRegex(ValueError, "test.*\\*.h5"):
+            run_material_identifiability_audit(
+                self.train_dir,
+                self.test_dir,
+                self.output_dir,
+                AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+            )
+
+        self.assertFalse(self.output_dir.exists() and any(self.output_dir.iterdir()))
+
+    def test_runner_rejects_empty_train_h5_directory_before_statistics_or_outputs(self):
+        for material_code in range(3):
+            self._write_h5(
+                self.test_dir / f"test-{material_code}.h5",
+                material_code=material_code,
+                index=0,
+                include_dynamics=False,
+            )
+
+        with self.assertRaisesRegex(ValueError, "train.*\\*.h5"):
+            run_material_identifiability_audit(
+                self.train_dir,
+                self.test_dir,
+                self.output_dir,
+                AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+            )
+
+        self.assertFalse(self.output_dir.exists() and any(self.output_dir.iterdir()))
 
     def test_runner_requires_overwrite_before_replacing_existing_outputs(self):
         self._create_smoke_fixture()

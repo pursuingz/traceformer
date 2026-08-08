@@ -83,6 +83,11 @@ def _resolve_directory(path: Path, *, name: str) -> Path:
     return resolved
 
 
+def _validate_input_paths(paths: list[Path], *, split: str) -> None:
+    if not paths:
+        raise ValueError(f"{split} directory contains no *.h5 files")
+
+
 def _read_split_records(
     paths: list[Path],
     *,
@@ -151,6 +156,8 @@ def run_material_identifiability_audit(
     test_dir = _resolve_directory(test_dir, name="test")
     train_paths = sorted(train_dir.glob("*.h5"))
     test_paths = sorted(test_dir.glob("*.h5"))
+    _validate_input_paths(train_paths, split="train")
+    _validate_input_paths(test_paths, split="test")
     invalid_records: list[dict[str, str]] = []
 
     train_records = _read_split_records(
