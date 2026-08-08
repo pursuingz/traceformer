@@ -1,6 +1,11 @@
 """H5 record extraction for the material identifiability audit."""
 
+import csv
 import hashlib
+import json
+import math
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +17,16 @@ from scipy.stats import ks_2samp, spearmanr, wasserstein_distance
 
 MATERIAL_NAMES = {0: "elastic", 1: "plasticine", 2: "sand"}
 FRAME_INDICES = (5, 10, 15, 20, 24)
+
+OUTPUT_NAMES = {
+    "records": "material_identifiability_records.csv",
+    "coverage": "material_identifiability_coverage.csv",
+    "confounding": "material_identifiability_confounding.csv",
+    "response": "material_identifiability_response.csv",
+    "summary": "material_identifiability_summary.csv",
+    "metadata": "material_identifiability_metadata.json",
+    "report": "material_identifiability_b02.md",
+}
 
 
 @dataclass(frozen=True)
@@ -110,6 +125,108 @@ PRIMARY_RESPONSE_COLUMNS = (
     "velocity_rms_trajectory",
     "f_strain_norm_f24",
     "volumetric_strain_f24",
+)
+
+_COVERAGE_DISTRIBUTION_COLUMNS = (
+    "row_type",
+    "split",
+    "material",
+    "parameter",
+    "n",
+    "unique_n",
+    "min",
+    "p05",
+    "p25",
+    "mean",
+    "std",
+    "p50",
+    "p75",
+    "p95",
+    "max",
+    "pearson_e_nu",
+    "spearman_e_nu",
+    "joint_grid_occupancy",
+)
+_COVERAGE_SUPPORT_COLUMNS = (
+    "row_type",
+    "split",
+    "material",
+    "parameter",
+    "n_train",
+    "n_test",
+    "train_min",
+    "train_max",
+    "test_min",
+    "test_max",
+    "outside_train_fraction",
+    "ks_statistic",
+    "ks_pvalue",
+    "wasserstein_distance",
+    "joint_empty_bin_fraction",
+    "support_status",
+    "mahalanobis_feature_columns",
+    "mahalanobis_train_p95",
+    "mahalanobis_outside_fraction",
+    "mahalanobis_nonfinite_test_fraction",
+    *(
+        f"smd_{column}"
+        for column in NUISANCE_COLUMNS
+        if column not in {"log10_e", "nu"}
+    ),
+)
+_COVERAGE_COLUMNS = tuple(
+    dict.fromkeys((*_COVERAGE_DISTRIBUTION_COLUMNS, *_COVERAGE_SUPPORT_COLUMNS))
+)
+_CONFOUNDING_COLUMNS = (
+    "row_type",
+    "material",
+    "parameter",
+    "feature",
+    "feature_names",
+    "fitted_features",
+    "n",
+    "pair_n",
+    "pearson",
+    "spearman",
+    "cv_r2",
+    "permutation_p",
+    "confounded",
+    "status",
+    "seed",
+    "folds",
+    "invalid_record_count",
+)
+_RESPONSE_OUTPUT_COLUMNS = (
+    "material",
+    "parameter",
+    "response",
+    "response_tier",
+    "n",
+    "seed",
+    "folds",
+    "nuisance_features",
+    "fitted_features",
+    "r2_m0",
+    "r2_me",
+    "r2_mnu",
+    "r2_mboth",
+    "r2_augmented",
+    "delta_r2",
+    "partial_spearman",
+    "permutation_p",
+    "bootstrap_ci_low",
+    "bootstrap_ci_high",
+    "q_value",
+    "status",
+    "invalid_record_count",
+)
+_SUMMARY_COLUMNS = (
+    "material",
+    "parameter",
+    "status",
+    "support_status",
+    "reason_codes",
+    "invalid_record_count",
 )
 
 PARAMETER_COLUMNS = ("log10_e", "nu")
@@ -1590,3 +1707,484 @@ def read_h5_record(
             )
         )
         return record
+
+
+def _as_finite_float(value: object) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _has_invalid_marker(row: dict[str, object]) -> bool:
+    if row.get("valid") is False:
+        return True
+    if str(row.get("status", "")).startswith("invalid"):
+        return True
+    count = _as_finite_float(row.get("invalid_record_count", 0))
+    if count is not None and count > 0:
+        return True
+    invalid_records = row.get("invalid_records")
+    return bool(invalid_records) if invalid_records is not None else False
+
+
+def _ordered_material_parameter_pairs(
+    response_rows: list[dict[str, object]],
+    confounding_rows: list[dict[str, object]],
+    support_rows: list[dict[str, object]],
+) -> list[tuple[str, str]]:
+    pairs = {
+        (str(row["material"]), str(row["parameter"]))
+        for rows in (response_rows, confounding_rows, support_rows)
+        for row in rows
+        if "material" in row and "parameter" in row
+    }
+    material_order = {name: index for index, name in enumerate(MATERIAL_NAMES.values())}
+    parameter_order = {name: index for index, name in enumerate(PARAMETER_COLUMNS)}
+    return sorted(
+        pairs,
+        key=lambda pair: (
+            material_order.get(pair[0], len(material_order)),
+            pair[0],
+            parameter_order.get(pair[1], len(parameter_order)),
+            pair[1],
+        ),
+    )
+
+
+def _qualifies_primary_response(row: dict[str, object]) -> bool:
+    if row.get("response_tier") != "primary" or row.get("status", "ok") != "ok":
+        return False
+    delta_r2 = _as_finite_float(row.get("delta_r2"))
+    permutation_p = _as_finite_float(row.get("permutation_p"))
+    q_value = _as_finite_float(row.get("q_value"))
+    ci_low = _as_finite_float(row.get("bootstrap_ci_low"))
+    return bool(
+        delta_r2 is not None
+        and delta_r2 >= 0.05
+        and permutation_p is not None
+        and permutation_p < 0.05
+        and q_value is not None
+        and q_value < 0.05
+        and ci_low is not None
+        and ci_low > 0.0
+    )
+
+
+def _has_weak_response_evidence(row: dict[str, object]) -> bool:
+    if row.get("status", "ok") != "ok":
+        return False
+    delta_r2 = _as_finite_float(row.get("delta_r2"))
+    if delta_r2 is not None and delta_r2 >= 0.01:
+        return True
+    permutation_p = _as_finite_float(row.get("permutation_p"))
+    q_value = _as_finite_float(row.get("q_value"))
+    ci_low = _as_finite_float(row.get("bootstrap_ci_low"))
+    return bool(
+        (permutation_p is not None and permutation_p < 0.05)
+        or (q_value is not None and q_value < 0.05)
+        or (ci_low is not None and ci_low > 0.0)
+    )
+
+
+def classify_identifiability(
+    response_rows: list[dict[str, object]],
+    confounding_rows: list[dict[str, object]],
+    support_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Classify material-local parameter evidence without conflating support shift."""
+    summary: list[dict[str, object]] = []
+    for material, parameter in _ordered_material_parameter_pairs(
+        response_rows, confounding_rows, support_rows
+    ):
+        response_subset = [
+            row
+            for row in response_rows
+            if row.get("material") == material and row.get("parameter") == parameter
+        ]
+        confounding_subset = [
+            row
+            for row in confounding_rows
+            if row.get("material") == material
+            and row.get("parameter") == parameter
+            and row.get("row_type", "summary") == "summary"
+        ]
+        support_subset = [
+            row
+            for row in support_rows
+            if row.get("material") == material and row.get("parameter") == parameter
+        ]
+        invalid_record_count = max(
+            (
+                int(max(_as_finite_float(row.get("invalid_record_count", 0)) or 0, 0))
+                for row in (*response_subset, *confounding_subset, *support_subset)
+            ),
+            default=0,
+        )
+        invalid = any(
+            _has_invalid_marker(row)
+            for row in (*response_subset, *confounding_subset, *support_subset)
+        )
+        confounded = any(
+            bool(row.get("confounded", False)) for row in confounding_subset
+        )
+        qualifying_primary = [
+            row for row in response_subset if _qualifies_primary_response(row)
+        ]
+        weak_evidence = [
+            row for row in response_subset if _has_weak_response_evidence(row)
+        ]
+        support_status = (
+            str(support_subset[0].get("support_status", "unknown"))
+            if support_subset
+            else "unknown"
+        )
+        reason_codes: list[str] = []
+        if invalid:
+            status = "invalid"
+            reason_codes.append("invalid_records")
+        elif confounded:
+            status = "confounded"
+            reason_codes.append("nuisance_predictable")
+        elif qualifying_primary:
+            status = "identifiable"
+            reason_codes.extend(
+                (
+                    "primary_delta_r2",
+                    "primary_permutation_significant",
+                    "primary_fdr_significant",
+                    "primary_bootstrap_positive",
+                )
+            )
+        elif weak_evidence:
+            status = "weak"
+            if any(
+                (_as_finite_float(row.get("delta_r2")) or float("-inf")) >= 0.01
+                for row in weak_evidence
+            ):
+                reason_codes.append("response_delta_r2")
+            if any(
+                _as_finite_float(row.get("permutation_p")) is not None
+                and _as_finite_float(row.get("permutation_p")) < 0.05
+                or _as_finite_float(row.get("q_value")) is not None
+                and _as_finite_float(row.get("q_value")) < 0.05
+                or _as_finite_float(row.get("bootstrap_ci_low")) is not None
+                and _as_finite_float(row.get("bootstrap_ci_low")) > 0.0
+                for row in weak_evidence
+            ):
+                reason_codes.append("partial_significance")
+        else:
+            status = "not_detected"
+            reason_codes.append("no_detectable_response")
+        if support_status == "out_of_support":
+            reason_codes.append("test_parameter_extrapolation")
+        elif support_status == "in_support":
+            reason_codes.append("test_parameter_in_support")
+        else:
+            reason_codes.append("test_support_unknown")
+        summary.append(
+            {
+                "material": material,
+                "parameter": parameter,
+                "status": status,
+                "support_status": support_status,
+                "reason_codes": tuple(dict.fromkeys(reason_codes)),
+                "invalid_record_count": invalid_record_count,
+            }
+        )
+    return summary
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
+    if isinstance(value, np.ndarray):
+        return [_json_value(item) for item in value.tolist()]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def _csv_value(value: object) -> str | int | float:
+    value = _json_value(value)
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return value
+
+
+def _write_csv(path: Path, columns: tuple[str, ...], rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: _csv_value(row.get(column)) for column in columns})
+
+
+def _coverage_output_rows(
+    coverage_rows: list[dict[str, object]], support_rows: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    return [
+        {**row, "row_type": "distribution"} for row in coverage_rows
+    ] + [{**row, "row_type": "support"} for row in support_rows]
+
+
+def _markdown_cell(value: object) -> str:
+    value = _json_value(value)
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value).replace("|", "\\|")
+
+
+def _markdown_table(columns: tuple[str, ...], rows: list[dict[str, object]]) -> str:
+    if not rows:
+        return "无可用数据。"
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(_markdown_cell(row.get(column)) for column in columns) + " |"
+        for row in rows
+    )
+    return "\n".join(lines)
+
+
+def render_markdown_report(
+    summary_rows: list[dict[str, object]],
+    coverage_rows: list[dict[str, object]],
+    support_rows: list[dict[str, object]],
+    confounding_rows: list[dict[str, object]],
+    response_rows: list[dict[str, object]],
+    metadata: dict,
+) -> str:
+    """Render a Chinese research-decision report from precomputed audit rows."""
+    summary_table = _markdown_table(
+        ("material", "parameter", "status", "support_status", "reason_codes"),
+        summary_rows,
+    )
+    support_table = _markdown_table(
+        (
+            "material",
+            "parameter",
+            "outside_train_fraction",
+            "joint_empty_bin_fraction",
+            "mahalanobis_outside_fraction",
+            "support_status",
+        ),
+        support_rows,
+    )
+    confounding_summary = [
+        row for row in confounding_rows if row.get("row_type", "summary") == "summary"
+    ]
+    confounding_table = _markdown_table(
+        ("material", "parameter", "cv_r2", "permutation_p", "confounded", "status"),
+        confounding_summary,
+    )
+    primary_responses = [
+        row for row in response_rows if row.get("response_tier") == "primary"
+    ]
+    response_table = _markdown_table(
+        (
+            "material",
+            "parameter",
+            "response",
+            "delta_r2",
+            "permutation_p",
+            "q_value",
+            "bootstrap_ci_low",
+            "status",
+        ),
+        primary_responses,
+    )
+    invalid_records = metadata.get("invalid_records", [])
+    invalid_count = len(invalid_records) if isinstance(invalid_records, list) else "未知"
+    return "\n".join(
+        (
+            "# B0.2 材质参数可辨识性审计",
+            "",
+            "## 审计边界",
+            "本审计只在各材质内部分析 `log10(E)` 与 `nu`，train 使用 GT 动力学响应，test 只用于参数和静态 nuisance 的 support 检查。",
+            "该 observational audit 不能证明反事实物理正确；三种材质来自不同 UID 区间，不能构成配对反事实样本。",
+            "报告不使用 test 动力学，也不以 test 轨迹响应选择模型。",
+            "",
+            "## 生成协议事实",
+            "elastic 的 drag force 数量为 1；plasticine 和 sand 使用 `np.random.randint(0, 1)`，其结果恒为 0。",
+            "因此材质类别携带外力和地板场景差异，跨材质比较只用于描述协议混杂，不作为连续参数效应证据。",
+            "",
+            "## 可辨识性裁决",
+            summary_table,
+            "",
+            "`status` 只描述 train 内统计证据；`support_status` 独立描述 test 是否位于 train 支持范围内。`invalid` 表示存在未被静默忽略的无效记录，不能据此作出参数结论。",
+            "",
+            "## Train/Test Support",
+            support_table,
+            "",
+            "## Nuisance 混杂",
+            confounding_table,
+            "",
+            "## 主要 GT 响应",
+            response_table,
+            "",
+            "## 数据完整性与下一步",
+            f"invalid records: {invalid_count}。无效记录必须先定位并处理，再依据对应材质和参数的状态安排后续实验。",
+            "若参数被判为 confounded，应优先修订数据生成协议；若 train 内有信号但 test 为 out_of_support，应先修订 split/coverage；若无可检测信号，应改变场景、载荷或参数采样，而不是把结果解释为模型条件注入失败。",
+        )
+    ) + "\n"
+
+
+def _validate_output_targets(output_dir: Path, target_paths: dict[str, Path]) -> None:
+    if output_dir.exists() and not output_dir.is_dir():
+        raise NotADirectoryError(f"audit output path is not a directory: {output_dir}")
+    for target_path in target_paths.values():
+        if target_path.exists() and not target_path.is_file():
+            raise IsADirectoryError(
+                f"audit output target is not a regular file: {target_path}"
+            )
+
+
+def _activate_output_files(
+    temporary_dir: Path,
+    target_paths: dict[str, Path],
+) -> None:
+    backup_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{temporary_dir.name}.backup.",
+            dir=temporary_dir.parent,
+        )
+    )
+    backups: dict[str, Path] = {}
+    activated: list[tuple[str, Path]] = []
+    try:
+        for key, target_path in target_paths.items():
+            if target_path.exists():
+                if not target_path.is_file():
+                    raise IsADirectoryError(
+                        f"audit output target is not a regular file: {target_path}"
+                    )
+                backup_path = backup_dir / OUTPUT_NAMES[key]
+                target_path.replace(backup_path)
+                backups[key] = backup_path
+
+        for key, target_path in target_paths.items():
+            (temporary_dir / OUTPUT_NAMES[key]).replace(target_path)
+            activated.append((key, target_path))
+    except Exception as activation_error:
+        rollback_errors: list[OSError] = []
+        for key, target_path in reversed(activated):
+            try:
+                target_path.replace(temporary_dir / OUTPUT_NAMES[key])
+            except OSError as error:
+                rollback_errors.append(error)
+        for key, backup_path in backups.items():
+            try:
+                backup_path.replace(target_paths[key])
+            except OSError as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            raise RuntimeError(
+                f"audit output activation failed and rollback was incomplete; "
+                f"backups remain in {backup_dir}"
+            ) from activation_error
+        shutil.rmtree(backup_dir)
+        raise
+    else:
+        shutil.rmtree(backup_dir)
+
+
+def write_audit_outputs(
+    output_dir: Path,
+    *,
+    records: list[dict[str, object]],
+    coverage_rows: list[dict[str, object]],
+    support_rows: list[dict[str, object]],
+    confounding_rows: list[dict[str, object]],
+    response_rows: list[dict[str, object]],
+    summary_rows: list[dict[str, object]],
+    metadata: dict,
+    overwrite: bool,
+) -> dict[str, Path]:
+    """Render all B0.2 artifacts before atomically activating any target file."""
+    output_dir = Path(output_dir)
+    target_paths = {key: output_dir / name for key, name in OUTPUT_NAMES.items()}
+    if not overwrite:
+        existing = [path for path in target_paths.values() if path.exists()]
+        if existing:
+            raise FileExistsError(
+                f"refusing to overwrite existing audit output: {existing[0]}"
+            )
+    _validate_output_targets(output_dir, target_paths)
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
+    )
+    try:
+        _write_csv(
+            temporary_dir / OUTPUT_NAMES["records"],
+            (*STATIC_COLUMNS, *RESPONSE_COLUMNS),
+            records,
+        )
+        _write_csv(
+            temporary_dir / OUTPUT_NAMES["coverage"],
+            _COVERAGE_COLUMNS,
+            _coverage_output_rows(coverage_rows, support_rows),
+        )
+        _write_csv(
+            temporary_dir / OUTPUT_NAMES["confounding"],
+            _CONFOUNDING_COLUMNS,
+            confounding_rows,
+        )
+        _write_csv(
+            temporary_dir / OUTPUT_NAMES["response"],
+            _RESPONSE_OUTPUT_COLUMNS,
+            response_rows,
+        )
+        _write_csv(
+            temporary_dir / OUTPUT_NAMES["summary"], _SUMMARY_COLUMNS, summary_rows
+        )
+        with (temporary_dir / OUTPUT_NAMES["metadata"]).open(
+            "w", encoding="utf-8"
+        ) as handle:
+            json.dump(
+                _json_value(metadata),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            handle.write("\n")
+        (temporary_dir / OUTPUT_NAMES["report"]).write_text(
+            render_markdown_report(
+                summary_rows,
+                coverage_rows,
+                support_rows,
+                confounding_rows,
+                response_rows,
+                metadata,
+            ),
+            encoding="utf-8",
+        )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _activate_output_files(temporary_dir, target_paths)
+    finally:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+    return target_paths

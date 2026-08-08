@@ -1,6 +1,9 @@
+import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -13,10 +16,14 @@ from utils.material_identifiability import (
     PRIMARY_RESPONSE_COLUMNS,
     RESPONSE_COLUMNS,
     STATIC_COLUMNS,
+    OUTPUT_NAMES,
     RecordValidationError,
     build_coverage_rows,
     build_support_rows,
+    classify_identifiability,
     read_h5_record,
+    render_markdown_report,
+    write_audit_outputs,
 )
 
 
@@ -853,6 +860,415 @@ class IdentifiabilityStatisticsTests(unittest.TestCase):
         self.assertEqual(row["permutation_p"], 1.0)
         self.assertEqual(row["q_value"], 1.0)
         self.assertNotIn("future_contact_fraction", NUISANCE_COLUMNS)
+
+
+class ClassificationTests(unittest.TestCase):
+    @staticmethod
+    def _response(**overrides):
+        row = {
+            "material": "elastic",
+            "parameter": "log10_e",
+            "response": "centered_shape_mse_f24",
+            "response_tier": "primary",
+            "delta_r2": 0.05,
+            "permutation_p": 0.049,
+            "q_value": 0.049,
+            "bootstrap_ci_low": 0.001,
+            "partial_spearman": 0.2,
+            "status": "ok",
+        }
+        row.update(overrides)
+        return row
+
+    @staticmethod
+    def _confounding(**overrides):
+        row = {
+            "row_type": "summary",
+            "material": "elastic",
+            "parameter": "log10_e",
+            "confounded": False,
+            "status": "ok",
+        }
+        row.update(overrides)
+        return row
+
+    @staticmethod
+    def _support(**overrides):
+        row = {
+            "material": "elastic",
+            "parameter": "log10_e",
+            "support_status": "in_support",
+        }
+        row.update(overrides)
+        return row
+
+    def test_classification_uses_primary_fdr_qualified_response(self):
+        summary = classify_identifiability(
+            [self._response()],
+            [self._confounding()],
+            [self._support()],
+        )
+
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "identifiable")
+        self.assertEqual(row["support_status"], "in_support")
+        self.assertIn("primary_delta_r2", row["reason_codes"])
+
+    def test_classification_rejects_secondary_only_and_fdr_boundary_evidence(self):
+        secondary_only = self._response(response_tier="secondary")
+        summary = classify_identifiability(
+            [secondary_only],
+            [self._confounding()],
+            [self._support()],
+        )
+        self.assertNotEqual(
+            find_row(summary, material="elastic", parameter="log10_e")["status"],
+            "identifiable",
+        )
+
+        fdr_boundary = self._response(q_value=0.05)
+        summary = classify_identifiability(
+            [fdr_boundary],
+            [self._confounding()],
+            [self._support()],
+        )
+        self.assertEqual(
+            find_row(summary, material="elastic", parameter="log10_e")["status"],
+            "weak",
+        )
+
+    def test_classification_requires_strict_significance_and_positive_ci(self):
+        for boundary in (
+            {"permutation_p": 0.05},
+            {"q_value": 0.05},
+            {"bootstrap_ci_low": 0.0},
+        ):
+            with self.subTest(boundary=boundary):
+                summary = classify_identifiability(
+                    [self._response(**boundary)],
+                    [self._confounding()],
+                    [self._support()],
+                )
+                self.assertEqual(
+                    find_row(
+                        summary,
+                        material="elastic",
+                        parameter="log10_e",
+                    )["status"],
+                    "weak",
+                )
+
+    def test_classification_distinguishes_weak_not_detected_and_confounded(self):
+        weak_rows = [self._response(delta_r2=0.01, permutation_p=1.0, q_value=1.0)]
+        summary = classify_identifiability(
+            weak_rows,
+            [self._confounding()],
+            [self._support()],
+        )
+        self.assertEqual(
+            find_row(summary, material="elastic", parameter="log10_e")["status"],
+            "weak",
+        )
+
+        null_rows = [
+            self._response(
+                delta_r2=0.009,
+                permutation_p=1.0,
+                q_value=1.0,
+                bootstrap_ci_low=-0.01,
+                partial_spearman=float("nan"),
+            )
+        ]
+        summary = classify_identifiability(
+            null_rows,
+            [self._confounding()],
+            [self._support()],
+        )
+        self.assertEqual(
+            find_row(summary, material="elastic", parameter="log10_e")["status"],
+            "not_detected",
+        )
+
+        summary = classify_identifiability(
+            [self._response()],
+            [self._confounding(confounded=True)],
+            [self._support(support_status="out_of_support")],
+        )
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "confounded")
+        self.assertEqual(row["support_status"], "out_of_support")
+        self.assertIn("nuisance_predictable", row["reason_codes"])
+
+    def test_classification_keeps_support_independent_and_propagates_invalid_records(self):
+        summary = classify_identifiability(
+            [self._response()],
+            [self._confounding()],
+            [self._support(support_status="out_of_support")],
+        )
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "identifiable")
+        self.assertEqual(row["support_status"], "out_of_support")
+
+        summary = classify_identifiability(
+            [self._response(invalid_record_count=1)],
+            [self._confounding()],
+            [self._support()],
+        )
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "invalid")
+        self.assertIn("invalid_records", row["reason_codes"])
+
+    def test_classification_does_not_multiply_shared_invalid_record_count(self):
+        response_rows = [
+            self._response(response="centered_shape_mse_f24", invalid_record_count=1),
+            self._response(response="velocity_rms_trajectory", invalid_record_count=1),
+        ]
+
+        summary = classify_identifiability(
+            response_rows,
+            [self._confounding(invalid_record_count=1)],
+            [self._support(invalid_record_count=1)],
+        )
+
+        row = find_row(summary, material="elastic", parameter="log10_e")
+        self.assertEqual(row["status"], "invalid")
+        self.assertEqual(row["invalid_record_count"], 1)
+
+
+class OutputTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.output_dir = self.root / "outputs"
+        self.records = [
+            {
+                "model": "train.h5",
+                "split": "train",
+                "material": "elastic",
+                "valid": True,
+                "log10_e": 6.0,
+                "nu": 0.3,
+                "centered_shape_mse_f24": 0.2,
+            },
+            {
+                "model": "test.h5",
+                "split": "test",
+                "material": "elastic",
+                "valid": True,
+                "log10_e": 6.1,
+                "nu": 0.31,
+            },
+        ]
+        self.summary_rows = [
+            {
+                "material": material,
+                "parameter": "log10_e",
+                "status": "not_detected",
+                "support_status": "in_support",
+                "reason_codes": ("no_detectable_response",),
+            }
+            for material in ("elastic", "plasticine", "sand")
+        ]
+        self.payload = {
+            "records": self.records,
+            "coverage_rows": [{
+                "row_type": "wrong", "split": "train",
+                "material": "elastic", "parameter": "log10_e",
+                "n": 1, "unique_n": 1, "joint_grid_occupancy": 0.04,
+            }],
+            "support_rows": [{
+                "row_type": "wrong", "material": "elastic", "parameter": "log10_e",
+                "n_train": 1, "n_test": 1, "support_status": "in_support",
+            }],
+            "confounding_rows": [{
+                "row_type": "summary", "material": "elastic", "parameter": "log10_e",
+                "confounded": False, "status": "ok",
+            }],
+            "response_rows": [{
+                "material": "elastic", "parameter": "log10_e",
+                "response": "centered_shape_mse_f24", "response_tier": "primary",
+                "delta_r2": 0.0, "permutation_p": 1.0, "q_value": 1.0,
+            }],
+            "summary_rows": self.summary_rows,
+            "metadata": {
+                "seed": 0,
+                "note": "无效记录",
+                "invalid_records": [
+                    {"path": "bad.h5", "split": "train", "error": "missing F"}
+                ],
+            },
+        }
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_writer_emits_fixed_schema_refuses_overwrite_and_renders_honest_report(self):
+        paths = write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
+        self.assertEqual(set(paths), set(OUTPUT_NAMES))
+        self.assertTrue(all(path.exists() for path in paths.values()))
+        self.assertEqual(
+            {path.name for path in self.output_dir.iterdir()},
+            set(OUTPUT_NAMES.values()),
+        )
+
+        with self.assertRaises(FileExistsError):
+            write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
+
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(len(metadata["invalid_records"]), 1)
+        self.assertEqual(metadata["invalid_records"][0]["path"], "bad.h5")
+        self.assertEqual(metadata["seed"], 0)
+        self.assertIn(
+            "无效记录",
+            paths["metadata"].read_text(encoding="utf-8"),
+        )
+
+        with paths["records"].open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        self.assertEqual(reader.fieldnames, [*STATIC_COLUMNS, *RESPONSE_COLUMNS])
+        test_row = next(row for row in rows if row["split"] == "test")
+        self.assertEqual(test_row["centered_shape_mse_f24"], "")
+
+        with paths["coverage"].open(newline="", encoding="utf-8") as handle:
+            coverage_rows = list(csv.DictReader(handle))
+        self.assertEqual(
+            {row["row_type"] for row in coverage_rows},
+            {"distribution", "support"},
+        )
+
+        report = paths["report"].read_text(encoding="utf-8")
+        self.assertIn("np.random.randint(0, 1)", report)
+        self.assertIn("elastic", report)
+        self.assertIn("plasticine", report)
+        self.assertIn("sand", report)
+        self.assertIn("不能证明反事实物理正确", report)
+        self.assertIn("不能构成配对反事实样本", report)
+        self.assertIn("不使用 test 动力学", report)
+
+    def test_writer_leaves_final_paths_untouched_when_rendering_fails(self):
+        broken_payload = dict(self.payload)
+        broken_payload["metadata"] = {"seed": 0, "unsupported": object()}
+
+        with self.assertRaises(TypeError):
+            write_audit_outputs(self.output_dir, overwrite=False, **broken_payload)
+
+        self.assertFalse(
+            self.output_dir.exists() and any(self.output_dir.glob("*"))
+        )
+
+    def test_writer_does_not_partially_replace_outputs_when_activation_is_blocked(self):
+        self.output_dir.mkdir()
+        records_path = self.output_dir / OUTPUT_NAMES["records"]
+        coverage_path = self.output_dir / OUTPUT_NAMES["coverage"]
+        blocked_path = self.output_dir / OUTPUT_NAMES["confounding"]
+        records_path.write_text("old records\n", encoding="utf-8")
+        coverage_path.write_text("old coverage\n", encoding="utf-8")
+        blocked_path.mkdir()
+
+        with self.assertRaises(OSError):
+            write_audit_outputs(self.output_dir, overwrite=True, **self.payload)
+
+        self.assertEqual(records_path.read_text(encoding="utf-8"), "old records\n")
+        self.assertEqual(coverage_path.read_text(encoding="utf-8"), "old coverage\n")
+        self.assertTrue(blocked_path.is_dir())
+        self.assertFalse(
+            any(
+                (self.output_dir / OUTPUT_NAMES[key]).exists()
+                for key in ("response", "summary", "metadata", "report")
+            )
+        )
+
+    def test_writer_refuses_any_existing_target_before_rendering(self):
+        self.output_dir.mkdir()
+        blocked_path = self.output_dir / OUTPUT_NAMES["summary"]
+        blocked_path.mkdir()
+        broken_payload = dict(self.payload)
+        broken_payload["metadata"] = {"unsupported": object()}
+
+        with self.assertRaises(FileExistsError):
+            write_audit_outputs(
+                self.output_dir,
+                overwrite=False,
+                **broken_payload,
+            )
+
+        self.assertTrue(blocked_path.is_dir())
+        self.assertEqual(list(self.output_dir.iterdir()), [blocked_path])
+
+    def test_writer_restores_all_old_outputs_after_mid_activation_failure(self):
+        paths = write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
+        old_contents = {
+            key: path.read_bytes()
+            for key, path in paths.items()
+        }
+        replacement_payload = dict(self.payload)
+        replacement_payload["metadata"] = {"seed": 1, "invalid_records": []}
+        original_replace = Path.replace
+        failed = False
+
+        def fail_response_activation(source, target):
+            nonlocal failed
+            target = Path(target)
+            if (
+                not failed
+                and source.name == OUTPUT_NAMES["response"]
+                and target == paths["response"]
+            ):
+                failed = True
+                raise OSError("injected activation failure")
+            return original_replace(source, target)
+
+        with mock.patch.object(
+            Path,
+            "replace",
+            autospec=True,
+            side_effect=fail_response_activation,
+        ):
+            with self.assertRaisesRegex(OSError, "injected activation failure"):
+                write_audit_outputs(
+                    self.output_dir,
+                    overwrite=True,
+                    **replacement_payload,
+                )
+
+        self.assertTrue(failed)
+        self.assertEqual(
+            {key: path.read_bytes() for key, path in paths.items()},
+            old_contents,
+        )
+
+    def test_writer_replaces_complete_existing_output_set(self):
+        paths = write_audit_outputs(self.output_dir, overwrite=False, **self.payload)
+        replacement_payload = dict(self.payload)
+        replacement_payload["metadata"] = {"seed": 1, "invalid_records": []}
+
+        replaced_paths = write_audit_outputs(
+            self.output_dir,
+            overwrite=True,
+            **replacement_payload,
+        )
+
+        self.assertEqual(replaced_paths, paths)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(metadata["seed"], 1)
+        self.assertEqual(
+            {path.name for path in self.output_dir.iterdir()},
+            set(OUTPUT_NAMES.values()),
+        )
+
+    def test_markdown_renderer_is_available_without_writing_files(self):
+        report = render_markdown_report(
+            self.summary_rows,
+            self.payload["coverage_rows"],
+            self.payload["support_rows"],
+            self.payload["confounding_rows"],
+            self.payload["response_rows"],
+            self.payload["metadata"],
+        )
+
+        self.assertIn("B0.2", report)
+        self.assertIn("不能证明反事实物理正确", report)
 
 
 if __name__ == "__main__":
