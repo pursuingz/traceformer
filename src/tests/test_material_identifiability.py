@@ -1572,6 +1572,54 @@ class OutputTests(unittest.TestCase):
         self.assertIn("train invalid records: 0", report)
         self.assertIn("test invalid records: 1", report)
 
+    def test_test_invalid_support_override_is_consistent_across_outputs(self):
+        payload = dict(self.payload)
+        payload["metadata"] = {
+            "seed": 0,
+            "invalid_records": [
+                {"path": "bad-test.h5", "split": "test", "error": "missing E"}
+            ],
+        }
+        payload["summary_rows"] = [dict(row) for row in self.summary_rows]
+        for row in payload["summary_rows"]:
+            row["reason_codes"] = (
+                *row["reason_codes"],
+                "test_parameter_in_support",
+            )
+        payload["summary_rows"][0]["status"] = "identifiable"
+
+        paths = write_audit_outputs(
+            self.output_dir,
+            overwrite=False,
+            **payload,
+        )
+
+        with paths["summary"].open(newline="", encoding="utf-8") as handle:
+            summary_rows = list(csv.DictReader(handle))
+        self.assertEqual(summary_rows[0]["status"], "identifiable")
+        self.assertEqual({row["support_status"] for row in summary_rows}, {"unknown"})
+        self.assertTrue(
+            all(
+                "test_parameter_in_support" not in row["reason_codes"]
+                and "test_parameter_extrapolation" not in row["reason_codes"]
+                for row in summary_rows
+            )
+        )
+
+        with paths["coverage"].open(newline="", encoding="utf-8") as handle:
+            coverage_rows = list(csv.DictReader(handle))
+        support_rows = [row for row in coverage_rows if row["row_type"] == "support"]
+        self.assertEqual({row["support_status"] for row in support_rows}, {"unknown"})
+
+        report = paths["report"].read_text(encoding="utf-8")
+        support_section = report.split("## Train/Test Support", 1)[1].split(
+            "## Nuisance", 1
+        )[0]
+        self.assertIn("| elastic | log10_e |", support_section)
+        self.assertIn("| unknown |", support_section)
+        self.assertNotIn("| in_support |", support_section)
+        self.assertNotIn("test_parameter_in_support", report)
+
     def test_writer_leaves_final_paths_untouched_when_rendering_fails(self):
         broken_payload = dict(self.payload)
         broken_payload["metadata"] = {"seed": 0, "unsupported": object()}

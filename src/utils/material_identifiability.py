@@ -2223,6 +2223,24 @@ def _apply_metadata_invalid_records(
     return prepared_rows
 
 
+def _prepare_output_rows(
+    summary_rows: list[dict[str, object]],
+    support_rows: list[dict[str, object]],
+    metadata: dict,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict]:
+    metadata = _metadata_with_output_fields(metadata)
+    prepared_summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
+    prepared_support_rows = [dict(row) for row in support_rows]
+    test_blocking = (
+        int(metadata["test_invalid_record_count"]) > 0
+        or int(metadata["unknown_split_invalid_record_count"]) > 0
+    )
+    if test_blocking:
+        for row in prepared_support_rows:
+            row["support_status"] = "unknown"
+    return prepared_summary_rows, prepared_support_rows, metadata
+
+
 def _empty_test_response(value: object) -> bool:
     if isinstance(value, np.generic):
         value = value.item()
@@ -2256,8 +2274,11 @@ def render_markdown_report(
     metadata: dict,
 ) -> str:
     """Render a Chinese research-decision report from precomputed audit rows."""
-    metadata = _metadata_with_output_fields(metadata)
-    summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
+    summary_rows, support_rows, metadata = _prepare_output_rows(
+        summary_rows,
+        support_rows,
+        metadata,
+    )
     summary_table = _markdown_table(
         ("material", "parameter", "status", "support_status", "reason_codes"),
         summary_rows,
@@ -2444,8 +2465,11 @@ def write_audit_outputs(
         overwrite=overwrite,
     )
     _validate_test_records_have_no_responses(records)
-    metadata = _metadata_with_output_fields(metadata)
-    summary_rows = _apply_metadata_invalid_records(summary_rows, metadata)
+    summary_rows, support_rows, metadata = _prepare_output_rows(
+        summary_rows,
+        support_rows,
+        metadata,
+    )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
