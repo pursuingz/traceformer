@@ -2,6 +2,7 @@
 
 import argparse
 import math
+from collections import Counter
 from pathlib import Path
 
 from utils.material_identifiability import (
@@ -153,13 +154,32 @@ def _validate_material_counts(
     test_records: list[dict[str, object]],
     *,
     folds: int,
+    invalid_records: list[dict[str, str]],
 ) -> None:
+    def invalid_reason_summary(split: str) -> str:
+        counts = Counter(
+            record["error"]
+            for record in invalid_records
+            if record["split"] == split
+        )
+        if not counts:
+            return ""
+        reasons = "; ".join(
+            f"{reason} ({count})"
+            for reason, count in sorted(
+                counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        )
+        return f"; invalid {split} reasons: {reasons}"
+
     for material in MATERIAL_NAMES.values():
         count = sum(record["material"] == material for record in train_records)
         if count < folds:
             raise ValueError(
                 f"material {material} has {count} valid train records; "
                 f"at least {folds} are required"
+                f"{invalid_reason_summary('train')}"
             )
     for material in MATERIAL_NAMES.values():
         count = sum(record["material"] == material for record in test_records)
@@ -167,6 +187,7 @@ def _validate_material_counts(
             raise ValueError(
                 f"material {material} has {count} valid test records; "
                 "at least 1 is required"
+                f"{invalid_reason_summary('test')}"
             )
 
 
@@ -227,6 +248,7 @@ def run_material_identifiability_audit(
         train_records,
         test_records,
         folds=settings.folds,
+        invalid_records=invalid_records,
     )
 
     print("coverage")

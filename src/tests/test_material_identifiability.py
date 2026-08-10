@@ -141,6 +141,45 @@ class MaterialRecordTests(unittest.TestCase):
         self.assertAlmostEqual(record["f_strain_norm_f24"], 0.0)
         self.assertAlmostEqual(record["volumetric_strain_f24"], 0.0)
 
+    def test_train_record_accepts_flattened_legacy_f_and_c_matrices(self):
+        train_path = self.root / "legacy_flattened_matrices.h5"
+        self.write_h5(train_path, frames=25, include_dynamics=True)
+        with h5py.File(train_path, "a") as handle:
+            flattened_f = np.asarray(handle["F"][:]).reshape(25, 8, 9)
+            flattened_c = np.asarray(handle["C"][:]).reshape(25, 8, 9)
+            del handle["F"]
+            del handle["C"]
+            handle["F"] = flattened_f
+            handle["C"] = flattened_c
+
+        record = read_h5_record(
+            train_path,
+            split="train",
+            settings=AuditSettings(),
+        )
+
+        self.assertAlmostEqual(record["f_strain_norm_f24"], 0.0)
+        self.assertAlmostEqual(record["volumetric_strain_f24"], 0.0)
+        self.assertAlmostEqual(record["c_norm_f24"], 0.0)
+
+    def test_flattened_matrix_dynamics_preserves_row_major_component_order(self):
+        x = np.zeros((2, 3, 3), dtype=np.float64)
+        flattened = np.arange(54, dtype=np.float64).reshape(2, 3, 9)
+
+        matrices = material_identifiability._normalise_matrix_dynamics(
+            flattened,
+            x,
+            field="F",
+        )
+
+        np.testing.assert_array_equal(
+            matrices,
+            flattened.reshape(2, 3, 3, 3),
+        )
+        np.testing.assert_array_equal(matrices[0, 0, 0], [0.0, 1.0, 2.0])
+        np.testing.assert_array_equal(matrices[0, 0, 1], [3.0, 4.0, 5.0])
+        np.testing.assert_array_equal(matrices[0, 0, 2], [6.0, 7.0, 8.0])
+
     def test_response_columns_freeze_complete_secondary_schema(self):
         self.assertEqual(RESPONSE_COLUMNS, self._response_columns())
         self.assertNotIn("contact_onset_frame", NUISANCE_COLUMNS)
@@ -2110,6 +2149,41 @@ class CliTests(unittest.TestCase):
                     self.output_dir,
                     AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
                 )
+
+        self.assertFalse(self.output_dir.exists())
+
+    def test_runner_reports_invalid_train_reasons_when_material_count_fails(self):
+        for material_code in range(3):
+            for index in range(2):
+                path = self.train_dir / f"train-{material_code}-{index}.h5"
+                self._write_h5(
+                    path,
+                    material_code=material_code,
+                    index=index,
+                    include_dynamics=True,
+                )
+                if material_code == 0:
+                    with h5py.File(path, "a") as handle:
+                        del handle["F"]
+                        handle["F"] = np.zeros((25, 8, 8), dtype=np.float32)
+        for material_code in range(3):
+            self._write_h5(
+                self.test_dir / f"test-{material_code}.h5",
+                material_code=material_code,
+                index=0,
+                include_dynamics=False,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"elastic has 0 valid train records.*invalid train reasons:.*F.*\(2\)",
+        ):
+            run_material_identifiability_audit(
+                self.train_dir,
+                self.test_dir,
+                self.output_dir,
+                AuditSettings(folds=2, permutations=2, bootstrap_samples=4),
+            )
 
         self.assertFalse(self.output_dir.exists())
 

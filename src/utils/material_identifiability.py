@@ -427,6 +427,24 @@ def _validate_train_dynamics(
         raise RecordValidationError("train dynamics must be finite")
 
 
+def _normalise_matrix_dynamics(
+    values: np.ndarray,
+    x: np.ndarray,
+    *,
+    field: str,
+) -> np.ndarray:
+    matrix_shape = x.shape[:2] + (3, 3)
+    flattened_shape = x.shape[:2] + (9,)
+    if values.shape == matrix_shape:
+        return values
+    if values.shape == flattened_shape:
+        return values.reshape(matrix_shape)
+    raise RecordValidationError(
+        f"{field} must have shape (frames, particles, 3, 3) "
+        "or (frames, particles, 9)"
+    )
+
+
 def _train_responses(
     x: np.ndarray,
     v: np.ndarray,
@@ -1749,8 +1767,16 @@ def read_h5_record(
         _require_fields(handle, _TRAIN_DYNAMIC_FIELDS)
         x = np.asarray(handle["x"][:], dtype=np.float64)
         v = np.asarray(handle["v"][:], dtype=np.float64)
-        f = np.asarray(handle["F"][:], dtype=np.float64)
-        c = np.asarray(handle["C"][:], dtype=np.float64)
+        f = _normalise_matrix_dynamics(
+            np.asarray(handle["F"][:], dtype=np.float64),
+            x,
+            field="F",
+        )
+        c = _normalise_matrix_dynamics(
+            np.asarray(handle["C"][:], dtype=np.float64),
+            x,
+            field="C",
+        )
         _validate_train_dynamics(x, v, f, c)
         record.update(
             _train_responses(
