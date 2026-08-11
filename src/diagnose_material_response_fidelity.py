@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -148,6 +150,31 @@ def _validate_runtime_arguments(
         raise ValueError("contact_band_raw must be finite and non-negative")
 
 
+def _normalized_checkpoint_path(path: str | Path) -> str:
+    """Resolve equivalent CLI/config paths without requiring the file to exist."""
+    return os.path.normcase(
+        os.path.normpath(str(Path(path).expanduser().resolve(strict=False)))
+    )
+
+
+def _validate_cli_checkpoint_matches_config(args: Any, checkpoint: Path) -> None:
+    config_resume = Path(str(args.resume))
+    if _normalized_checkpoint_path(config_resume) != _normalized_checkpoint_path(
+        checkpoint
+    ):
+        raise ValueError(
+            "CLI --checkpoint must match config resume: "
+            f"cli={checkpoint}; config={config_resume}"
+        )
+
+
+def _rollout_autocast_context(device: str | torch.device):
+    """Match eval.py's CUDA bf16 rollout context without forcing CUDA in tests."""
+    if torch.device(device).type == "cuda" and torch.cuda.is_available():
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
 def _scalar_batch_value(batch: dict[str, Any], field: str, model: str) -> float:
     if field not in batch:
         raise ValueError(f"{model}: batch is missing {field}")
@@ -281,8 +308,11 @@ def run_material_response_fidelity(
     # when a complete six-file report already exists.
     preflight_fidelity_outputs(output_dir, overwrite=overwrite)
 
-    args.resume = str(checkpoint)
+    # Validate the YAML identity before comparing it with the CLI path. Mutating
+    # args.resume here would hide a config/checkpoint mismatch from the strict
+    # contact_cond90 profile check.
     _validate_b0_identity(args, profile=B03_PROFILE)
+    _validate_cli_checkpoint_matches_config(args, checkpoint)
     dataset_root = Path(args.train_dataset.dataset_path)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
@@ -342,16 +372,17 @@ def run_material_response_fidelity(
         if record is None:
             raise ValueError(f"{model_name}: missing material metadata")
 
-        _validate_normal_material_condition(batch, record)
         reset_inference_seed(seed, getattr(args, "device", "cuda"))
-        output = rollout_condition(
-            pipeline,
-            batch,
-            args,
-            record.log10_e,
-            record.nu,
-            record.mat_type,
-        )
+        _validate_normal_material_condition(batch, record)
+        with _rollout_autocast_context(getattr(args, "device", "cuda")):
+            output = rollout_condition(
+                pipeline,
+                batch,
+                args,
+                record.log10_e,
+                record.nu,
+                record.mat_type,
+            )
         pred = _prediction_trajectory(output, input_frames, record.model)
         gt = _reference_trajectory(
             _build_raw_reference(batch, args.train_dataset), record.model

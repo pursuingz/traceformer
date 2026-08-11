@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -538,6 +539,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
             num_inference_steps=1,
             seed=0,
             device="cpu",
+            resume=str(self.checkpoint),
             model_config=SimpleNamespace(cond_frames=5),
             train_dataset=SimpleNamespace(
                 dataset_path=str(self.dataset_root),
@@ -589,6 +591,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
 
         class FakeDataset:
             def __init__(self, split, config):
+                outer.events.append("dataset")
                 self.split = split
                 self.split_lst_save = [record.model for record in outer.records]
                 self.batches = batches
@@ -596,45 +599,63 @@ class DiagnosticRunnerTests(unittest.TestCase):
         class FakeModel:
             def __init__(self, *args, **kwargs):
                 outer.model_constructions += 1
+                outer.events.append("model")
 
             def to(self, device):
+                outer.events.append("device")
                 return self
 
             def load_state_dict(self, checkpoint, strict):
                 self.strict = strict
+                outer.events.append("strict_load")
 
             def eval(self):
+                outer.events.append("eval")
                 return self
 
             def requires_grad_(self, enabled):
                 outer.requires_grad_values.append(enabled)
+                outer.events.append("frozen")
                 return self
 
         class FakePipeline:
             def __init__(self, *, model, scheduler):
                 outer.schedulers.append(scheduler)
+                outer.events.append("pipeline")
 
         self.model_constructions = 0
         self.requires_grad_values = []
         self.schedulers = []
         self.rollout_calls = []
+        self.events = []
+
+        def checkpoint_loader(path, device):
+            outer.events.append("checkpoint_loader")
+            return {"weight": torch.tensor(1.0)}
+
+        def compile_model(model):
+            outer.events.append("compile")
+            return model
+
         return fidelity_runner.RuntimeComponents(
             dataset_cls=FakeDataset,
             model_cls=FakeModel,
             pipeline_cls=FakePipeline,
-            checkpoint_loader=lambda path, device: {"weight": torch.tensor(1.0)},
+            checkpoint_loader=checkpoint_loader,
             dataloader_cls=lambda dataset, **kwargs: [
                 (batch, {}) for batch in dataset.batches
             ],
-            compile_model=lambda model: model,
+            compile_model=compile_model,
         )
 
     def _identity_check(self, args, records=None, profile=None):
+        self.events.append("identity")
         self.assertEqual(profile, "contact_cond90")
         if not args.identity_valid:
             raise ValueError("B0 config mismatch")
 
     def _normal_condition(self, batch, record):
+        self.events.append(f"normal:{record.model}")
         if not np.isclose(float(batch["E"].item()), record.log10_e):
             raise ValueError(f"{record.model}: batch/HDF5 E mismatch")
         if not np.isclose(float(batch["nu"].item()), record.nu):
@@ -649,18 +670,34 @@ class DiagnosticRunnerTests(unittest.TestCase):
             record.log10_e, record.nu, record.mat_type
         ))
         self.rollout_calls.append(name)
+        self.events.append(f"rollout:{name}")
         return self.trajectories[name].clone()
+
+    def _load_records(self, *args, **kwargs):
+        self.events.append("h5")
+        return self.records
+
+    def _reset_seed(self, seed, device):
+        self.events.append(f"seed:{seed}")
 
     def _run(self, runtime=None, **changes):
         args = self.args
         for key, value in changes.pop("args", {}).items():
             setattr(args, key, value)
         runtime = self.runtime if runtime is None else runtime
+        original_preflight = fidelity_runner.preflight_fidelity_outputs
+
+        def preflight(*args, **kwargs):
+            self.events.append("preflight")
+            return original_preflight(*args, **kwargs)
+
         with (
             mock.patch.object(fidelity_runner, "_validate_b0_identity", self._identity_check),
-            mock.patch.object(fidelity_runner, "load_material_records", return_value=self.records),
+            mock.patch.object(fidelity_runner, "load_material_records", self._load_records),
             mock.patch.object(fidelity_runner, "_validate_normal_material_condition", self._normal_condition),
             mock.patch.object(fidelity_runner, "rollout_condition", self._rollout),
+            mock.patch.object(fidelity_runner, "reset_inference_seed", self._reset_seed),
+            mock.patch.object(fidelity_runner, "preflight_fidelity_outputs", preflight),
             mock.patch.object(
                 fidelity_runner,
                 "_build_raw_reference",
@@ -703,6 +740,69 @@ class DiagnosticRunnerTests(unittest.TestCase):
             self.assertEqual(
                 len(list(csv.DictReader(handle))), 41 * len(RESPONSE_NAMES)
             )
+        self.assertEqual(self.args.resume, str(self.checkpoint))
+
+    def test_runner_rejects_cli_checkpoint_mismatch_before_runtime(self):
+        yaml_checkpoint = self.root / "yaml.safetensors"
+        yaml_checkpoint.write_bytes(b"yaml checkpoint")
+        self.args.resume = str(yaml_checkpoint)
+
+        with self.assertRaisesRegex(ValueError, "CLI --checkpoint"):
+            self._run()
+
+        self.assertEqual(self.events, ["preflight", "identity"])
+        self.assertEqual(self.model_constructions, 0)
+
+    def test_runner_records_critical_operation_order_and_autocast_wrapping(self):
+        class RecordingContext:
+            def __enter__(inner_self):
+                self.events.append("autocast_enter")
+                return inner_self
+
+            def __exit__(inner_self, exc_type, exc, traceback):
+                self.events.append("autocast_exit")
+                return False
+
+        with mock.patch.object(
+            fidelity_runner,
+            "_rollout_autocast_context",
+            side_effect=lambda device: RecordingContext(),
+        ):
+            self._run()
+
+        def before(first, second):
+            self.assertLess(self.events.index(first), self.events.index(second))
+
+        for later in ("checkpoint_loader", "model", "dataset", "h5", "device", "compile"):
+            before("preflight", later)
+        before("checkpoint_loader", "strict_load")
+        before("strict_load", "eval")
+        before("eval", "frozen")
+        before("frozen", "compile")
+        before("compile", "pipeline")
+        for record in self.records:
+            normal_index = self.events.index(f"normal:{record.model}")
+            self.assertEqual(self.events[normal_index - 1], "seed:0")
+            self.assertEqual(self.events[normal_index + 1], "autocast_enter")
+            self.assertEqual(
+                self.events[normal_index + 2], f"rollout:{record.model}"
+            )
+            self.assertEqual(self.events[normal_index + 3], "autocast_exit")
+        self.assertEqual(self.events.count("autocast_enter"), 41)
+        self.assertEqual(self.events.count("autocast_exit"), 41)
+
+    def test_rollout_autocast_context_uses_cuda_bf16_only_when_available(self):
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            with fidelity_runner._rollout_autocast_context("cpu"):
+                pass
+
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch, "autocast", return_value=nullcontext()) as autocast,
+        ):
+            with fidelity_runner._rollout_autocast_context("cuda"):
+                pass
+        autocast.assert_called_once_with("cuda", dtype=torch.bfloat16)
 
     def test_runner_skips_nonzero_windows_without_a_rollout(self):
         nonzero = dict(self._batches()[0], start_idx=torch.tensor([5]))
@@ -738,8 +838,11 @@ class DiagnosticRunnerTests(unittest.TestCase):
             self._run()
         self.args.identity_valid = True
 
+        missing_checkpoint = self.root / "missing.safetensors"
+        self.args.resume = str(missing_checkpoint)
         with self.assertRaisesRegex(FileNotFoundError, "checkpoint does not exist"):
-            self._run(checkpoint=self.root / "missing.safetensors")
+            self._run(checkpoint=missing_checkpoint)
+        self.args.resume = str(self.checkpoint)
         self.args.train_dataset.dataset_path = str(self.root / "missing_dataset")
         with self.assertRaisesRegex(FileNotFoundError, "dataset directory does not exist"):
             self._run()
