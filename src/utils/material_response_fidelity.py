@@ -84,6 +84,8 @@ FIDELITY_COLUMNS = (
     "mae",
     "rmse",
     "bias",
+    "bias_ci_low",
+    "bias_ci_high",
     "spearman",
     "spearman_ci_low",
     "spearman_ci_high",
@@ -123,6 +125,8 @@ _METADATA_REQUIRED_FIELDS = (
     "model_counts",
     "response_schema",
     "bootstrap_samples",
+    "contact_band_raw",
+    "contact_band_normalized",
 )
 _ROW_REQUIRED_FIELDS = (
     "model",
@@ -356,10 +360,14 @@ def classify_alignment(gt_rho: float | None, pred_rho: float | None) -> str:
         return "weak_or_unresolved"
     gt_value = _finite_scalar(gt_rho, "gt_rho")
     pred_value = _finite_scalar(pred_rho, "pred_rho")
-    if abs(gt_value) >= 0.20 and np.sign(gt_value) != np.sign(pred_value):
-        return "reversed"
     if (
         abs(gt_value) >= 0.20
+        and abs(pred_value) >= 0.20
+        and np.sign(gt_value) != np.sign(pred_value)
+    ):
+        return "reversed"
+    if (
+        abs(gt_value) >= 0.30
         and np.sign(gt_value) == np.sign(pred_value)
         and abs(pred_value) < 0.50 * abs(gt_value)
     ):
@@ -480,6 +488,23 @@ def _bootstrap_partial_ci(
     return float(low), float(high)
 
 
+def _bootstrap_mean_ci(
+    values: np.ndarray,
+    *,
+    samples: int,
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """Bootstrap a mean by resampling complete model-level values."""
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+        raise ValueError("bootstrap_samples must be a positive integer")
+    if values.ndim != 1 or values.size < 1 or not np.isfinite(values).all():
+        raise ValueError("bootstrap mean values must be a non-empty finite vector")
+    indices = rng.integers(0, values.size, size=(samples, values.size))
+    estimates = np.mean(values[indices], axis=1)
+    low, high = np.percentile(estimates, (2.5, 97.5))
+    return float(low), float(high)
+
+
 def _group_rows(rows: list[dict[str, Any]], group: str) -> list[dict[str, Any]]:
     if group == "overall":
         return rows
@@ -505,6 +530,11 @@ def build_fidelity_summary(
             gt_values = np.asarray([row["gt_value"] for row in selected], dtype=np.float64)
             pred_values = np.asarray([row["pred_value"] for row in selected], dtype=np.float64)
             errors = pred_values - gt_values
+            bias_ci_low, bias_ci_high = _bootstrap_mean_ci(
+                errors,
+                samples=bootstrap_samples,
+                rng=rng,
+            )
             constant = _is_constant(gt_values) or _is_constant(pred_values)
             rho = None if constant else _safe_spearman(gt_values, pred_values)
             ci_low, ci_high = (
@@ -531,6 +561,8 @@ def build_fidelity_summary(
                     "mae": float(np.mean(np.abs(errors))),
                     "rmse": float(np.sqrt(np.mean(errors**2))),
                     "bias": float(np.mean(errors)),
+                    "bias_ci_low": bias_ci_low,
+                    "bias_ci_high": bias_ci_high,
                     "spearman": rho,
                     "spearman_ci_low": ci_low,
                     "spearman_ci_high": ci_high,
@@ -610,7 +642,7 @@ def build_alignment_summary(
                 magnitude_ratio = (
                     None
                     if gt_ordinary is None or abs(gt_ordinary) < 0.05
-                    else pred_ordinary / gt_ordinary
+                    else abs(pred_ordinary) / abs(gt_ordinary)
                     if pred_ordinary is not None
                     else None
                 )
@@ -749,7 +781,17 @@ def _validate_fidelity_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, An
         ]
         if row["n"] != expected_n:
             raise ValueError("fidelity_rows n must match the frozen material counts")
-        for field in ("gt_mean", "gt_std", "pred_mean", "pred_std", "mae", "rmse", "bias"):
+        for field in (
+            "gt_mean",
+            "gt_std",
+            "pred_mean",
+            "pred_std",
+            "mae",
+            "rmse",
+            "bias",
+            "bias_ci_low",
+            "bias_ci_high",
+        ):
             row[field] = _finite_scalar(row[field], field)
         for field in ("spearman", "spearman_ci_low", "spearman_ci_high"):
             if row[field] is not None:
@@ -823,13 +865,32 @@ def _validate_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("metadata.model_counts must be elastic=13, plasticine=14, sand=14")
     if result["response_schema"] != list(RESPONSE_NAMES):
         raise ValueError("metadata.response_schema must match the frozen response schema")
-    if not isinstance(result["seed"], int) or isinstance(result["seed"], bool) or result["seed"] < 0:
+    if (
+        not isinstance(result["seed"], int)
+        or isinstance(result["seed"], bool)
+        or result["seed"] < 0
+    ):
         raise ValueError("metadata.seed must be a non-negative integer")
     if not isinstance(result["bootstrap_samples"], int) or isinstance(result["bootstrap_samples"], bool) or result["bootstrap_samples"] < 1:
         raise ValueError("metadata.bootstrap_samples must be a positive integer")
     for field in ("schema_version", "checkpoint", "config", "split"):
         if not isinstance(result[field], str) or not result[field]:
             raise ValueError(f"metadata.{field} must be a non-empty string")
+    for field in ("contact_band_raw", "contact_band_normalized"):
+        value = result[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"metadata.{field} must be finite and non-negative")
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"metadata.{field} must be finite and non-negative")
+    if not math.isclose(
+        float(result["contact_band_normalized"]),
+        float(result["contact_band_raw"]) / 2.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "metadata contact_band_normalized must equal contact_band_raw / 2"
+        )
     return result
 
 
@@ -932,13 +993,14 @@ def render_fidelity_markdown_report(
         f"- checkpoint: `{metadata['checkpoint']}`",
         f"- config: `{metadata['config']}`",
         f"- seed: `{metadata['seed']}`；split: `{metadata['split']}`",
+        f"- contact band: raw=`{metadata['contact_band_raw']}`；normalized=`{metadata['contact_band_normalized']}`",
         "- 本报告仅比较预测和 GT 均可从 25 帧粒子位置轨迹计算的**位置可观测响应**。",
         "- 结果是 factual 条件下的保真度审计，不能证明 counterfactual 因果正确性，也不使用测试集选择 checkpoint 或训练超参数。",
         "- 凸包体积是几何可观测量，不等同于模拟器内部的 `det(F)` 或体积应变。",
         "",
         "## Factual 保真度（overall）",
-        _markdown_table(("response", "n", "mae", "rmse", "spearman", "status"), [
-            {key: row[key] for key in ("response", "n", "mae", "rmse", "spearman", "status")}
+        _markdown_table(("response", "n", "mae", "rmse", "bias", "bias_ci_low", "bias_ci_high", "spearman", "status"), [
+            {key: row[key] for key in ("response", "n", "mae", "rmse", "bias", "bias_ci_low", "bias_ci_high", "spearman", "status")}
             for row in by_group["overall"]
         ]),
     ]
@@ -946,8 +1008,8 @@ def render_fidelity_markdown_report(
         report.extend((
             "",
             f"## {material} 的位置可观测响应",
-            _markdown_table(("response", "n", "mae", "rmse", "spearman", "status"), [
-                {key: row[key] for key in ("response", "n", "mae", "rmse", "spearman", "status")}
+            _markdown_table(("response", "n", "mae", "rmse", "bias", "bias_ci_low", "bias_ci_high", "spearman", "status"), [
+                {key: row[key] for key in ("response", "n", "mae", "rmse", "bias", "bias_ci_low", "bias_ci_high", "spearman", "status")}
                 for row in by_group[material]
             ]),
         ))

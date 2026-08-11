@@ -66,6 +66,8 @@ B03_PROFILE = "contact_cond90"
 B03_SAMPLE_SCOPE = "frozen 41-model test start_idx=0 factual rollout"
 B03_SCHEMA_VERSION = "1.0"
 _POSITION_NORMALIZATION_SCALE = 2.0
+_CONDITION_FRAME_RTOL = 1e-6
+_CONDITION_FRAME_ATOL = 1e-6
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _frozen_seed(value: str) -> int:
+    parsed = _non_negative_int(value)
+    if parsed != 0:
+        raise argparse.ArgumentTypeError("B0.3 requires seed=0")
+    return parsed
+
+
 def _non_negative_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -132,8 +141,8 @@ def _non_negative_float(value: str) -> float:
 def _validate_runtime_arguments(
     seed: int, bootstrap_samples: int, contact_band_raw: float
 ) -> None:
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-        raise ValueError("seed must be a non-negative integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed != 0:
+        raise ValueError("B0.3 requires seed=0")
     if (
         isinstance(bootstrap_samples, bool)
         or not isinstance(bootstrap_samples, int)
@@ -248,6 +257,36 @@ def _reference_trajectory(reference: Any, model: str) -> torch.Tensor:
     if trajectory.shape[-1] != 3 or not bool(torch.isfinite(trajectory).all()):
         raise ValueError(f"{model}: ground truth must be finite (1, 25, N, 3)")
     return trajectory[0]
+
+
+def _validate_condition_frame_alignment(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    input_frames: int,
+    model: str,
+) -> None:
+    """Lock observed condition-frame particle correspondence before scoring futures."""
+    if input_frames < 1 or input_frames > pred.shape[0] or input_frames > gt.shape[0]:
+        raise ValueError(f"{model}: invalid input_frames for condition alignment")
+    pred_condition = pred[:input_frames]
+    gt_condition = gt[:input_frames]
+    if not bool(torch.isfinite(pred_condition).all()) or not bool(
+        torch.isfinite(gt_condition).all()
+    ):
+        raise ValueError(f"{model}: conditioning frames must be finite")
+    if not torch.allclose(
+        pred_condition,
+        gt_condition,
+        rtol=_CONDITION_FRAME_RTOL,
+        atol=_CONDITION_FRAME_ATOL,
+    ):
+        max_error = float(torch.max(torch.abs(pred_condition - gt_condition)).item())
+        raise ValueError(
+            f"{model}: prediction/GT conditioning frames are not pointwise aligned "
+            f"(rtol={_CONDITION_FRAME_RTOL}, atol={_CONDITION_FRAME_ATOL}, "
+            f"max_abs_error={max_error:.6g})"
+        )
 
 
 def _model_row(
@@ -392,6 +431,12 @@ def run_material_response_fidelity(
                 f"{record.model}: prediction/GT shape mismatch: "
                 f"{tuple(pred.shape)} vs {tuple(gt.shape)}"
             )
+        _validate_condition_frame_alignment(
+            pred,
+            gt,
+            input_frames=input_frames,
+            model=record.model,
+        )
         floor_height = _scalar_batch_value(batch, "floor_height", record.model)
         row = _model_row(
             record=record,
@@ -429,6 +474,8 @@ def run_material_response_fidelity(
         "model_counts": {"elastic": 13, "plasticine": 14, "sand": 14},
         "response_schema": list(RESPONSE_NAMES),
         "bootstrap_samples": bootstrap_samples,
+        "contact_band_raw": float(contact_band_raw),
+        "contact_band_normalized": contact_band,
     }
     paths = write_fidelity_outputs(
         output_dir,
@@ -456,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="results/material_response_fidelity_b03",
         help="Directory for the fixed six-file B0.3 report.",
     )
-    parser.add_argument("--seed", type=_non_negative_int, default=0)
+    parser.add_argument("--seed", type=_frozen_seed, default=0)
     parser.add_argument("--bootstrap-samples", type=_positive_int, default=10000)
     parser.add_argument("--contact-band-raw", type=_non_negative_float, default=0.08)
     parser.add_argument("--overwrite", action="store_true")

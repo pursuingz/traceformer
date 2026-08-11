@@ -238,7 +238,7 @@ class ResponseStatisticsTests(unittest.TestCase):
         self.assertEqual(classify_alignment(-0.60, -0.40), "aligned")
         self.assertEqual(classify_alignment(-0.60, -0.20), "attenuated")
         self.assertEqual(classify_alignment(-0.60, +0.30), "reversed")
-        self.assertEqual(classify_alignment(-0.60, +0.10), "reversed")
+        self.assertEqual(classify_alignment(-0.60, +0.10), "weak_or_unresolved")
         self.assertEqual(classify_alignment(-0.60, -0.10), "attenuated")
         self.assertEqual(classify_alignment(-0.19, -0.19), "weak_or_unresolved")
 
@@ -256,8 +256,46 @@ class ResponseStatisticsTests(unittest.TestCase):
             and row["response"] == "centroid_displacement_f24"
         )
         self.assertEqual(overall["n"], 41)
+        self.assertLessEqual(overall["bias_ci_low"], overall["bias"])
+        self.assertGreaterEqual(overall["bias_ci_high"], overall["bias"])
         self.assertLessEqual(overall["spearman_ci_low"], overall["spearman"])
         self.assertGreaterEqual(overall["spearman_ci_high"], overall["spearman"])
+
+        constant = next(
+            row
+            for row in first
+            if row["group"] == "elastic"
+            and row["response"] == "future_contact_fraction"
+        )
+        self.assertEqual(constant["status"], "constant_response")
+        self.assertEqual(constant["bias_ci_low"], 0.0)
+        self.assertEqual(constant["bias_ci_high"], 0.0)
+
+    def test_alignment_magnitude_ratio_uses_absolute_rhos(self):
+        rows = complete_response_rows()
+        altered = []
+        for row in rows:
+            copied = dict(row)
+            if copied["mat_type"] == 0 and copied["response"] == "extent_change_x_f24":
+                index = int(str(copied["model"]).split("_")[-1].split(".")[0])
+                copied["gt_value"] = float(-index)
+                copied["pred_value"] = float(index)
+                copied["signed_error"] = copied["pred_value"] - copied["gt_value"]
+                copied["absolute_error"] = abs(copied["signed_error"])
+            altered.append(copied)
+
+        alignment = build_alignment_summary(altered, bootstrap_samples=20, seed=0)
+        row = next(
+            item
+            for item in alignment
+            if item["material"] == "elastic"
+            and item["parameter"] == "log10_e"
+            and item["response"] == "extent_change_x_f24"
+        )
+
+        self.assertAlmostEqual(row["gt_ordinary_rho"], -1.0)
+        self.assertAlmostEqual(row["pred_ordinary_rho"], 1.0)
+        self.assertAlmostEqual(row["magnitude_ratio"], 1.0)
 
     def test_alignment_freezes_13_14_14_groups_and_weak_magnitude_ratio(self):
         rows = complete_response_rows()
@@ -360,6 +398,8 @@ class OutputTests(unittest.TestCase):
             "model_counts": {"elastic": 13, "plasticine": 14, "sand": 14},
             "response_schema": list(RESPONSE_NAMES),
             "bootstrap_samples": 20,
+            "contact_band_raw": 0.08,
+            "contact_band_normalized": 0.04,
         }
 
     def tearDown(self):
@@ -395,6 +435,27 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(len(list(csv.DictReader(handle))), 41 * len(RESPONSE_NAMES))
         written_metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
         self.assertEqual(written_metadata["model_counts"]["elastic"], 13)
+        self.assertEqual(written_metadata["contact_band_raw"], 0.08)
+        self.assertEqual(written_metadata["contact_band_normalized"], 0.04)
+        with paths["fidelity"].open(newline="", encoding="utf-8") as handle:
+            header = next(csv.reader(handle))
+        self.assertIn("bias_ci_low", header)
+        self.assertIn("bias_ci_high", header)
+        self.assertIn("bias_ci_low", report)
+        self.assertIn("bias_ci_high", report)
+
+    def test_unrelated_output_file_is_preserved_and_not_managed(self):
+        self.output_dir.mkdir()
+        unrelated = self.output_dir / "notes.txt"
+        unrelated.write_text("keep me", encoding="utf-8")
+
+        preflight = preflight_fidelity_outputs(self.output_dir, overwrite=False)
+        paths = self._write()
+
+        self.assertEqual(set(preflight), set(OUTPUT_NAMES))
+        self.assertEqual(set(paths), set(OUTPUT_NAMES))
+        self.assertNotIn(unrelated, paths.values())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep me")
 
     def test_preflight_rejects_any_existing_target_without_overwrite(self):
         self.output_dir.mkdir()
@@ -409,6 +470,17 @@ class OutputTests(unittest.TestCase):
         del missing_metadata["response_schema"]
         with self.assertRaisesRegex(ValueError, "metadata is missing"):
             self._write(metadata=missing_metadata)
+
+        missing_contact_band = dict(self.metadata)
+        del missing_contact_band["contact_band_raw"]
+        with self.assertRaisesRegex(ValueError, "contact_band_raw"):
+            self._write(metadata=missing_contact_band)
+
+        inconsistent_contact_band = dict(
+            self.metadata, contact_band_normalized=0.08
+        )
+        with self.assertRaisesRegex(ValueError, "contact_band"):
+            self._write(metadata=inconsistent_contact_band)
 
         with self.assertRaisesRegex(ValueError, "exactly 41"):
             self._write(model_rows=self.model_rows[:-1])
@@ -469,7 +541,12 @@ class OutputTests(unittest.TestCase):
 
     def test_overwrite_replaces_complete_old_output_set(self):
         paths = self._write()
-        old_contents = {key: path.read_bytes() for key, path in paths.items()}
+        sentinels = {
+            key: f"OLD-{index}-{key}".encode("utf-8")
+            for index, key in enumerate(paths)
+        }
+        for key, path in paths.items():
+            path.write_bytes(sentinels[key])
         replacement_metadata = dict(self.metadata, schema_version="1.1")
 
         replaced = self._write(overwrite=True, metadata=replacement_metadata)
@@ -478,7 +555,9 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in self.output_dir.iterdir()}, set(OUTPUT_NAMES.values())
         )
-        self.assertNotEqual(replaced["metadata"].read_bytes(), old_contents["metadata"])
+        for key, path in replaced.items():
+            self.assertNotEqual(path.read_bytes(), sentinels[key])
+            self.assertNotIn(sentinels[key], path.read_bytes())
         self.assertFalse(any(".backup." in path.name for path in self.output_dir.parent.iterdir()))
 
     def test_overwrite_rolls_back_all_old_outputs_after_mid_activation_failure(self):
@@ -529,6 +608,9 @@ class DiagnosticRunnerTests(unittest.TestCase):
                 )
             ).unsqueeze(0).float()
             for index, record in enumerate(self.records)
+        }
+        self.pred_trajectories = {
+            model: trajectory.clone() for model, trajectory in self.trajectories.items()
         }
         self.args = SimpleNamespace(
             pc_size=8,
@@ -675,7 +757,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
         ))
         self.rollout_calls.append(name)
         self.events.append(f"rollout:{name}")
-        return self.trajectories[name].clone()
+        return self.pred_trajectories[name].clone()
 
     def _load_records(self, *args, **kwargs):
         self.events.append("h5")
@@ -746,6 +828,54 @@ class DiagnosticRunnerTests(unittest.TestCase):
                 len(list(csv.DictReader(handle))), 41 * len(RESPONSE_NAMES)
             )
         self.assertEqual(self.args.resume, str(self.checkpoint))
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        self.assertEqual(metadata["contact_band_raw"], 0.08)
+        self.assertEqual(metadata["contact_band_normalized"], 0.04)
+
+    def test_runner_rejects_nonzero_seed_before_preflight_or_runtime(self):
+        with self.assertRaisesRegex(ValueError, "seed=0"):
+            self._run(seed=1)
+
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.model_constructions, 0)
+
+    def test_condition_frame_alignment_tolerance_is_explicit(self):
+        gt = self.trajectories[self.records[0].model][0]
+        within_tolerance = gt.clone()
+        within_tolerance[:5] += 5e-7
+
+        fidelity_runner._validate_condition_frame_alignment(
+            within_tolerance,
+            gt,
+            input_frames=5,
+            model=self.records[0].model,
+        )
+
+        outside_tolerance = gt.clone()
+        outside_tolerance[:5] += 2e-5
+        with self.assertRaisesRegex(ValueError, "conditioning frames"):
+            fidelity_runner._validate_condition_frame_alignment(
+                outside_tolerance,
+                gt,
+                input_frames=5,
+                model=self.records[0].model,
+            )
+
+    def test_runner_rejects_same_shape_condition_particle_reordering(self):
+        model = self.records[0].model
+        self.pred_trajectories[model][:, :5] = self.pred_trajectories[model][
+            :, :5, torch.arange(7, -1, -1), :
+        ]
+
+        with self.assertRaisesRegex(ValueError, "conditioning frames"):
+            self._run()
+
+    def test_runner_rejects_same_shape_condition_coordinate_offset(self):
+        model = self.records[0].model
+        self.pred_trajectories[model][:, :5, :, 0] += 1e-3
+
+        with self.assertRaisesRegex(ValueError, "conditioning frames"):
+            self._run()
 
     def test_runner_rejects_cli_checkpoint_mismatch_before_runtime(self):
         yaml_checkpoint = self.root / "yaml.safetensors"
@@ -886,6 +1016,17 @@ class DiagnosticRunnerTests(unittest.TestCase):
             parser.parse_args([])
         with self.assertRaises(SystemExit):
             parser.parse_args(["--config", "config.yaml"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--config",
+                    "config.yaml",
+                    "--checkpoint",
+                    "checkpoint.safetensors",
+                    "--seed",
+                    "1",
+                ]
+            )
 
 
 if __name__ == "__main__":
