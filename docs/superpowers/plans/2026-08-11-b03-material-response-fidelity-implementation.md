@@ -183,6 +183,7 @@ D:/miniconda3/envs/physctrl/python.exe -m unittest \
 - Fidelity groups 固定为 overall/elastic/plasticine/sand；输出 n、GT/pred mean/std、MAE、RMSE、bias、Spearman 及 95% CI。
 - Partial Spearman 对 `x/y/control` 分别 rank 后，从 `x` 和 `y` 中用带截距 OLS 去除 control，再相关残差。
 - Alignment 对每种材质、`log10_e/nu`、每个 response 输出 GT/pred ordinary rho、partial rho、bootstrap CI、rho gap、可选 magnitude ratio 和冻结标签。
+- 标签判定优先级固定为 `reversed > attenuated > aligned > weak_or_unresolved`，解决阈值边界重叠。
 - 常数输入返回 `None`，相关和 CI CSV 字段留空，状态为 `constant_response`；不是 exception。
 - Bootstrap 以 object/model 为单位成对采样，使用 `np.random.default_rng(seed)`，不得把 response 行当独立样本。
 

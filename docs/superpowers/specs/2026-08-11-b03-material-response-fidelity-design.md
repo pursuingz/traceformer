@@ -89,6 +89,8 @@ B0.3 禁止通过以下方式制造虚假的同口径比较：
 - `reversed`：GT/pred 方向相反，且两者 `|rho| >= 0.20`。
 - `weak_or_unresolved`：其余情况。
 
+标签存在阈值重叠时，固定优先级为 `reversed > attenuated > aligned > weak_or_unresolved`，确保 GT 信号明显但 prediction 幅度不足时不会被宽松的同向条件误标为 `aligned`。
+
 由于每种材质只有 13/14 个 test 对象，该层只报告效应量和 bootstrap CI，不输出 permutation p-value，也不声称因果关系。B0.2 的 train-level conditional association仍是数据可辨识性的主证据。
 
 若 GT 或 prediction 的某个 response 在组内为常数，相关系数和对应 CI 留空，并以 `constant_response` 状态保留该行；这属于合法的无响应证据，不视为审计损坏。
