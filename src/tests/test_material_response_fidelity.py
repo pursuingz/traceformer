@@ -622,7 +622,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
             seed=0,
             device="cpu",
             resume=str(self.checkpoint),
-            model_config=SimpleNamespace(cond_frames=5),
+            model_config=SimpleNamespace(),
             train_dataset=SimpleNamespace(
                 dataset_path=str(self.dataset_root),
                 input_frames=5,
@@ -632,6 +632,8 @@ class DiagnosticRunnerTests(unittest.TestCase):
             identity_valid=True,
         )
         self.runtime = self._runtime(self._batches())
+        self.identity_cond_frames = []
+        self.model_cond_frames = []
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -681,6 +683,10 @@ class DiagnosticRunnerTests(unittest.TestCase):
         class FakeModel:
             def __init__(self, *args, **kwargs):
                 outer.model_constructions += 1
+                if "model_config" in kwargs:
+                    outer.model_cond_frames.append(
+                        getattr(kwargs["model_config"], "cond_frames", None)
+                    )
                 outer.events.append("model")
 
             def to(self, device):
@@ -736,6 +742,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
 
     def _identity_check(self, args, records=None, profile=None):
         self.events.append("identity")
+        self.identity_cond_frames.append(hasattr(args.model_config, "cond_frames"))
         self.assertEqual(profile, "contact_cond90")
         if not args.identity_valid:
             raise ValueError("B0 config mismatch")
@@ -831,6 +838,12 @@ class DiagnosticRunnerTests(unittest.TestCase):
         metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
         self.assertEqual(metadata["contact_band_raw"], 0.08)
         self.assertEqual(metadata["contact_band_normalized"], 0.04)
+
+    def test_runtime_cond_frames_is_injected_only_after_identity_validation(self):
+        self._run()
+
+        self.assertEqual(self.identity_cond_frames, [False, False])
+        self.assertEqual(self.model_cond_frames, [5])
 
     def test_runner_rejects_nonzero_seed_before_preflight_or_runtime(self):
         with self.assertRaisesRegex(ValueError, "seed=0"):

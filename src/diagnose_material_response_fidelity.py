@@ -364,7 +364,6 @@ def run_material_response_fidelity(
         raise ValueError("input_frames and output_frames must be positive")
     args.train_dataset.input_frames = input_frames
     args.train_dataset.output_frames = output_frames
-    args.model_config.cond_frames = input_frames
     args.seed = seed
     # CLI uses raw MPM units. GT/pred/floor_height below use TrajDataset's
     # normalized coordinates: (raw - norm_fac) / 2.
@@ -374,6 +373,7 @@ def run_material_response_fidelity(
     dataset = runtime.dataset_cls("test", args.train_dataset)
     records = load_material_records(dataset_root, dataset.split_lst_save)
     _validate_b0_identity(args, records=records, profile=B03_PROFILE)
+    args.model_config.cond_frames = input_frames
     records_by_model = {record.model: record for record in records}
     if len(records_by_model) != EXPECTED_MODEL_COUNT:
         raise ValueError(
