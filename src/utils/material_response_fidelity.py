@@ -1,7 +1,12 @@
-"""Position-only response metrics shared by B0.3 prediction and GT paths."""
+"""Position-only response metrics and validated B0.3 audit outputs."""
 
+import csv
+import json
 import math
+import shutil
+import tempfile
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +32,98 @@ RESPONSE_NAMES = (*PRIMARY_RESPONSES, *SECONDARY_RESPONSES)
 MATERIAL_NAMES = {0: "elastic", 1: "plasticine", 2: "sand"}
 SUMMARY_GROUPS = ("overall", "elastic", "plasticine", "sand")
 EXPECTED_MATERIAL_COUNTS = {0: 13, 1: 14, 2: 14}
+OUTPUT_NAMES = {
+    "models": "material_response_fidelity_b03_models.csv",
+    "responses": "material_response_fidelity_b03_responses.csv",
+    "fidelity": "material_response_fidelity_b03_fidelity.csv",
+    "alignment": "material_response_fidelity_b03_alignment.csv",
+    "metadata": "material_response_fidelity_b03_metadata.json",
+    "report": "material_response_fidelity_b03.md",
+}
+MODEL_COLUMNS = (
+    "model",
+    "mat_type",
+    "material",
+    "log10_e",
+    "nu",
+    "checkpoint",
+    "config",
+    "seed",
+    "sample_scope",
+    "full_rollout_mse",
+    "gm_mse",
+    "long_seg_mse",
+    "fde",
+)
+RESPONSE_COLUMNS = (
+    "model",
+    "mat_type",
+    "material",
+    "log10_e",
+    "nu",
+    "checkpoint",
+    "config",
+    "seed",
+    "sample_scope",
+    "response",
+    "response_tier",
+    "gt_value",
+    "pred_value",
+    "signed_error",
+    "absolute_error",
+)
+FIDELITY_COLUMNS = (
+    "group",
+    "response",
+    "response_tier",
+    "n",
+    "gt_mean",
+    "gt_std",
+    "pred_mean",
+    "pred_std",
+    "mae",
+    "rmse",
+    "bias",
+    "spearman",
+    "spearman_ci_low",
+    "spearman_ci_high",
+    "status",
+)
+ALIGNMENT_COLUMNS = (
+    "material",
+    "parameter",
+    "response",
+    "response_tier",
+    "n",
+    "gt_ordinary_rho",
+    "pred_ordinary_rho",
+    "gt_partial_rho",
+    "pred_partial_rho",
+    "gt_ordinary_ci_low",
+    "gt_ordinary_ci_high",
+    "pred_ordinary_ci_low",
+    "pred_ordinary_ci_high",
+    "gt_partial_ci_low",
+    "gt_partial_ci_high",
+    "pred_partial_ci_low",
+    "pred_partial_ci_high",
+    "ordinary_rho_gap",
+    "partial_rho_gap",
+    "magnitude_ratio",
+    "alignment_label",
+    "partial_alignment_label",
+    "status",
+)
+_METADATA_REQUIRED_FIELDS = (
+    "schema_version",
+    "checkpoint",
+    "config",
+    "seed",
+    "split",
+    "model_counts",
+    "response_schema",
+    "bootstrap_samples",
+)
 _ROW_REQUIRED_FIELDS = (
     "model",
     "mat_type",
@@ -553,3 +650,434 @@ def build_alignment_summary(
                     }
                 )
     return summary
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("metadata must contain only finite numeric values")
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    raise TypeError(f"metadata contains unsupported value: {type(value).__name__}")
+
+
+def _validate_model_rows(model_rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(model_rows, Sequence) or isinstance(model_rows, (str, bytes)):
+        raise ValueError("model_rows must be a sequence of dictionaries")
+    if len(model_rows) != sum(EXPECTED_MATERIAL_COUNTS.values()):
+        raise ValueError("model_rows must contain exactly 41 models")
+
+    seen_models: set[str] = set()
+    counts = {material: 0 for material in MATERIAL_NAMES}
+    validated: list[dict[str, Any]] = []
+    for source_row in model_rows:
+        if not isinstance(source_row, dict):
+            raise ValueError("model_rows must be a sequence of dictionaries")
+        missing = [field for field in MODEL_COLUMNS if field not in source_row]
+        if missing:
+            raise ValueError(f"model row is missing fields: {missing}")
+        row = {field: source_row[field] for field in MODEL_COLUMNS}
+        mat_type, material = _material_from_row(row)
+        if row["material"] != material:
+            raise ValueError("model row material must match mat_type")
+        model = row["model"]
+        if model in seen_models:
+            raise ValueError(f"duplicate model row: {model}")
+        seen_models.add(model)
+        for field in ("full_rollout_mse", "gm_mse", "long_seg_mse", "fde"):
+            row[field] = _finite_scalar(row[field], field)
+        row["mat_type"] = mat_type
+        counts[mat_type] += 1
+        validated.append(row)
+    if counts != EXPECTED_MATERIAL_COUNTS:
+        raise ValueError("model_rows material counts must be elastic=13, plasticine=14, sand=14")
+    return sorted(validated, key=lambda row: str(row["model"]))
+
+
+def _validate_summary_rows(
+    rows: Sequence[dict[str, Any]],
+    *,
+    columns: tuple[str, ...],
+    expected_count: int,
+    row_name: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise ValueError(f"{row_name} must be a sequence of dictionaries")
+    if len(rows) != expected_count:
+        raise ValueError(f"{row_name} has an unexpected frozen schema size")
+    output: list[dict[str, Any]] = []
+    for source_row in rows:
+        if not isinstance(source_row, dict):
+            raise ValueError(f"{row_name} must contain dictionaries")
+        missing = [field for field in columns if field not in source_row]
+        if missing:
+            raise ValueError(f"{row_name} is missing fields: {missing}")
+        output.append({field: source_row[field] for field in columns})
+    return output
+
+
+def _validate_fidelity_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    validated = _validate_summary_rows(
+        rows,
+        columns=FIDELITY_COLUMNS,
+        expected_count=len(SUMMARY_GROUPS) * len(RESPONSE_NAMES),
+        row_name="fidelity_rows",
+    )
+    identities = set()
+    for row in validated:
+        identity = (row["group"], row["response"])
+        if row["group"] not in SUMMARY_GROUPS or row["response"] not in RESPONSE_NAMES:
+            raise ValueError("fidelity_rows has an invalid frozen response schema")
+        if identity in identities:
+            raise ValueError("fidelity_rows has duplicate group-response rows")
+        identities.add(identity)
+        if row["response_tier"] != _response_tier(row["response"]):
+            raise ValueError("fidelity_rows response tier must match response")
+        expected_n = 41 if row["group"] == "overall" else EXPECTED_MATERIAL_COUNTS[
+            next(kind for kind, name in MATERIAL_NAMES.items() if name == row["group"])
+        ]
+        if row["n"] != expected_n:
+            raise ValueError("fidelity_rows n must match the frozen material counts")
+        for field in ("gt_mean", "gt_std", "pred_mean", "pred_std", "mae", "rmse", "bias"):
+            row[field] = _finite_scalar(row[field], field)
+        for field in ("spearman", "spearman_ci_low", "spearman_ci_high"):
+            if row[field] is not None:
+                row[field] = _finite_scalar(row[field], field)
+        if row["status"] not in ("ok", "constant_response"):
+            raise ValueError("fidelity_rows status must be ok or constant_response")
+        if row["status"] == "constant_response" and any(
+            row[field] is not None
+            for field in ("spearman", "spearman_ci_low", "spearman_ci_high")
+        ):
+            raise ValueError("constant fidelity response must leave correlation fields empty")
+    if identities != {(group, response) for group in SUMMARY_GROUPS for response in RESPONSE_NAMES}:
+        raise ValueError("fidelity_rows is incomplete or duplicated")
+    return validated
+
+
+def _validate_alignment_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    validated = _validate_summary_rows(
+        rows,
+        columns=ALIGNMENT_COLUMNS,
+        expected_count=len(MATERIAL_NAMES) * 2 * len(RESPONSE_NAMES),
+        row_name="alignment_rows",
+    )
+    identities = set()
+    nullable = tuple(field for field in ALIGNMENT_COLUMNS if field.endswith("rho") or field.endswith("ci_low") or field.endswith("ci_high") or field.endswith("rho_gap")) + ("magnitude_ratio",)
+    for row in validated:
+        identity = (row["material"], row["parameter"], row["response"])
+        if row["material"] not in MATERIAL_NAMES.values() or row["parameter"] not in ("log10_e", "nu") or row["response"] not in RESPONSE_NAMES:
+            raise ValueError("alignment_rows has an invalid frozen response schema")
+        if identity in identities:
+            raise ValueError("alignment_rows has duplicate material-parameter-response rows")
+        identities.add(identity)
+        if row["response_tier"] != _response_tier(row["response"]):
+            raise ValueError("alignment_rows response tier must match response")
+        expected_n = EXPECTED_MATERIAL_COUNTS[
+            next(kind for kind, name in MATERIAL_NAMES.items() if name == row["material"])
+        ]
+        if row["n"] != expected_n:
+            raise ValueError("alignment_rows n must match the frozen material counts")
+        for field in nullable:
+            if row[field] is not None:
+                row[field] = _finite_scalar(row[field], field)
+        for field in ("alignment_label", "partial_alignment_label"):
+            if row[field] not in ("aligned", "attenuated", "reversed", "weak_or_unresolved"):
+                raise ValueError("alignment_rows contains an invalid alignment label")
+        if row["status"] not in ("ok", "constant_response"):
+            raise ValueError("alignment_rows status must be ok or constant_response")
+        if row["status"] == "constant_response" and any(
+            row[field] is not None for field in nullable
+        ):
+            raise ValueError("constant alignment response must leave correlation fields empty")
+    expected = {
+        (material, parameter, response)
+        for material in MATERIAL_NAMES.values()
+        for parameter in ("log10_e", "nu")
+        for response in RESPONSE_NAMES
+    }
+    if identities != expected:
+        raise ValueError("alignment_rows is incomplete or duplicated")
+    return validated
+
+
+def _validate_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dictionary")
+    missing = [field for field in _METADATA_REQUIRED_FIELDS if field not in metadata]
+    if missing:
+        raise ValueError(f"metadata is missing fields: {missing}")
+    result = _json_value(metadata)
+    if result["model_counts"] != {"elastic": 13, "plasticine": 14, "sand": 14}:
+        raise ValueError("metadata.model_counts must be elastic=13, plasticine=14, sand=14")
+    if result["response_schema"] != list(RESPONSE_NAMES):
+        raise ValueError("metadata.response_schema must match the frozen response schema")
+    if not isinstance(result["seed"], int) or isinstance(result["seed"], bool) or result["seed"] < 0:
+        raise ValueError("metadata.seed must be a non-negative integer")
+    if not isinstance(result["bootstrap_samples"], int) or isinstance(result["bootstrap_samples"], bool) or result["bootstrap_samples"] < 1:
+        raise ValueError("metadata.bootstrap_samples must be a positive integer")
+    for field in ("schema_version", "checkpoint", "config", "split"):
+        if not isinstance(result[field], str) or not result[field]:
+            raise ValueError(f"metadata.{field} must be a non-empty string")
+    return result
+
+
+def _validate_output_payload(
+    model_rows: Sequence[dict[str, Any]],
+    response_rows: Sequence[dict[str, Any]],
+    fidelity_rows: Sequence[dict[str, Any]],
+    alignment_rows: Sequence[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    validated_models = _validate_model_rows(model_rows)
+    validated_responses = _validated_response_rows(response_rows)
+    if {row["model"] for row in validated_models} != {
+        row["model"] for row in validated_responses
+    }:
+        raise ValueError("model_rows and response_rows must describe the same 41 models")
+    model_metadata = {
+        row["model"]: tuple(
+            row[field]
+            for field in (
+                "mat_type",
+                "log10_e",
+                "nu",
+                "material",
+                "checkpoint",
+                "config",
+                "seed",
+                "sample_scope",
+            )
+        )
+        for row in validated_models
+    }
+    for row in validated_responses:
+        response_metadata = tuple(
+            row[field]
+            for field in (
+                "mat_type",
+                "log10_e",
+                "nu",
+                "material",
+                "checkpoint",
+                "config",
+                "seed",
+                "sample_scope",
+            )
+        )
+        if response_metadata != model_metadata[row["model"]]:
+            raise ValueError("model_rows and response_rows disagree on provenance")
+    validated_metadata = _validate_metadata(metadata)
+    for row in validated_models:
+        if (
+            row["checkpoint"],
+            row["config"],
+            row["seed"],
+            row["sample_scope"],
+        ) != (
+            validated_metadata["checkpoint"],
+            validated_metadata["config"],
+            validated_metadata["seed"],
+            validated_metadata["split"],
+        ):
+            raise ValueError("metadata and model_rows disagree on run provenance")
+    return (
+        validated_models,
+        validated_responses,
+        _validate_fidelity_rows(fidelity_rows),
+        _validate_alignment_rows(alignment_rows),
+        validated_metadata,
+    )
+
+
+def _write_csv(path: Path, columns: tuple[str, ...], rows: Sequence[dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="raise")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: "" if row[column] is None else row[column] for column in columns})
+
+
+def _markdown_table(columns: tuple[str, ...], rows: Sequence[dict[str, Any]]) -> str:
+    header = "| " + " | ".join(columns) + " |"
+    divider = "| " + " | ".join("---" for _ in columns) + " |"
+    body = []
+    for row in rows:
+        body.append("| " + " | ".join("" if row[column] is None else str(row[column]) for column in columns) + " |")
+    return "\n".join((header, divider, *body))
+
+
+def render_fidelity_markdown_report(
+    fidelity_rows: Sequence[dict[str, Any]],
+    alignment_rows: Sequence[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> str:
+    """Render the Chinese, factual-only B0.3 decision report."""
+    by_group = {group: [row for row in fidelity_rows if row["group"] == group] for group in SUMMARY_GROUPS}
+    report = [
+        "# B0.3 预测-GT 材料响应保真度审计",
+        "",
+        "## 审计边界",
+        f"- checkpoint: `{metadata['checkpoint']}`",
+        f"- config: `{metadata['config']}`",
+        f"- seed: `{metadata['seed']}`；split: `{metadata['split']}`",
+        "- 本报告仅比较预测和 GT 均可从 25 帧粒子位置轨迹计算的**位置可观测响应**。",
+        "- 结果是 factual 条件下的保真度审计，不能证明 counterfactual 因果正确性，也不使用测试集选择 checkpoint 或训练超参数。",
+        "- 凸包体积是几何可观测量，不等同于模拟器内部的 `det(F)` 或体积应变。",
+        "",
+        "## Factual 保真度（overall）",
+        _markdown_table(("response", "n", "mae", "rmse", "spearman", "status"), [
+            {key: row[key] for key in ("response", "n", "mae", "rmse", "spearman", "status")}
+            for row in by_group["overall"]
+        ]),
+    ]
+    for material in ("elastic", "plasticine", "sand"):
+        report.extend((
+            "",
+            f"## {material} 的位置可观测响应",
+            _markdown_table(("response", "n", "mae", "rmse", "spearman", "status"), [
+                {key: row[key] for key in ("response", "n", "mae", "rmse", "spearman", "status")}
+                for row in by_group[material]
+            ]),
+        ))
+    report.extend((
+        "",
+        "## 材料参数对齐诊断",
+        "下表为描述性 ordinary/partial Spearman 结果；每种材料只有 13 或 14 个对象，CI 只表达对象级重采样不确定性。",
+        _markdown_table(
+            ("material", "parameter", "response", "gt_partial_rho", "pred_partial_rho", "partial_rho_gap", "partial_alignment_label", "status"),
+            [
+                {key: row[key] for key in ("material", "parameter", "response", "gt_partial_rho", "pred_partial_rho", "partial_rho_gap", "partial_alignment_label", "status")}
+                for row in alignment_rows
+            ],
+        ),
+        "",
+        "## 解释限制",
+        "B0.3 只能说明冻结模型是否保留 factual 样本之间的位置响应排序和幅度；它不能证明更改 E/nu 后模型会产生正确的反事实轨迹。需要配对 counterfactual 数据或干预测试才可回答该问题。",
+    ))
+    return "\n".join(report) + "\n"
+
+
+def _validate_output_targets(output_dir: Path, target_paths: dict[str, Path]) -> None:
+    if output_dir.exists() and not output_dir.is_dir():
+        raise NotADirectoryError(f"fidelity output path is not a directory: {output_dir}")
+    for target in target_paths.values():
+        if target.exists() and not target.is_file():
+            raise IsADirectoryError(f"fidelity output target is not a regular file: {target}")
+
+
+def preflight_fidelity_outputs(
+    output_dir: str | Path, overwrite: bool
+) -> dict[str, Path]:
+    """Validate exact B0.3 targets without creating or replacing them."""
+    directory = Path(output_dir)
+    target_paths = {key: directory / name for key, name in OUTPUT_NAMES.items()}
+    if not overwrite:
+        existing = next((path for path in target_paths.values() if path.exists()), None)
+        if existing is not None:
+            raise FileExistsError(f"refusing to overwrite existing fidelity output: {existing}")
+    _validate_output_targets(directory, target_paths)
+    return target_paths
+
+
+def _cleanup_transaction_directory(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _validate_staged_outputs(temporary_dir: Path) -> None:
+    paths = [temporary_dir / name for name in OUTPUT_NAMES.values()]
+    if not all(path.is_file() for path in paths):
+        raise RuntimeError("staged fidelity output set is incomplete")
+    if {path.name for path in temporary_dir.iterdir()} != set(OUTPUT_NAMES.values()):
+        raise RuntimeError("staged fidelity output set has an unexpected schema")
+
+
+def _activate_output_files(temporary_dir: Path, target_paths: dict[str, Path]) -> None:
+    backup_dir = Path(tempfile.mkdtemp(prefix=f".{temporary_dir.name}.backup.", dir=temporary_dir.parent))
+    backups: dict[str, Path] = {}
+    activated: list[str] = []
+    try:
+        for key, target_path in target_paths.items():
+            if target_path.exists():
+                backup_path = backup_dir / OUTPUT_NAMES[key]
+                target_path.replace(backup_path)
+                backups[key] = backup_path
+        for key, target_path in target_paths.items():
+            (temporary_dir / OUTPUT_NAMES[key]).replace(target_path)
+            activated.append(key)
+    except Exception as activation_error:
+        rollback_errors = []
+        for key in reversed(activated):
+            try:
+                target_paths[key].replace(temporary_dir / OUTPUT_NAMES[key])
+            except OSError as error:
+                rollback_errors.append(error)
+        for key, backup_path in backups.items():
+            try:
+                backup_path.replace(target_paths[key])
+            except OSError as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            raise RuntimeError(
+                f"fidelity output activation failed and rollback was incomplete; backups remain in {backup_dir}"
+            ) from activation_error
+        _cleanup_transaction_directory(backup_dir)
+        raise
+    else:
+        _cleanup_transaction_directory(backup_dir)
+
+
+def write_fidelity_outputs(
+    output_dir: str | Path,
+    model_rows: Sequence[dict[str, Any]],
+    response_rows: Sequence[dict[str, Any]],
+    fidelity_rows: Sequence[dict[str, Any]],
+    alignment_rows: Sequence[dict[str, Any]],
+    metadata: dict[str, Any],
+    overwrite: bool,
+) -> dict[str, Path]:
+    """Validate, stage, and transactionally activate the fixed six-file B0.3 output set."""
+    directory = Path(output_dir)
+    target_paths = preflight_fidelity_outputs(directory, overwrite=overwrite)
+    (
+        validated_models,
+        validated_responses,
+        validated_fidelity,
+        validated_alignment,
+        validated_metadata,
+    ) = _validate_output_payload(
+        model_rows, response_rows, fidelity_rows, alignment_rows, metadata
+    )
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{directory.name}.", dir=directory.parent))
+    try:
+        _write_csv(temporary_dir / OUTPUT_NAMES["models"], MODEL_COLUMNS, validated_models)
+        _write_csv(temporary_dir / OUTPUT_NAMES["responses"], RESPONSE_COLUMNS, validated_responses)
+        _write_csv(temporary_dir / OUTPUT_NAMES["fidelity"], FIDELITY_COLUMNS, validated_fidelity)
+        _write_csv(temporary_dir / OUTPUT_NAMES["alignment"], ALIGNMENT_COLUMNS, validated_alignment)
+        with (temporary_dir / OUTPUT_NAMES["metadata"]).open("w", encoding="utf-8") as handle:
+            json.dump(validated_metadata, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+        (temporary_dir / OUTPUT_NAMES["report"]).write_text(
+            render_fidelity_markdown_report(
+                validated_fidelity, validated_alignment, validated_metadata
+            ),
+            encoding="utf-8",
+        )
+        _validate_staged_outputs(temporary_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        preflight_fidelity_outputs(directory, overwrite=overwrite)
+        _activate_output_files(temporary_dir, target_paths)
+    finally:
+        _cleanup_transaction_directory(temporary_dir)
+    return target_paths
