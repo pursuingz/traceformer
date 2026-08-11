@@ -426,6 +426,31 @@ class OutputTests(unittest.TestCase):
 
         self.assertFalse(self.output_dir.exists())
 
+    def test_writer_rejects_response_row_missing_provenance_field(self):
+        missing_provenance = [dict(row) for row in self.response_rows]
+        del missing_provenance[0]["checkpoint"]
+
+        with self.assertRaisesRegex(ValueError, "checkpoint"):
+            self._write(response_rows=missing_provenance)
+
+        self.assertFalse(self.output_dir.exists())
+
+    def test_writer_rejects_41_models_with_nonfrozen_material_counts(self):
+        wrong_counts = [dict(row) for row in self.model_rows]
+        plasticine_row = next(row for row in wrong_counts if row["mat_type"] == 1)
+        plasticine_row["mat_type"] = 0
+        plasticine_row["material"] = "elastic"
+
+        self.assertEqual(len({row["model"] for row in wrong_counts}), 41)
+        self.assertEqual(
+            {row["mat_type"] for row in wrong_counts}.intersection({0, 1, 2}),
+            {0, 1, 2},
+        )
+        with self.assertRaisesRegex(ValueError, "material counts"):
+            self._write(model_rows=wrong_counts)
+
+        self.assertFalse(self.output_dir.exists())
+
     def test_writer_leaves_no_final_outputs_when_staged_rendering_fails(self):
         with mock.patch.object(
             material_response_fidelity,
