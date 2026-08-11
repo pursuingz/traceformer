@@ -606,7 +606,10 @@ class DiagnosticRunnerTests(unittest.TestCase):
                 return self
 
             def load_state_dict(self, checkpoint, strict):
+                if strict is not True:
+                    raise AssertionError("strict checkpoint load required")
                 self.strict = strict
+                outer.strict_values.append(strict)
                 outer.events.append("strict_load")
 
             def eval(self):
@@ -625,6 +628,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
 
         self.model_constructions = 0
         self.requires_grad_values = []
+        self.strict_values = []
         self.schedulers = []
         self.rollout_calls = []
         self.events = []
@@ -728,6 +732,7 @@ class DiagnosticRunnerTests(unittest.TestCase):
         self.assertEqual(set(self.rollout_calls), {record.model for record in self.records})
         self.assertEqual(self.schedulers, [None])
         self.assertEqual(self.requires_grad_values, [False])
+        self.assertEqual(self.strict_values, [True])
         self.assertTrue(
             all(
                 np.isclose(call.kwargs["contact_band_raw"], 0.04)
@@ -792,9 +797,13 @@ class DiagnosticRunnerTests(unittest.TestCase):
         self.assertEqual(self.events.count("autocast_exit"), 41)
 
     def test_rollout_autocast_context_uses_cuda_bf16_only_when_available(self):
-        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch.object(torch, "autocast") as autocast,
+        ):
             with fidelity_runner._rollout_autocast_context("cpu"):
                 pass
+        autocast.assert_not_called()
 
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=True),
@@ -803,6 +812,12 @@ class DiagnosticRunnerTests(unittest.TestCase):
             with fidelity_runner._rollout_autocast_context("cuda"):
                 pass
         autocast.assert_called_once_with("cuda", dtype=torch.bfloat16)
+
+    def test_fake_model_rejects_non_strict_checkpoint_regression(self):
+        model = self.runtime.model_cls()
+
+        with self.assertRaisesRegex(AssertionError, "strict checkpoint load required"):
+            model.load_state_dict({}, strict=False)
 
     def test_runner_skips_nonzero_windows_without_a_rollout(self):
         nonzero = dict(self._batches()[0], start_idx=torch.tensor([5]))
