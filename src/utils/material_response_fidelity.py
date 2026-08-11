@@ -245,7 +245,8 @@ def partial_spearman(x: Any, y: Any, control: Any) -> float | None:
     residual_y = ranked_y - design @ np.linalg.lstsq(design, ranked_y, rcond=None)[0]
     if _is_constant(residual_x) or _is_constant(residual_y):
         return 0.0
-    return _safe_spearman(residual_x, residual_y)
+    rho = float(np.corrcoef(residual_x, residual_y)[0, 1])
+    return rho if math.isfinite(rho) else None
 
 
 def classify_alignment(gt_rho: float | None, pred_rho: float | None) -> str:
@@ -254,13 +255,21 @@ def classify_alignment(gt_rho: float | None, pred_rho: float | None) -> str:
         return "weak_or_unresolved"
     gt_value = _finite_scalar(gt_rho, "gt_rho")
     pred_value = _finite_scalar(pred_rho, "pred_rho")
-    if abs(gt_value) < 0.20 or abs(pred_value) < 0.20:
-        return "weak_or_unresolved"
-    if np.sign(gt_value) != np.sign(pred_value):
+    if abs(gt_value) >= 0.20 and np.sign(gt_value) != np.sign(pred_value):
         return "reversed"
-    if abs(pred_value) < 0.50 * abs(gt_value):
+    if (
+        abs(gt_value) >= 0.20
+        and np.sign(gt_value) == np.sign(pred_value)
+        and abs(pred_value) < 0.50 * abs(gt_value)
+    ):
         return "attenuated"
-    return "aligned"
+    if (
+        abs(gt_value) >= 0.20
+        and abs(pred_value) >= 0.20
+        and np.sign(gt_value) == np.sign(pred_value)
+    ):
+        return "aligned"
+    return "weak_or_unresolved"
 
 
 def _validated_response_rows(

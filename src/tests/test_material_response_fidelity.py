@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+from scipy.stats import rankdata
 
 from utils.material_response_fidelity import (
     RESPONSE_NAMES,
@@ -200,10 +201,27 @@ class ResponseStatisticsTests(unittest.TestCase):
         self.assertIsNotNone(rho)
         self.assertLess(abs(rho), 0.2)
 
+    def test_partial_spearman_uses_pearson_correlation_of_rank_residuals(self):
+        x = np.asarray([4.0, 2.0, 1.0, 0.0, 3.0])
+        y = np.asarray([3.0, 0.0, 4.0, 2.0, 1.0])
+        control = np.asarray([1.0, 2.0, 0.0, 3.0, 4.0])
+        rank_x, rank_y, rank_control = (rankdata(values) for values in (x, y, control))
+        design = np.column_stack((np.ones_like(rank_control), rank_control))
+        residual_x = rank_x - design @ np.linalg.lstsq(design, rank_x, rcond=None)[0]
+        residual_y = rank_y - design @ np.linalg.lstsq(design, rank_y, rcond=None)[0]
+        expected = float(np.corrcoef(residual_x, residual_y)[0, 1])
+
+        actual = partial_spearman(x, y, control)
+
+        self.assertAlmostEqual(actual, expected, places=12)
+        self.assertNotAlmostEqual(actual, -0.7, places=6)
+
     def test_alignment_labels_are_frozen_at_boundaries(self):
         self.assertEqual(classify_alignment(-0.60, -0.40), "aligned")
         self.assertEqual(classify_alignment(-0.60, -0.20), "attenuated")
         self.assertEqual(classify_alignment(-0.60, +0.30), "reversed")
+        self.assertEqual(classify_alignment(-0.60, +0.10), "reversed")
+        self.assertEqual(classify_alignment(-0.60, -0.10), "attenuated")
         self.assertEqual(classify_alignment(-0.19, -0.19), "weak_or_unresolved")
 
     def test_fidelity_bootstrap_is_model_paired_and_seed_reproducible(self):
